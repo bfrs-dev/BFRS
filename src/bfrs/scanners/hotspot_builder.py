@@ -75,7 +75,7 @@ class HotspotBuilder:
             source=source,
             evidence={
                 "hit_count": len(cluster),
-                "hit_types": tuple(sorted({hit.hit_type for hit in cluster})),
+                "hit_types": tuple(hit.hit_type for hit in cluster),
                 "hit_offsets": tuple(hit.start_offset for hit in cluster),
             },
         )
