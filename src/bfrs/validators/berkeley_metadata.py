@@ -182,7 +182,7 @@ class BerkeleyMetadataValidator:
             reasons.append("metadata_magic_invalid")
         if version != BTREE_VERSION:
             reasons.append("metadata_version_unsupported")
-        if not self._valid_page_size(page_size):
+        if not is_valid_page_size(page_size):
             reasons.append("metadata_page_size_invalid")
         if page_type != BTREE_METADATA_PAGE_TYPE:
             reasons.append("metadata_page_type_invalid")
@@ -233,9 +233,10 @@ class BerkeleyMetadataValidator:
         candidate_end = absolute_offset + min(available, max(page_size, 0))
         return _Candidate(status, info, tuple(reasons), candidate_end)
 
-    @staticmethod
-    def _valid_page_size(page_size: int) -> bool:
-        return (
-            MIN_PAGE_SIZE <= page_size <= MAX_PAGE_SIZE
-            and page_size & (page_size - 1) == 0
-        )
+
+
+def is_valid_page_size(page_size: int) -> bool:
+    return (
+        MIN_PAGE_SIZE <= page_size <= MAX_PAGE_SIZE
+        and page_size & (page_size - 1) == 0
+    )
