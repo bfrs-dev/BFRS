@@ -3,13 +3,14 @@
 from dataclasses import dataclass
 from typing import Any
 
+from bfrs.core.secp256k1 import FIELD_PRIME, decode_sec_public_key
 from bfrs.validators.bitcoin_record_type import (
     BitcoinRecordType,
     decode_compact_size,
 )
 
 
-SECP256K1_FIELD_PRIME = (1 << 256) - (1 << 32) - 977
+SECP256K1_FIELD_PRIME = FIELD_PRIME
 _PUBLIC_KEY_RECORD_TYPES = frozenset({"key", "wkey", "ckey", "keymeta"})
 _SUPPORTED_RECORD_TYPES = _PUBLIC_KEY_RECORD_TYPES | {"mkey", "defaultkey"}
 
@@ -207,36 +208,10 @@ class BitcoinRecordKeyValidator:
 def _validate_sec_public_key(public_key: bytes) -> _SecPublicKeyValidation:
     compressed = len(public_key) == 33
     prefix = public_key[0]
-
-    if compressed:
-        if prefix not in (2, 3):
-            return _SecPublicKeyValidation(False, True, "pubkey_prefix_invalid")
-        x = int.from_bytes(public_key[1:], "big")
-        if x >= SECP256K1_FIELD_PRIME:
-            return _SecPublicKeyValidation(False, True, "pubkey_point_invalid")
-
-        rhs = (pow(x, 3, SECP256K1_FIELD_PRIME) + 7) % SECP256K1_FIELD_PRIME
-        y = pow(
-            rhs,
-            (SECP256K1_FIELD_PRIME + 1) // 4,
-            SECP256K1_FIELD_PRIME,
-        )
-        if pow(y, 2, SECP256K1_FIELD_PRIME) != rhs:
-            return _SecPublicKeyValidation(False, True, "pubkey_point_invalid")
-        if (y & 1) != (prefix & 1):
-            y = SECP256K1_FIELD_PRIME - y
-        if y >= SECP256K1_FIELD_PRIME or (y & 1) != (prefix & 1):
-            return _SecPublicKeyValidation(False, True, "pubkey_point_invalid")
-        return _SecPublicKeyValidation(True, True, None)
-
-    if prefix != 4:
+    if compressed and prefix not in (2, 3):
+        return _SecPublicKeyValidation(False, True, "pubkey_prefix_invalid")
+    if not compressed and prefix != 4:
         return _SecPublicKeyValidation(False, False, "pubkey_prefix_invalid")
-    x = int.from_bytes(public_key[1:33], "big")
-    y = int.from_bytes(public_key[33:], "big")
-    if x >= SECP256K1_FIELD_PRIME or y >= SECP256K1_FIELD_PRIME:
-        return _SecPublicKeyValidation(False, False, "pubkey_point_invalid")
-    if pow(y, 2, SECP256K1_FIELD_PRIME) != (
-        pow(x, 3, SECP256K1_FIELD_PRIME) + 7
-    ) % SECP256K1_FIELD_PRIME:
-        return _SecPublicKeyValidation(False, False, "pubkey_point_invalid")
-    return _SecPublicKeyValidation(True, False, None)
+    if decode_sec_public_key(public_key) is None:
+        return _SecPublicKeyValidation(False, compressed, "pubkey_point_invalid")
+    return _SecPublicKeyValidation(True, compressed, None)
