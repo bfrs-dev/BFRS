@@ -1,4 +1,10 @@
-from bfrs.core.models import Hotspot, RawHit, ScanRange, ValidationResult
+from bfrs.core.models import (
+    Hotspot,
+    RawHit,
+    ScanRange,
+    ValidationResult,
+    ValidationStatus,
+)
 
 
 def test_create_scan_range() -> None:
@@ -42,13 +48,12 @@ def test_create_validation_result() -> None:
     result = ValidationResult(
         start_offset=128,
         end_offset=160,
-        hit_type="candidate",
-        is_valid=True,
-        confidence=0.95,
+        validator="test_validator",
+        status=ValidationStatus.STRUCTURAL,
         source="disk.img",
         evidence={"check": "passed"},
     )
 
-    assert result.is_valid is True
-    assert result.confidence == 0.95
+    assert result.validator == "test_validator"
+    assert result.status is ValidationStatus.STRUCTURAL
     assert result.source == "disk.img"

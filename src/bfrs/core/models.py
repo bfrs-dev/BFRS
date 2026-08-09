@@ -1,6 +1,7 @@
 """Basic data models passed between BFRS pipeline stages."""
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 
@@ -30,12 +31,17 @@ class Hotspot:
     evidence: dict[str, Any] = field(default_factory=dict)
 
 
+class ValidationStatus(str, Enum):
+    STRUCTURAL = "structural"
+    FRAGMENT = "fragment"
+    REJECTED = "rejected"
+
+
 @dataclass(frozen=True, slots=True)
 class ValidationResult:
     start_offset: int
     end_offset: int
-    hit_type: str
-    is_valid: bool
-    confidence: float
+    validator: str
+    status: ValidationStatus
     source: str
     evidence: dict[str, Any] = field(default_factory=dict)
