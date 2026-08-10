@@ -255,6 +255,7 @@ def test_structural_metadata_creates_logical_anchor_without_base_offset() -> Non
         metadata_page_number=anchors[0].metadata_page_number,
         page_size=anchors[0].page_size,
         byte_order=anchors[0].byte_order,
+        root_page=anchors[0].root_page,
         metadata_physical_offset=999_999_999,
     )
     assert relocated == anchors[0]

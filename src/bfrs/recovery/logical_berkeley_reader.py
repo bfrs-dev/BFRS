@@ -51,6 +51,7 @@ class LogicalBerkeleyMetadataAnchor:
     metadata_page_number: int
     page_size: int
     byte_order: str
+    root_page: int
     metadata_physical_offset: int = field(compare=False)
 
     def __post_init__(self) -> None:
@@ -60,6 +61,8 @@ class LogicalBerkeleyMetadataAnchor:
             raise ValueError("page_size must match logical database identity")
         if self.byte_order != self.identity.byte_order:
             raise ValueError("byte_order must match logical database identity")
+        if self.root_page <= 0:
+            raise ValueError("root_page must be positive")
         if self.metadata_physical_offset < 0:
             raise ValueError("metadata_physical_offset must not be negative")
 
@@ -168,6 +171,7 @@ class LogicalBerkeleyPageReader:
                 metadata_page_number=page.page_number,
                 page_size=self.page_map.page_size,
                 byte_order=self.page_map.byte_order,
+                root_page=int(page.validation.evidence["root_page"]),
                 metadata_physical_offset=page.physical_offset,
             )
             for page in self.validate_metadata_pages()
@@ -178,6 +182,22 @@ class LogicalBerkeleyPageReader:
                 anchors,
                 key=lambda anchor: anchor.metadata_page_number,
             )
+        )
+
+    def read_page_context(
+        self,
+        page_number: int,
+    ) -> ValidationContext | None:
+        location = self.page_map.locate(page_number)
+        if location is None:
+            return None
+        page_data, read_error = self._read(location)
+        if read_error is not None:
+            return None
+        return ValidationContext(
+            source=self.identity.source,
+            start_offset=location.physical_offset,
+            data=page_data,
         )
 
     def summarize(self) -> LogicalBerkeleyReadSummary:
