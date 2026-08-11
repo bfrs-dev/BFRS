@@ -194,6 +194,9 @@ def test_safe_json_schema_is_explicit_and_deterministic(tmp_path):
     serialized_inner = json.dumps(inner_private, sort_keys=True).lower()
     assert private_der().hex() not in serialized_inner
     assert "scalar" not in serialized_inner
+    ntfs_index = payload["ntfs_bitcoin_artifact_index"]
+    assert ntfs_index["wallet_dat_candidate_count"] == 0
+    assert ntfs_index["candidates"] == []
     assert not contains_bytes(payload)
 
     first = write_json_report(tmp_path / "first.json", result, CONFIGURATION)

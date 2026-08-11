@@ -319,6 +319,83 @@ def _orphan_private_key_fragment_recovery(result) -> dict[str, Any]:
     }
 
 
+def _ntfs_bitcoin_artifact_index(index) -> dict[str, Any]:
+    if index is None:
+        return {
+            "source": None,
+            "volume_offset": None,
+            "cluster_size": None,
+            "mft_record_size": None,
+            "mft_records_scanned": 0,
+            "mft_records_valid": 0,
+            "mft_records_invalid": 0,
+            "allocated_record_count": 0,
+            "deleted_record_count": 0,
+            "wallet_dat_candidate_count": 0,
+            "bitcoin_context_artifact_count": 0,
+            "mft_attribute_list_present": False,
+            "mft_stream_may_be_incomplete": False,
+            "candidates": [],
+            "diagnostics": ["ntfs_index_not_available"],
+        }
+    return {
+        "source": index.source,
+        "volume_offset": index.volume_offset,
+        "cluster_size": index.cluster_size,
+        "mft_record_size": index.mft_record_size,
+        "mft_records_scanned": index.mft_records_scanned,
+        "mft_records_valid": index.mft_records_valid,
+        "mft_records_invalid": index.mft_records_invalid,
+        "allocated_record_count": index.allocated_record_count,
+        "deleted_record_count": index.deleted_record_count,
+        "wallet_dat_candidate_count": index.wallet_dat_candidate_count,
+        "bitcoin_context_artifact_count": index.bitcoin_context_artifact_count,
+        "mft_attribute_list_present": index.mft_attribute_list_present,
+        "mft_stream_may_be_incomplete": index.mft_stream_may_be_incomplete,
+        "candidates": [
+            {
+                "mft_record_number": candidate.mft_record_number,
+                "sequence_number": candidate.sequence_number,
+                "allocation_state": candidate.allocation_state,
+                "filename": candidate.filename,
+                "namespace": candidate.namespace,
+                "aliases": [
+                    {
+                        "filename": alias.filename,
+                        "namespace": alias.namespace,
+                        "parent_mft_record_number": alias.parent_mft_record_number,
+                        "parent_sequence_number": alias.parent_sequence_number,
+                    }
+                    for alias in candidate.aliases
+                ],
+                "path": candidate.path,
+                "partial_path": candidate.partial_path,
+                "artifact_class": candidate.artifact_class,
+                "resident": candidate.resident,
+                "nonresident": candidate.nonresident,
+                "logical_size": candidate.logical_size,
+                "allocated_size": candidate.allocated_size,
+                "extent_count": candidate.extent_count,
+                "extents": [
+                    {
+                        "vcn_start": extent.vcn_start,
+                        "vcn_end": extent.vcn_end,
+                        "physical_lcn_start": extent.physical_lcn_start,
+                        "physical_byte_start": extent.physical_byte_start,
+                        "physical_byte_end": extent.physical_byte_end,
+                        "sparse": extent.sparse,
+                    }
+                    for extent in candidate.extents
+                ],
+                "extent_trust": candidate.extent_trust,
+                "data_recovery_state": candidate.data_recovery_state,
+            }
+            for candidate in index.candidates
+        ],
+        "diagnostics": list(index.diagnostics),
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -385,6 +462,9 @@ def serialize_full_image_result(
             _orphan_private_key_fragment_recovery(
                 result.orphan_private_key_fragment_recovery
             )
+        ),
+        "ntfs_bitcoin_artifact_index": _ntfs_bitcoin_artifact_index(
+            result.ntfs_bitcoin_artifact_index
         ),
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())

@@ -23,6 +23,10 @@ from bfrs.recovery.metadata_less_fragments import (
     MetadataLessBerkeleyFragmentRecovery,
     MetadataLessBerkeleyFragmentRecoveryPipeline,
 )
+from bfrs.recovery.ntfs_bitcoin_artifacts import (
+    NTFSBitcoinArtifactIndex,
+    NTFSBitcoinArtifactLocator,
+)
 from bfrs.recovery.orphan_record_key_diagnostic import (
     OrphanBitcoinRecordKeyDiagnostic,
     OrphanBitcoinRecordKeyDiagnosticPipeline,
@@ -81,6 +85,7 @@ class FullImageRecoveryResult:
     reasons: tuple[str, ...]
     evidence: dict[str, Any]
     logical_ntfs_results: tuple[Any, ...] = ()
+    ntfs_bitcoin_artifact_index: NTFSBitcoinArtifactIndex | None = None
 
 
 class _AcceptedContextRangeReader:
@@ -251,6 +256,9 @@ class FullImageRecoveryCoordinator:
                 range_reader=range_reader,
             ).run()
         )
+        ntfs_bitcoin_artifact_index = NTFSBitcoinArtifactLocator().index(
+            reader.path
+        )
         ordered_direct = tuple(item[2] for item in sorted(direct_with_ranges))
         all_statuses = tuple(result.status for result in ordered_direct) + tuple(
             result.status for result in wallet_results
@@ -289,6 +297,7 @@ class FullImageRecoveryCoordinator:
             orphan_private_key_fragment_recovery=(
                 orphan_private_key_fragments
             ),
+            ntfs_bitcoin_artifact_index=ntfs_bitcoin_artifact_index,
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,
             reasons=reasons,
