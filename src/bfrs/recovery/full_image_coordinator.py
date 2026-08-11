@@ -19,6 +19,10 @@ from bfrs.recovery.fragmented_berkeley_reassembler import (
     ReconstructedBerkeleyDatabase,
 )
 from bfrs.recovery.logical_berkeley_reader import PhysicalRangeReadError
+from bfrs.recovery.metadata_less_fragments import (
+    MetadataLessBerkeleyFragmentRecovery,
+    MetadataLessBerkeleyFragmentRecoveryPipeline,
+)
 from bfrs.recovery.reconstructed_wallet_pipeline import (
     ReconstructedBerkeleyWalletPipeline,
     ReconstructedBerkeleyWalletRecovery,
@@ -54,6 +58,7 @@ class FullImageRecoveryResult:
     reconstructed_wallet_results: tuple[
         ReconstructedBerkeleyWalletRecovery, ...
     ]
+    metadata_less_fragment_recovery: MetadataLessBerkeleyFragmentRecovery
     structural_wallet_count: int
     fragment_wallet_count: int
     reasons: tuple[str, ...]
@@ -81,6 +86,27 @@ class _AcceptedContextRangeReader:
         if not available:
             raise PhysicalRangeReadError("range is outside accepted hotspots")
         return max(available, key=lambda item: (item[0], item[1]))[2]
+
+    def read_before(
+        self,
+        end_offset: int,
+        maximum_length: int,
+        lower_bound: int,
+    ) -> tuple[int, bytes]:
+        if maximum_length < 0 or lower_bound < 0 or end_offset < lower_bound:
+            raise ValueError("invalid bounded backward read")
+        covering = tuple(
+            context
+            for context in self._contexts
+            if context.start_offset < end_offset <= context.end_offset
+        )
+        if not covering:
+            raise PhysicalRangeReadError("hit is outside accepted hotspots")
+        context = min(covering, key=lambda item: item.start_offset)
+        start = max(lower_bound, context.start_offset, end_offset - maximum_length)
+        local_start = start - context.start_offset
+        local_end = end_offset - context.start_offset
+        return start, context.data[local_start:local_end]
 
 
 class FullImageRecoveryCoordinator:
@@ -167,10 +193,29 @@ class FullImageRecoveryCoordinator:
             ).run()
             for database in databases
         )
+        accepted_hits = tuple(
+            hit
+            for hit in hits
+            if any(
+                context.start_offset
+                <= hit.start_offset
+                <= hit.end_offset
+                <= context.end_offset
+                for context in contexts
+            )
+        )
+        metadata_less = MetadataLessBerkeleyFragmentRecoveryPipeline(
+            accepted_hits,
+            source=str(reader.path.resolve()),
+            range_start=start,
+            range_end=range_end,
+            range_reader=range_reader,
+        ).run()
         ordered_direct = tuple(item[2] for item in sorted(direct_with_ranges))
         all_statuses = tuple(result.status for result in ordered_direct) + tuple(
             result.status for result in wallet_results
         )
+        all_statuses += (metadata_less.status,)
         structural_count = sum(
             status is ValidationStatus.STRUCTURAL for status in all_statuses
         )
@@ -198,6 +243,7 @@ class FullImageRecoveryCoordinator:
             direct_results=ordered_direct,
             reconstructed_databases=databases,
             reconstructed_wallet_results=wallet_results,
+            metadata_less_fragment_recovery=metadata_less,
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,
             reasons=reasons,
@@ -243,6 +289,10 @@ class FullImageRecoveryCoordinator:
                     for item in pages
                 ),
                 "errors": tuple(errors),
+                "raw_hit_counts_by_signature": tuple(
+                    (hit_type, sum(hit.hit_type == hit_type for hit in hits))
+                    for hit_type in sorted({hit.hit_type for hit in hits})
+                ),
             },
         )
 

@@ -6,6 +6,7 @@ import sys
 from typing import Sequence
 
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
+from bfrs.recovery.metadata_less_fragments import FRAMED_BITCOIN_RECORD_PATTERNS
 from bfrs.reporting.json_report import write_json_report
 from bfrs.scanners.fast_scanner import Signature
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
@@ -32,12 +33,10 @@ BITCOIN_CORE_SIGNATURES_V1 = (
         BTREE_MAGIC.to_bytes(4, "big"),
         "berkeley_metadata",
     ),
-    Signature("bitcoin_key", b"\x03key", "bitcoin_record"),
-    Signature("bitcoin_wkey", b"\x04wkey", "bitcoin_record"),
-    Signature("bitcoin_defaultkey", b"\x0adefaultkey", "bitcoin_record"),
-    Signature("bitcoin_ckey", b"\x04ckey", "bitcoin_record"),
-    Signature("bitcoin_mkey", b"\x04mkey", "bitcoin_record"),
-    Signature("bitcoin_keymeta", b"\x07keymeta", "bitcoin_record"),
+    *(
+        Signature(name, pattern, "bitcoin_record")
+        for name, pattern in FRAMED_BITCOIN_RECORD_PATTERNS
+    ),
 )
 
 

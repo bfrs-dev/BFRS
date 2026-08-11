@@ -259,7 +259,14 @@ def test_ckey_bait_with_ambiguous_page_copy_does_not_elevate(tmp_path):
         hotspot_padding=1024,
     ).scan(path)
     assert result.reconstructed_databases[0].ambiguous_page_numbers == (20,)
-    assert result.status is ValidationStatus.REJECTED
+    orphan = result.metadata_less_fragment_recovery
+    assert orphan.status is ValidationStatus.FRAGMENT
+    assert orphan.valid_ckey_count == 2
+    assert {item.physical_page_offset for item in orphan.record_locations} == {
+        1024,
+        8192,
+    }
+    assert result.status is ValidationStatus.FRAGMENT
 
 
 def test_generic_berkeley_database_is_rejected_as_wallet(tmp_path):
@@ -309,6 +316,39 @@ def test_false_raw_hits_do_not_elevate_status(tmp_path):
     assert not result.reconstructed_databases
 
 
+def test_rejected_metadata_near_independent_valid_leaf_recovers_fragment(tmp_path):
+    invalid_metadata = bytearray(PAGE_SIZE)
+    invalid_metadata[12:16] = BTREE_MAGIC.to_bytes(4, "little")
+    path = tmp_path / "hp-like-metadata-loss.img"
+    path.write_bytes(
+        placed(
+            {
+                0: bytes(invalid_metadata),
+                4096: leaf(20, *ckey_pair()),
+            }
+        )
+    )
+    result = FullImageRecoveryCoordinator(
+        BITCOIN_CORE_SIGNATURES_V1,
+        CandidatePolicy(min_hits=1, min_distinct_types=1),
+        chunk_size=127,
+        cluster_gap=0,
+        hotspot_padding=1024,
+    ).scan(path)
+
+    assert result.raw_hit_count == 2
+    assert result.evidence["physical_metadata_candidates"] == ()
+    assert result.evidence["physical_page_candidates"] == ()
+    orphan = result.metadata_less_fragment_recovery
+    assert orphan.status is ValidationStatus.FRAGMENT
+    assert orphan.valid_ckey_count == 1
+    assert result.status is ValidationStatus.FRAGMENT
+    assert dict(result.evidence["raw_hit_counts_by_signature"]) == {
+        "berkeley_metadata_little_endian": 1,
+        "bitcoin_ckey": 1,
+    }
+
+
 def test_range_scan_clamps_hotspots_to_requested_range(tmp_path):
     path = tmp_path / "range.img"
     path.write_bytes(b"HIT" + b"x" * 97 + b"HIT" + b"x" * 100)
@@ -349,7 +389,8 @@ def test_range_does_not_import_metadata_or_page_geometry_from_before_start(tmp_p
     )
     assert result.evidence["physical_metadata_candidates"] == ()
     assert result.evidence["physical_page_candidates"] == ()
-    assert result.status is ValidationStatus.REJECTED
+    assert result.metadata_less_fragment_recovery.status is ValidationStatus.FRAGMENT
+    assert result.status is ValidationStatus.FRAGMENT
 
 
 def test_hotspot_read_error_is_isolated_and_diagnosed(tmp_path, monkeypatch):

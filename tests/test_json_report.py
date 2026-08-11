@@ -159,6 +159,16 @@ def test_safe_json_schema_is_explicit_and_deterministic(tmp_path):
     # Direct and globally reconstructed recovery are intentionally counted
     # as separate successful result paths.
     assert payload["structural_result_count"] == 2
+    assert payload["fragment_result_count"] == 1
+    assert payload["status"] == "structural"
+    metadata_less = payload["metadata_less_fragment_summary"]
+    assert metadata_less["status"] == "fragment"
+    assert metadata_less["valid_plaintext_key_count"] == 1
+    assert metadata_less["record_locations"]
+    assert payload["raw_hit_counts_by_signature"] == {
+        "berkeley_metadata_little_endian": 1,
+        "bitcoin_key": 1,
+    }
     assert not contains_bytes(payload)
 
     first = write_json_report(tmp_path / "first.json", result, CONFIGURATION)

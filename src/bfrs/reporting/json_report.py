@@ -171,6 +171,59 @@ def _reconstructed_wallet(wallet) -> dict[str, Any]:
     }
 
 
+def _metadata_less_fragment(result) -> dict[str, Any]:
+    return {
+        "status": result.status.value,
+        "source": result.source,
+        "candidate_page_count": result.candidate_page_count,
+        "structural_leaf_count": result.structural_leaf_count,
+        "fragment_leaf_count": result.fragment_leaf_count,
+        "record_pair_count": result.record_pair_count,
+        "valid_plaintext_key_count": result.valid_plaintext_key_count,
+        "valid_ckey_count": result.valid_ckey_count,
+        "valid_mkey_count": result.valid_mkey_count,
+        "recognized_wkey_count": result.recognized_wkey_count,
+        "recognized_defaultkey_count": result.recognized_defaultkey_count,
+        "recognized_keymeta_count": result.recognized_keymeta_count,
+        "page_locations": [
+            {
+                "physical_offset": page.physical_offset,
+                "page_number": page.page_number,
+                "page_size": page.page_size,
+                "byte_order": page.byte_order,
+                "validation_status": page.validation_status.value,
+            }
+            for page in result.page_locations
+        ],
+        "record_locations": [
+            {
+                "record_type": record.record_type,
+                "physical_page_offset": record.physical_page_offset,
+                "page_number": record.page_number,
+                "page_size": record.page_size,
+                "byte_order": record.byte_order,
+                "page_status": record.page_status.value,
+                "key_offset": record.key_offset,
+                "value_offset": record.value_offset,
+                "discovery_hit_offset": record.discovery_hit_offset,
+            }
+            for record in result.record_locations
+        ],
+        "reasons": list(result.reasons),
+        "diagnostics": {
+            name: result.evidence.get(name, 0)
+            for name in (
+                "candidate_page_starts_tested",
+                "candidate_geometry_count",
+                "page_validation_attempt_count",
+                "page_validator_structural_count",
+                "page_validator_fragment_count",
+                "strong_hit_count",
+            )
+        },
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -224,6 +277,12 @@ def serialize_full_image_result(
             _reconstructed_wallet(item)
             for item in result.reconstructed_wallet_results
         ],
+        "metadata_less_fragment_summary": _metadata_less_fragment(
+            result.metadata_less_fragment_recovery
+        ),
+        "raw_hit_counts_by_signature": dict(
+            result.evidence.get("raw_hit_counts_by_signature", ())
+        ),
         "structural_result_count": result.structural_wallet_count,
         "fragment_result_count": result.fragment_wallet_count,
         "diagnostics": {
