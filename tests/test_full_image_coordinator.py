@@ -2,6 +2,11 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+from bfrs.cli import (
+    BITCOIN_CORE_SIGNATURES_V1,
+    DEFAULT_MINIMUM_DISTINCT_TYPES,
+    DEFAULT_MINIMUM_HITS,
+)
 from bfrs.core.hotspot_reader import HotspotReader
 from bfrs.core.models import ValidationStatus
 from bfrs.core.secp256k1 import GENERATOR, encode_sec_public_key
@@ -199,12 +204,60 @@ def test_ckey_and_mkey_across_hotspots_produce_structural_wallet(tmp_path):
     assert result.status is ValidationStatus.STRUCTURAL
 
 
+def test_default_single_signal_hotspots_share_global_metadata_geometry(tmp_path):
+    path = tmp_path / "single-signal-hotspots.img"
+    path.write_bytes(
+        placed(
+            {
+                0: metadata(),
+                512: internal(10, 20, 900),
+                4096: leaf(20, *ckey_pair()),
+                8192: leaf(900, *mkey_pair()),
+            }
+        )
+    )
+    result = FullImageRecoveryCoordinator(
+        BITCOIN_CORE_SIGNATURES_V1,
+        CandidatePolicy(
+            min_hits=DEFAULT_MINIMUM_HITS,
+            min_distinct_types=DEFAULT_MINIMUM_DISTINCT_TYPES,
+        ),
+        chunk_size=127,
+        cluster_gap=0,
+        hotspot_padding=1024,
+    ).scan(path)
+
+    # One hit in each of three disjoint hotspots proves that local signal
+    # diversity is not required for global structural reconstruction.
+    assert result.raw_hit_count == 3
+    assert result.hotspot_count == 3
+    assert result.accepted_hotspot_count == 3
+    assert all(item[2] for item in result.evidence["hotspot_decisions"])
+    physical_pages = result.evidence["physical_page_candidates"]
+    assert {item[0] for item in physical_pages} == {512, 4096, 8192}
+    assert result.reconstructed_databases[0].leaf_page_numbers == (20, 900)
+    wallet = result.reconstructed_wallet_results[0]
+    assert wallet.structural_ckey_count == 1
+    assert wallet.structural_mkey_count == 1
+    assert wallet.status is ValidationStatus.STRUCTURAL
+    assert result.status is ValidationStatus.STRUCTURAL
+
+
 def test_ckey_bait_with_ambiguous_page_copy_does_not_elevate(tmp_path):
     image = fragmented_encrypted_image(include_mkey=False)
     duplicate = leaf(20, *ckey_pair())
     path = tmp_path / "ambiguous.img"
     path.write_bytes(placed({0: image, 8192: duplicate}))
-    result = coordinator().scan(path)
+    result = FullImageRecoveryCoordinator(
+        BITCOIN_CORE_SIGNATURES_V1,
+        CandidatePolicy(
+            min_hits=DEFAULT_MINIMUM_HITS,
+            min_distinct_types=DEFAULT_MINIMUM_DISTINCT_TYPES,
+        ),
+        chunk_size=127,
+        cluster_gap=0,
+        hotspot_padding=1024,
+    ).scan(path)
     assert result.reconstructed_databases[0].ambiguous_page_numbers == (20,)
     assert result.status is ValidationStatus.REJECTED
 
@@ -266,6 +319,37 @@ def test_range_scan_clamps_hotspots_to_requested_range(tmp_path):
     assert result.raw_hit_count == 1
     assert result.start_offset == 50 and result.end_offset == 150
     assert result.evidence["hotspot_ranges"] == ((50, 150),)
+
+
+def test_range_does_not_import_metadata_or_page_geometry_from_before_start(tmp_path):
+    path = tmp_path / "range-geometry.img"
+    path.write_bytes(
+        placed(
+            {
+                0: metadata(),
+                512: internal(10, 20, 900),
+                4096: leaf(20, *ckey_pair()),
+                8192: leaf(900, *mkey_pair()),
+            }
+        )
+    )
+    result = FullImageRecoveryCoordinator(
+        BITCOIN_CORE_SIGNATURES_V1,
+        CandidatePolicy(min_hits=1, min_distinct_types=1),
+        chunk_size=127,
+        cluster_gap=0,
+        hotspot_padding=2048,
+    ).scan(path, start=4000, end=len(path.read_bytes()))
+
+    assert result.raw_hit_count == 2
+    assert result.accepted_hotspot_count == 2
+    assert all(
+        4000 <= start_offset <= end_offset <= len(path.read_bytes())
+        for start_offset, end_offset in result.evidence["read_hotspot_ranges"]
+    )
+    assert result.evidence["physical_metadata_candidates"] == ()
+    assert result.evidence["physical_page_candidates"] == ()
+    assert result.status is ValidationStatus.REJECTED
 
 
 def test_hotspot_read_error_is_isolated_and_diagnosed(tmp_path, monkeypatch):
