@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import ntpath
 
@@ -72,6 +73,9 @@ class NTFSDirectoryIndexArtifactRecovery:
     rejection_counts: tuple[tuple[str, int], ...]
     candidates: tuple[NTFSDirectoryIndexArtifactCandidate, ...]
     diagnostics: tuple[str, ...]
+    index_block_sizes: tuple[int, ...] = ()
+    current_indx_physical_starts: tuple[int, ...] = ()
+    current_indx_fixed_sha256: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +113,9 @@ class NTFSDirectoryIndexArtifactRecoveryPipeline:
         diagnostics: list[str] = []
         candidates: list[NTFSDirectoryIndexArtifactCandidate] = []
         identities: set[tuple[object, ...]] = set()
+        index_block_sizes: set[int] = set()
+        current_block_starts: set[int] = set()
+        current_block_hashes: set[str] = set()
         image = _Image(Path(context.source))
         mft_stream = _LogicalStream(
             image, context.mft_extents, context.mft_logical_size
@@ -176,6 +183,7 @@ class NTFSDirectoryIndexArtifactRecoveryPipeline:
                         rejections[str(error)] += 1
                         continue
                     roots.append((offset, value_offset, value, geometry))
+                    index_block_sizes.add(geometry.block_size)
                 elif type_code == ATTRIBUTE_INDEX_ALLOCATION:
                     if not nonresident:
                         rejections["index_allocation_resident"] += 1
@@ -252,6 +260,11 @@ class NTFSDirectoryIndexArtifactRecoveryPipeline:
                 for block_number in range(full_block_count):
                     counters["indx_block_count"] += 1
                     block_offset = block_number * geometry.block_size
+                    physical_start = allocation_stream.physical_offset_for(
+                        block_offset, geometry.block_size
+                    )
+                    if physical_start is not None:
+                        current_block_starts.add(physical_start)
                     try:
                         block = allocation_stream.read_at(
                             block_offset, geometry.block_size
@@ -270,6 +283,9 @@ class NTFSDirectoryIndexArtifactRecoveryPipeline:
                         rejections[str(error)] += 1
                         continue
                     counters["indx_block_valid_count"] += 1
+                    current_block_hashes.add(
+                        hashlib.sha256(fixed_block).hexdigest()
+                    )
                     counters["active_entry_count"] += len(active)
                     counters["slack_candidate_count"] += slack_attempts
                     counters["structural_slack_entry_count"] += len(slack)
@@ -327,6 +343,9 @@ class NTFSDirectoryIndexArtifactRecoveryPipeline:
             rejection_counts=tuple(sorted(rejections.items())),
             candidates=ordered,
             diagnostics=tuple(diagnostics),
+            index_block_sizes=tuple(sorted(index_block_sizes)),
+            current_indx_physical_starts=tuple(sorted(current_block_starts)),
+            current_indx_fixed_sha256=tuple(sorted(current_block_hashes)),
         )
 
     @staticmethod
@@ -436,7 +455,7 @@ class NTFSDirectoryIndexArtifactRecoveryPipeline:
     @staticmethod
     def _validated_indx(
         block: bytes,
-        logical_offset: int,
+        logical_offset: int | None,
         context: NTFSStaleRecoveryContext,
     ) -> tuple[bytes, int]:
         if block[:4] != b"INDX":
@@ -447,9 +466,10 @@ class NTFSDirectoryIndexArtifactRecoveryPipeline:
             block, context.boot.bytes_per_sector
         )
         vcn = int.from_bytes(fixed[16:24], "little")
-        expected_vcn = logical_offset // context.boot.cluster_size
-        if logical_offset % context.boot.cluster_size or vcn != expected_vcn:
-            raise NtfsMftRecordError("indx_vcn_invalid")
+        if logical_offset is not None:
+            expected_vcn = logical_offset // context.boot.cluster_size
+            if logical_offset % context.boot.cluster_size or vcn != expected_vcn:
+                raise NtfsMftRecordError("indx_vcn_invalid")
         return fixed, vcn
 
     def _parse_node(

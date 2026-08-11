@@ -37,6 +37,11 @@ from bfrs.recovery.ntfs_stale_file import (
     NTFSStaleFileRecordRecovery,
     NTFSStaleFileRecordRecoveryPipeline,
 )
+from bfrs.recovery.ntfs_stale_indx import (
+    NTFS_INDX_RECORD_SIGNATURE,
+    NTFSStaleINDXRecovery,
+    NTFSStaleINDXRecoveryPipeline,
+)
 from bfrs.recovery.orphan_record_key_diagnostic import (
     OrphanBitcoinRecordKeyDiagnostic,
     OrphanBitcoinRecordKeyDiagnosticPipeline,
@@ -100,6 +105,7 @@ class FullImageRecoveryResult:
     ntfs_directory_index_artifact_recovery: (
         NTFSDirectoryIndexArtifactRecovery | None
     ) = None
+    ntfs_stale_indx_recovery: NTFSStaleINDXRecovery | None = None
 
 
 class _AcceptedContextRangeReader:
@@ -195,6 +201,14 @@ class FullImageRecoveryCoordinator:
             context=ntfs_locator.stale_recovery_context,
             locator=ntfs_locator,
         )
+        stale_indx_pipeline = NTFSStaleINDXRecoveryPipeline(
+            source=reader.path,
+            range_start=start,
+            range_end=range_end,
+            context=ntfs_locator.stale_recovery_context,
+            locator=ntfs_locator,
+            current_index=ntfs_directory_index_artifact_recovery,
+        )
         recovery_hits: list[RawHit] = []
         raw_hit_counts: Counter[str] = Counter()
         try:
@@ -202,12 +216,16 @@ class FullImageRecoveryCoordinator:
                 raw_hit_counts[hit.hit_type] += 1
                 if hit.hit_type == NTFS_FILE_RECORD_SIGNATURE:
                     stale_pipeline.process_hit(hit)
+                elif hit.hit_type == NTFS_INDX_RECORD_SIGNATURE:
+                    stale_indx_pipeline.process_hit(hit)
                 else:
                     recovery_hits.append(hit)
         except BaseException:
             stale_pipeline.close()
+            stale_indx_pipeline.close()
             raise
         ntfs_stale_file_record_recovery = stale_pipeline.finish()
+        ntfs_stale_indx_recovery = stale_indx_pipeline.finish()
         hits = tuple(recovery_hits)
         hotspots = self._range_hotspots(hits, start, range_end)
 
@@ -343,6 +361,7 @@ class FullImageRecoveryCoordinator:
             ntfs_directory_index_artifact_recovery=(
                 ntfs_directory_index_artifact_recovery
             ),
+            ntfs_stale_indx_recovery=ntfs_stale_indx_recovery,
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,
             reasons=reasons,

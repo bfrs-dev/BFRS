@@ -15,6 +15,10 @@ from bfrs.recovery.ntfs_stale_file import (
     NTFS_FILE_RECORD_PATTERN,
     NTFS_FILE_RECORD_SIGNATURE,
 )
+from bfrs.recovery.ntfs_stale_indx import (
+    NTFS_INDX_RECORD_PATTERN,
+    NTFS_INDX_RECORD_SIGNATURE,
+)
 from bfrs.reporting.json_report import write_json_report
 from bfrs.scanners.fast_scanner import Signature
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
@@ -35,6 +39,11 @@ BITCOIN_CORE_SIGNATURES_V1 = (
         NTFS_FILE_RECORD_SIGNATURE,
         NTFS_FILE_RECORD_PATTERN,
         "ntfs_file_record",
+    ),
+    Signature(
+        NTFS_INDX_RECORD_SIGNATURE,
+        NTFS_INDX_RECORD_PATTERN,
+        "ntfs_indx_record",
     ),
     Signature(
         "berkeley_metadata_little_endian",

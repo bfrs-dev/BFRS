@@ -671,6 +671,79 @@ def _ntfs_directory_index_artifact_recovery(result) -> dict[str, Any]:
     }
 
 
+def _ntfs_stale_indx_recovery(result) -> dict[str, Any]:
+    if result is None:
+        return {
+            "source": None,
+            "raw_indx_hit_count": 0,
+            "current_indx_excluded_count": 0,
+            "candidate_block_count": 0,
+            "structural_stale_indx_count": 0,
+            "rejected_block_count": 0,
+            "active_entry_count": 0,
+            "slack_candidate_count": 0,
+            "structural_slack_entry_count": 0,
+            "wallet_candidate_count": 0,
+            "bitcoin_context_candidate_count": 0,
+            "rejection_counts": {},
+            "diagnostic_sample_limit": 0,
+            "blocks": [],
+            "candidates": [],
+            "diagnostics": ["ntfs_stale_indx_recovery_not_available"],
+        }
+    return {
+        "source": result.source,
+        "raw_indx_hit_count": result.raw_indx_hit_count,
+        "current_indx_excluded_count": result.current_indx_excluded_count,
+        "candidate_block_count": result.candidate_block_count,
+        "structural_stale_indx_count": result.structural_stale_indx_count,
+        "rejected_block_count": result.rejected_block_count,
+        "active_entry_count": result.active_entry_count,
+        "slack_candidate_count": result.slack_candidate_count,
+        "structural_slack_entry_count": result.structural_slack_entry_count,
+        "wallet_candidate_count": result.wallet_candidate_count,
+        "bitcoin_context_candidate_count": (
+            result.bitcoin_context_candidate_count
+        ),
+        "rejection_counts": dict(result.rejection_counts),
+        "diagnostic_sample_limit": result.diagnostic_sample_limit,
+        "blocks": [
+            {
+                "physical_offset": block.physical_offset,
+                "index_block_size": block.index_block_size,
+                "embedded_vcn": block.embedded_vcn,
+                "validation_strength": block.validation_strength,
+                "comparison_to_current": block.comparison_to_current,
+                "active_entry_count": block.active_entry_count,
+                "structural_slack_entry_count": (
+                    block.structural_slack_entry_count
+                ),
+            }
+            for block in result.blocks
+        ],
+        "candidates": [
+            {
+                "source_block_physical_offset": (
+                    item.source_block_physical_offset
+                ),
+                "embedded_vcn": item.embedded_vcn,
+                "entry_offset": item.entry_offset,
+                "entry_state": item.entry_state,
+                "file_reference_record": item.file_reference_record,
+                "file_reference_sequence": item.file_reference_sequence,
+                "filename": item.filename,
+                "namespace": item.namespace,
+                "reference_state": item.reference_state,
+                "artifact_class": item.artifact_class,
+                "validation_strength": item.validation_strength,
+                "source_directory_known": item.source_directory_known,
+            }
+            for item in result.candidates
+        ],
+        "diagnostics": list(result.diagnostics),
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -753,6 +826,9 @@ def serialize_full_image_result(
             _ntfs_directory_index_artifact_recovery(
                 result.ntfs_directory_index_artifact_recovery
             )
+        ),
+        "ntfs_stale_indx_recovery": _ntfs_stale_indx_recovery(
+            result.ntfs_stale_indx_recovery
         ),
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())

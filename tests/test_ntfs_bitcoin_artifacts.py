@@ -13,11 +13,16 @@ from bfrs.recovery.ntfs_stale_file import (
     NTFS_FILE_RECORD_SIGNATURE,
     NTFSStaleFileRecordRecoveryPipeline,
 )
+from bfrs.recovery.ntfs_stale_indx import (
+    NTFS_INDX_RECORD_SIGNATURE,
+    NTFSStaleINDXRecoveryPipeline,
+)
 from bfrs.recovery.ntfs_directory_index import (
     NTFSDirectoryIndexArtifactRecoveryPipeline,
 )
 from bfrs.reporting.json_report import (
     _ntfs_directory_index_artifact_recovery,
+    _ntfs_stale_indx_recovery,
 )
 from bfrs.reporting.json_report import _ntfs_bitcoin_artifact_index
 from bfrs.reporting.json_report import _ntfs_mft_recovery_diagnostic
@@ -527,6 +532,213 @@ def test_directory_index_duplicate_location_is_one_candidate(
     )
     assert result.wallet_candidate_count == 1
     assert len(wallet_candidates) == 1
+
+
+def stale_indx_pipeline(
+    tmp_path,
+    *,
+    stale_block: bytes | None = None,
+    current_block: bytes | None = None,
+    range_end: int | None = None,
+    target_sequence: int = 1,
+):
+    allocation = named_nonresident(
+        0xA0,
+        "$I30",
+        run(1, 80) + b"\x00",
+        logical_size=CLUSTER,
+        highest_vcn=0,
+    )
+    directory = file_record(
+        6,
+        (filename("Directory", parent=5), index_root(()), allocation),
+        directory=True,
+    )
+    target = file_record(
+        7, (filename("current.dat"),), sequence=target_sequence
+    )
+    image = bytearray(image_with({6: directory, 7: target}))
+    current_offset = 80 * CLUSTER
+    stale_offset = 90 * CLUSTER
+    image[current_offset:current_offset + CLUSTER] = (
+        current_block if current_block is not None else indx_block(())
+    )
+    if stale_block is not None:
+        image[stale_offset:stale_offset + CLUSTER] = stale_block
+    path = tmp_path / "stale-indx.img"
+    path.write_bytes(image)
+    locator = NTFSBitcoinArtifactLocator()
+    locator.index(path)
+    current = NTFSDirectoryIndexArtifactRecoveryPipeline(
+        context=locator.stale_recovery_context,
+        locator=locator,
+    ).run()
+    pipeline = NTFSStaleINDXRecoveryPipeline(
+        source=path,
+        range_start=0,
+        range_end=len(image) if range_end is None else range_end,
+        context=locator.stale_recovery_context,
+        locator=locator,
+        current_index=current,
+    )
+    return pipeline, current_offset, stale_offset, current
+
+
+def indx_hit(offset: int) -> RawHit:
+    return RawHit(
+        start_offset=offset,
+        end_offset=offset + 4,
+        hit_type=NTFS_INDX_RECORD_SIGNATURE,
+        confidence=1.0,
+        source="test",
+    )
+
+
+def test_stale_indx_current_block_exclusion_and_duplicate_hit(tmp_path) -> None:
+    pipeline, current_offset, _, _ = stale_indx_pipeline(tmp_path)
+    hit = indx_hit(current_offset)
+    pipeline.process_hit(hit)
+    pipeline.process_hit(hit)
+    result = pipeline.finish()
+    assert result.raw_indx_hit_count == 2
+    assert result.current_indx_excluded_count == 1
+    assert result.candidate_block_count == 0
+    assert result.structural_stale_indx_count == 0
+
+
+def test_stale_indx_valid_active_wallet_and_reused_reference(tmp_path) -> None:
+    stale = indx_block((index_entry("wallet.dat", sequence=5),))
+    pipeline, _, stale_offset, _ = stale_indx_pipeline(
+        tmp_path, stale_block=stale, target_sequence=18
+    )
+    pipeline.process_hit(indx_hit(stale_offset))
+    result = pipeline.finish()
+    assert result.structural_stale_indx_count == 1
+    assert result.active_entry_count == 1
+    assert result.wallet_candidate_count == 1
+    candidate = next(
+        item for item in result.candidates if item.filename == "wallet.dat"
+    )
+    assert candidate.entry_state == "active"
+    assert candidate.reference_state == "current_record_reused_sequence_differs"
+    assert candidate.validation_strength == "raw_stale_indx_active_entry"
+    assert candidate.source_directory_known is False
+
+
+def test_stale_indx_slack_wallet_and_active_end(tmp_path) -> None:
+    stale = indx_block((), slack=index_entry("wallet.dat"))
+    pipeline, _, stale_offset, _ = stale_indx_pipeline(
+        tmp_path, stale_block=stale
+    )
+    pipeline.process_hit(indx_hit(stale_offset))
+    result = pipeline.finish()
+    assert result.active_entry_count == 0
+    assert result.structural_slack_entry_count == 1
+    assert result.wallet_candidate_count == 1
+    assert result.candidates[0].entry_state == "slack"
+    assert result.candidates[0].validation_strength == (
+        "raw_stale_indx_slack_entry"
+    )
+
+
+def test_stale_indx_bad_usa_and_random_string_rejected(tmp_path) -> None:
+    bad_usa = indx_block(
+        (), slack=index_entry("wallet.dat"), valid_usa=False
+    )
+    pipeline, _, stale_offset, _ = stale_indx_pipeline(
+        tmp_path, stale_block=bad_usa
+    )
+    pipeline.process_hit(indx_hit(stale_offset))
+    result = pipeline.finish()
+    assert result.rejected_block_count == 1
+    assert result.active_entry_count == 0
+    assert result.structural_slack_entry_count == 0
+    assert result.wallet_candidate_count == 0
+
+    random_block = bytearray(CLUSTER)
+    random_block[:4] = b"INDX"
+    random_block[100:120] = "wallet.dat".encode("utf-16-le")
+    random_pipeline, _, random_offset, _ = stale_indx_pipeline(
+        tmp_path, stale_block=bytes(random_block)
+    )
+    random_pipeline.process_hit(indx_hit(random_offset))
+    random_result = random_pipeline.finish()
+    assert random_result.structural_stale_indx_count == 0
+    assert random_result.wallet_candidate_count == 0
+
+
+def test_stale_indx_wallet_empty_context_and_out_of_range(tmp_path) -> None:
+    stale = indx_block(
+        (
+            index_entry("Wallet-Empty.png"),
+            index_entry("debug.log", record=9),
+        )
+    )
+    pipeline, _, stale_offset, _ = stale_indx_pipeline(
+        tmp_path, stale_block=stale
+    )
+    pipeline.process_hit(indx_hit(stale_offset))
+    result = pipeline.finish()
+    assert result.wallet_candidate_count == 0
+    assert result.bitcoin_context_candidate_count == 1
+    debug = next(item for item in result.candidates if item.filename == "debug.log")
+    assert debug.reference_state == "record_number_out_of_range"
+
+
+def test_stale_indx_copy_of_current_outside_stream_is_preserved(tmp_path) -> None:
+    block = indx_block((index_entry("debug.log"),))
+    pipeline, _, stale_offset, _ = stale_indx_pipeline(
+        tmp_path, stale_block=block, current_block=block
+    )
+    pipeline.process_hit(indx_hit(stale_offset))
+    result = pipeline.finish()
+    assert result.current_indx_excluded_count == 0
+    assert result.structural_stale_indx_count == 1
+    assert result.blocks[0].comparison_to_current == (
+        "content_matches_current_indx"
+    )
+
+
+def test_stale_indx_range_safety_and_safe_json(tmp_path) -> None:
+    block = indx_block((index_entry("wallet.dat"),))
+    pipeline, _, stale_offset, _ = stale_indx_pipeline(
+        tmp_path,
+        stale_block=block,
+        range_end=90 * CLUSTER + CLUSTER - 1,
+    )
+    pipeline.process_hit(indx_hit(stale_offset))
+    result = pipeline.finish()
+    assert result.structural_stale_indx_count == 0
+    assert dict(result.rejection_counts)["candidate_outside_safe_range"] == 1
+    payload = _ntfs_stale_indx_recovery(result)
+    encoded = json.dumps(payload, sort_keys=True).lower()
+    assert "raw_indx_bytes" not in encoded
+    assert "payload" not in encoded
+    assert "private_key" not in encoded
+
+
+def test_coordinator_same_scan_pass_routes_indx_without_hotspots(tmp_path) -> None:
+    block = indx_block((index_entry("wallet.dat"),))
+    direct_pipeline, _, stale_offset, _ = stale_indx_pipeline(
+        tmp_path, stale_block=block
+    )
+    path = direct_pipeline._path
+    result = FullImageRecoveryCoordinator(
+        BITCOIN_CORE_SIGNATURES_V1,
+        CandidatePolicy(min_hits=1, min_distinct_types=1),
+        chunk_size=64 * 1024,
+    ).scan(path)
+    raw_counts = dict(result.evidence["raw_hit_counts_by_signature"])
+    stale = result.ntfs_stale_indx_recovery
+    assert raw_counts[NTFS_INDX_RECORD_SIGNATURE] >= 2
+    assert stale.current_indx_excluded_count == 1
+    assert stale.structural_stale_indx_count == 1
+    assert stale.wallet_candidate_count == 1
+    assert stale.candidates[0].source_block_physical_offset == stale_offset
+    assert result.hotspot_count == 0
+    assert result.status is ValidationStatus.REJECTED
+    assert result.structural_wallet_count == 0
+    assert result.fragment_wallet_count == 0
 
 
 def test_allocated_wallet_fragmented_nonresident_extents(tmp_path) -> None:
