@@ -396,6 +396,147 @@ def _ntfs_bitcoin_artifact_index(index) -> dict[str, Any]:
     }
 
 
+def _ntfs_extent(extent) -> dict[str, Any]:
+    return {
+        "vcn_start": extent.vcn_start,
+        "vcn_end": extent.vcn_end,
+        "physical_lcn_start": extent.physical_lcn_start,
+        "physical_byte_start": extent.physical_byte_start,
+        "physical_byte_end": extent.physical_byte_end,
+        "sparse": extent.sparse,
+    }
+
+
+def _ntfs_alias(alias) -> dict[str, Any]:
+    return {
+        "filename": alias.filename,
+        "namespace": alias.namespace,
+        "parent_mft_record_number": alias.parent_mft_record_number,
+        "parent_sequence_number": alias.parent_sequence_number,
+    }
+
+
+def _ntfs_mft_recovery_diagnostic(index) -> dict[str, Any]:
+    diagnostic = None if index is None else index.mft_recovery_diagnostic
+    if diagnostic is None:
+        return {
+            "source": None,
+            "mirror_physical_offset": None,
+            "mirror_record_count_expected": 0,
+            "mirror_record_count_read": 0,
+            "mirror_record_count_valid": 0,
+            "mirror_record_count_invalid": 0,
+            "mirror_difference_counts": {},
+            "mirror_comparisons": [],
+            "invalid_main_record_count": 0,
+            "invalid_reason_counts": {},
+            "invalid_main_records": [],
+            "partial_salvage_count": 0,
+            "salvaged_wallet_candidate_count": 0,
+            "salvaged_bitcoin_context_count": 0,
+            "mirror_artifact_candidates": [],
+            "partial_salvage_candidates": [],
+            "diagnostics": ["ntfs_mft_recovery_diagnostic_not_available"],
+        }
+    return {
+        "source": diagnostic.source,
+        "mirror_physical_offset": diagnostic.mirror_physical_offset,
+        "mirror_record_count_expected": (
+            diagnostic.mirror_record_count_expected
+        ),
+        "mirror_record_count_read": diagnostic.mirror_record_count_read,
+        "mirror_record_count_valid": diagnostic.mirror_record_count_valid,
+        "mirror_record_count_invalid": diagnostic.mirror_record_count_invalid,
+        "mirror_difference_counts": dict(
+            diagnostic.mirror_difference_counts
+        ),
+        "mirror_comparisons": [
+            {
+                "mft_record_number": item.mft_record_number,
+                "classification": item.classification,
+                "main_valid": item.main_valid,
+                "mirror_valid": item.mirror_valid,
+                "main_sequence_number": item.main_sequence_number,
+                "mirror_sequence_number": item.mirror_sequence_number,
+                "sequence_equal": item.sequence_equal,
+                "flags_equal": item.flags_equal,
+                "bytes_in_use_equal": item.bytes_in_use_equal,
+                "first_attribute_offset_equal": (
+                    item.first_attribute_offset_equal
+                ),
+                "filename_metadata_equal": item.filename_metadata_equal,
+                "data_metadata_equal": item.data_metadata_equal,
+                "fixed_record_sha256_equal": item.fixed_record_sha256_equal,
+                "main_fixed_sha256": item.main_fixed_sha256,
+                "mirror_fixed_sha256": item.mirror_fixed_sha256,
+            }
+            for item in diagnostic.mirror_comparisons
+        ],
+        "invalid_main_record_count": diagnostic.invalid_main_record_count,
+        "invalid_reason_counts": dict(diagnostic.invalid_reason_counts),
+        "invalid_main_records": [
+            {
+                "mft_record_number": item.mft_record_number,
+                "logical_mft_offset": item.logical_mft_offset,
+                "physical_offset": item.physical_offset,
+                "failure_stage": item.failure_stage,
+                "failure_reason": item.failure_reason,
+            }
+            for item in diagnostic.invalid_main_records
+        ],
+        "partial_salvage_count": diagnostic.partial_salvage_count,
+        "salvaged_wallet_candidate_count": (
+            diagnostic.salvaged_wallet_candidate_count
+        ),
+        "salvaged_bitcoin_context_count": (
+            diagnostic.salvaged_bitcoin_context_count
+        ),
+        "mirror_artifact_candidates": [
+            {
+                "mft_record_number": item.mft_record_number,
+                "sequence_number": item.sequence_number,
+                "allocation_state": item.allocation_state,
+                "filename": item.filename,
+                "aliases": [_ntfs_alias(alias) for alias in item.aliases],
+                "artifact_class": item.artifact_class,
+                "resident": item.resident,
+                "nonresident": item.nonresident,
+                "logical_size": item.logical_size,
+                "allocated_size": item.allocated_size,
+                "extent_count": len(item.extents),
+                "extents": [_ntfs_extent(extent) for extent in item.extents],
+                "source_kind": item.source_kind,
+            }
+            for item in diagnostic.mirror_artifact_candidates
+        ],
+        "partial_salvage_candidates": [
+            {
+                "mft_record_number": item.mft_record_number,
+                "logical_mft_offset": item.logical_mft_offset,
+                "physical_offset": item.physical_offset,
+                "failure_stage": item.failure_stage,
+                "failure_reason": item.failure_reason,
+                "valid_prefix_attribute_count": (
+                    item.valid_prefix_attribute_count
+                ),
+                "aliases": [_ntfs_alias(alias) for alias in item.aliases],
+                "artifact_class": item.artifact_class,
+                "resident": item.resident,
+                "nonresident": item.nonresident,
+                "logical_size": item.logical_size,
+                "allocated_size": item.allocated_size,
+                "extent_count": len(item.extents),
+                "extents": [_ntfs_extent(extent) for extent in item.extents],
+                "extent_trust": item.extent_trust,
+                "confidence": item.confidence,
+                "source_kind": item.source_kind,
+            }
+            for item in diagnostic.partial_salvage_candidates
+        ],
+        "diagnostics": list(diagnostic.diagnostics),
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -464,6 +605,9 @@ def serialize_full_image_result(
             )
         ),
         "ntfs_bitcoin_artifact_index": _ntfs_bitcoin_artifact_index(
+            result.ntfs_bitcoin_artifact_index
+        ),
+        "ntfs_mft_recovery_diagnostic": _ntfs_mft_recovery_diagnostic(
             result.ntfs_bitcoin_artifact_index
         ),
         "raw_hit_counts_by_signature": dict(

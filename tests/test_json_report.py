@@ -197,6 +197,9 @@ def test_safe_json_schema_is_explicit_and_deterministic(tmp_path):
     ntfs_index = payload["ntfs_bitcoin_artifact_index"]
     assert ntfs_index["wallet_dat_candidate_count"] == 0
     assert ntfs_index["candidates"] == []
+    mft_diagnostic = payload["ntfs_mft_recovery_diagnostic"]
+    assert mft_diagnostic["mirror_record_count_expected"] == 0
+    assert mft_diagnostic["partial_salvage_candidates"] == []
     assert not contains_bytes(payload)
 
     first = write_json_report(tmp_path / "first.json", result, CONFIGURATION)

@@ -9,6 +9,7 @@ from bfrs.recovery.ntfs_bitcoin_artifacts import (
     NTFSBitcoinArtifactLocator,
 )
 from bfrs.reporting.json_report import _ntfs_bitcoin_artifact_index
+from bfrs.reporting.json_report import _ntfs_mft_recovery_diagnostic
 from bfrs.validators.candidate_policy import CandidatePolicy
 
 
@@ -114,12 +115,12 @@ def file_record(
     return bytes(fixed)
 
 
-def boot_sector() -> bytes:
+def boot_sector(cluster_size: int = CLUSTER) -> bytes:
     boot = bytearray(512)
     boot[0:3] = b"\xeb\x52\x90"
     boot[3:11] = b"NTFS    "
     boot[11:13] = SECTOR.to_bytes(2, "little")
-    boot[13] = CLUSTER // SECTOR
+    boot[13] = cluster_size // SECTOR
     boot[40:48] = (IMAGE_SIZE // SECTOR).to_bytes(8, "little")
     boot[48:56] = MFT_LCN.to_bytes(8, "little")
     boot[56:64] = (8).to_bytes(8, "little")
@@ -128,10 +129,16 @@ def boot_sector() -> bytes:
     return bytes(boot)
 
 
-def image_with(records: dict[int, bytes], *, mbr: bool = False) -> bytes:
+def image_with(
+    records: dict[int, bytes],
+    *,
+    mbr: bool = False,
+    mirror_records: dict[int, bytes] | None = None,
+    cluster_size: int = CLUSTER,
+) -> bytes:
     volume_offset = CLUSTER if mbr else 0
     image = bytearray(IMAGE_SIZE + volume_offset)
-    image[volume_offset:volume_offset + 512] = boot_sector()
+    image[volume_offset:volume_offset + 512] = boot_sector(cluster_size)
     if mbr:
         image[510:512] = b"\x55\xaa"
         entry = bytearray(16)
@@ -139,17 +146,26 @@ def image_with(records: dict[int, bytes], *, mbr: bool = False) -> bytes:
         entry[8:12] = (volume_offset // 512).to_bytes(4, "little")
         entry[12:16] = (IMAGE_SIZE // 512).to_bytes(4, "little")
         image[446:462] = entry
-    mft_pairs = run(MFT_RECORDS * RECORD // CLUSTER, MFT_LCN) + b"\x00"
+    mft_cluster_count = (
+        MFT_RECORDS * RECORD + cluster_size - 1
+    ) // cluster_size
+    mft_pairs = run(mft_cluster_count, MFT_LCN) + b"\x00"
     mft_data = data_nonresident(
         mft_pairs,
-        MFT_RECORDS * RECORD // CLUSTER - 1,
+        mft_cluster_count - 1,
         logical_size=MFT_RECORDS * RECORD,
-        allocated_size=MFT_RECORDS * RECORD,
+        allocated_size=mft_cluster_count * cluster_size,
     )
     all_records = {0: file_record(0, (mft_data,)), **records}
-    start = volume_offset + MFT_LCN * CLUSTER
+    start = volume_offset + MFT_LCN * cluster_size
     for number, record in all_records.items():
         image[start + number * RECORD:start + (number + 1) * RECORD] = record
+    mirror_start = volume_offset + 8 * cluster_size
+    for number, record in (mirror_records or {}).items():
+        image[
+            mirror_start + number * RECORD:
+            mirror_start + (number + 1) * RECORD
+        ] = record
     return bytes(image)
 
 
@@ -306,3 +322,184 @@ def test_coordinator_runs_index_without_changing_wallet_status(tmp_path) -> None
     assert result.status is ValidationStatus.REJECTED
     assert result.structural_wallet_count == 0
     assert result.fragment_wallet_count == 0
+
+
+def malformed_attribute() -> bytes:
+    value = bytearray(16)
+    value[0:4] = (0x80).to_bytes(4, "little")
+    value[4:8] = (24).to_bytes(4, "little")
+    return bytes(value)
+
+
+def locate_image(tmp_path, raw: bytes):
+    path = tmp_path / "mft-recovery.img"
+    path.write_bytes(raw)
+    return NTFSBitcoinArtifactLocator().index(path)
+
+
+def test_mirror_valid_main_valid_identical(tmp_path) -> None:
+    record = file_record(1, (filename("$MFTMirr"),), directory=True)
+    result = locate_image(
+        tmp_path,
+        image_with({1: record}, mirror_records={1: record}),
+    )
+    diagnostic = result.mft_recovery_diagnostic
+    comparison = diagnostic.mirror_comparisons[1]
+    assert diagnostic.mirror_record_count_expected == 4
+    assert diagnostic.mirror_record_count_read == 4
+    assert comparison.classification == "identical"
+    assert comparison.fixed_record_sha256_equal is True
+
+
+@pytest.mark.parametrize("cluster_size", [4096, 8192, 65536])
+def test_mft_mirror_is_exactly_four_records_for_supported_geometry(
+    tmp_path,
+    cluster_size: int,
+) -> None:
+    main_records = {
+        number: file_record(number, (filename(f"$Meta{number}"),))
+        for number in range(1, 5)
+    }
+    mirror_records = {
+        number: file_record(number, (filename(f"$Meta{number}"),))
+        for number in range(4)
+    }
+    mirror_records[4] = file_record(4, (filename("wallet.dat"),))
+    result = locate_image(
+        tmp_path,
+        image_with(
+            main_records,
+            mirror_records=mirror_records,
+            cluster_size=cluster_size,
+        ),
+    )
+    diagnostic = result.mft_recovery_diagnostic
+    assert diagnostic.mirror_record_count_expected == 4
+    assert diagnostic.mirror_record_count_read == 4
+    assert len(diagnostic.mirror_comparisons) == 4
+    assert all(
+        item.mft_record_number < 4
+        for item in diagnostic.mirror_comparisons
+    )
+    assert diagnostic.mirror_artifact_candidates == ()
+
+
+def test_mirror_valid_main_invalid_is_alternative_artifact_source(tmp_path) -> None:
+    mirror_wallet = file_record(
+        1,
+        (filename("wallet.dat"), data_resident(b"MIRROR-PAYLOAD")),
+    )
+    broken_main = bytearray(mirror_wallet)
+    broken_main[510:512] = b"XX"
+    result = locate_image(
+        tmp_path,
+        image_with(
+            {1: bytes(broken_main)},
+            mirror_records={1: mirror_wallet},
+        ),
+    )
+    diagnostic = result.mft_recovery_diagnostic
+    comparison = diagnostic.mirror_comparisons[1]
+    assert comparison.classification == "mirror_valid_main_invalid"
+    assert diagnostic.mirror_artifact_candidates[0].filename == "wallet.dat"
+    assert diagnostic.mirror_artifact_candidates[0].source_kind == "mft_mirror"
+    assert diagnostic.partial_salvage_count == 0
+    encoded = json.dumps(_ntfs_mft_recovery_diagnostic(result))
+    assert "MIRROR-PAYLOAD" not in encoded
+
+
+def test_mirror_valid_main_valid_different(tmp_path) -> None:
+    main = file_record(1, (filename("$MFTMirr"),), sequence=1)
+    mirror = file_record(1, (filename("$MFTMirr"),), sequence=2)
+    result = locate_image(
+        tmp_path,
+        image_with({1: main}, mirror_records={1: mirror}),
+    )
+    comparison = result.mft_recovery_diagnostic.mirror_comparisons[1]
+    assert comparison.classification == "mirror_valid_main_valid_different"
+    assert comparison.sequence_equal is False
+
+
+def test_invalid_usa_never_allows_partial_salvage(tmp_path) -> None:
+    main = bytearray(
+        file_record(6, (filename("wallet.dat"), data_resident(b"x")))
+    )
+    main[510:512] = b"XX"
+    result = locate_image(tmp_path, image_with({6: bytes(main)}))
+    diagnostic = result.mft_recovery_diagnostic
+    invalid = next(
+        item for item in diagnostic.invalid_main_records
+        if item.mft_record_number == 6
+    )
+    assert invalid.failure_stage == "usa_invalid"
+    assert not any(
+        item.mft_record_number == 6
+        for item in diagnostic.partial_salvage_candidates
+    )
+
+
+def test_valid_prefix_wallet_and_data_are_salvaged_before_damage(tmp_path) -> None:
+    main = file_record(
+        6,
+        (
+            filename("wallet.dat"),
+            data_resident(b"DO-NOT-REPORT"),
+            malformed_attribute(),
+        ),
+    )
+    result = locate_image(tmp_path, image_with({6: main}))
+    diagnostic = result.mft_recovery_diagnostic
+    salvage = next(
+        item for item in diagnostic.partial_salvage_candidates
+        if item.mft_record_number == 6
+    )
+    assert diagnostic.salvaged_wallet_candidate_count == 1
+    assert salvage.valid_prefix_attribute_count == 2
+    assert salvage.aliases[0].filename == "wallet.dat"
+    assert salvage.resident is True
+    assert salvage.logical_size == len(b"DO-NOT-REPORT")
+    assert salvage.extent_trust == "partial_invalid_record"
+    assert salvage.source_kind == "invalid_mft_partial"
+    encoded = json.dumps(_ntfs_mft_recovery_diagnostic(result))
+    assert "DO-NOT-REPORT" not in encoded
+
+
+def test_raw_wallet_string_is_not_salvaged_as_filename(tmp_path) -> None:
+    main = file_record(
+        6,
+        (resident(0x10, b"wallet.dat"), malformed_attribute()),
+    )
+    diagnostic = locate_image(
+        tmp_path, image_with({6: main})
+    ).mft_recovery_diagnostic
+    assert diagnostic.salvaged_wallet_candidate_count == 0
+
+
+def test_salvaged_wallet_empty_png_is_not_wallet_candidate(tmp_path) -> None:
+    main = file_record(
+        6,
+        (filename("Wallet-Empty.png"), malformed_attribute()),
+    )
+    diagnostic = locate_image(
+        tmp_path, image_with({6: main})
+    ).mft_recovery_diagnostic
+    assert diagnostic.salvaged_wallet_candidate_count == 0
+
+
+def test_mirror_bitcoin_context_uses_existing_path_classification(tmp_path) -> None:
+    bitcoin = file_record(
+        1, (filename("Bitcoin", parent=1),), directory=True
+    )
+    debug = file_record(
+        2, (filename("debug.log", parent=1), data_resident(b"log"))
+    )
+    result = locate_image(
+        tmp_path,
+        image_with(
+            {1: bitcoin, 2: debug},
+            mirror_records={1: bitcoin, 2: debug},
+        ),
+    )
+    candidates = result.mft_recovery_diagnostic.mirror_artifact_candidates
+    debug_candidate = next(item for item in candidates if item.filename == "debug.log")
+    assert debug_candidate.artifact_class == "bitcoin_context_artifact"

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import re
 
@@ -13,6 +15,14 @@ from bfrs.recovery.ntfs_extents import (
 from bfrs.recovery.ntfs_mft_data import (
     NtfsMftDataExtractor,
     NtfsMftRecordError,
+)
+from bfrs.recovery.ntfs_mft_recovery import (
+    NTFSMFTRecoveryDiagnostic,
+    NTFSMirrorArtifactCandidate,
+    NTFSMirrorRecordComparison,
+    NTFSInvalidMainRecordDiagnostic,
+    NTFSPartialFileRecordSalvage,
+    empty_ntfs_mft_recovery_diagnostic,
 )
 
 
@@ -27,6 +37,7 @@ FILE_IN_USE = 0x0001
 FILE_DIRECTORY = 0x0002
 NAMESPACE_NAMES = {0: "posix", 1: "win32", 2: "dos", 3: "win32_dos"}
 MAX_MFT_RECORDS = 50_000_000
+MFT_MIRROR_RECORD_COUNT = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +96,7 @@ class NTFSBitcoinArtifactIndex:
     diagnostics: tuple[str, ...]
     mft_attribute_list_present: bool = False
     mft_stream_may_be_incomplete: bool = False
+    mft_recovery_diagnostic: NTFSMFTRecoveryDiagnostic | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +171,22 @@ class _LogicalStream:
             remaining -= take
         return bytes(output)
 
+    def physical_offset_for(self, offset: int, length: int) -> int | None:
+        if offset < 0 or length <= 0 or offset + length > self.size:
+            return None
+        extent = next(
+            (
+                item
+                for item in self._extents
+                if item.logical_start <= offset
+                and offset + length <= item.logical_end
+            ),
+            None,
+        )
+        if extent is None:
+            return None
+        return extent.physical_start + offset - extent.logical_start
+
 
 class NTFSBitcoinArtifactLocator:
     """Discover one supported NTFS volume and index MFT filename artifacts."""
@@ -224,14 +252,36 @@ class NTFSBitcoinArtifactLocator:
         )
         record_count = safe_stream_size // boot.record_size
         records: dict[tuple[int, int], _Record] = {}
+        main_by_number: dict[int, _Record] = {}
+        mirror_expected = MFT_MIRROR_RECORD_COUNT
+        main_mirror_raw: dict[int, bytes] = {}
+        invalid_entries: list[
+            tuple[int, bytes | None, int, int | None, str]
+        ] = []
         scanned = valid = invalid = allocated = deleted = 0
         for number in range(record_count):
             scanned += 1
+            raw: bytes | None = None
+            logical_offset = number * boot.record_size
+            physical_offset = stream.physical_offset_for(
+                logical_offset, boot.record_size
+            )
             try:
-                raw = stream.read_at(number * boot.record_size, boot.record_size)
+                raw = stream.read_at(logical_offset, boot.record_size)
+                if number < mirror_expected:
+                    main_mirror_raw[number] = raw
                 record = self._parse_record(raw, number, boot, boot.volume_end)
             except (OSError, ValueError, NtfsMftRecordError) as error:
                 invalid += 1
+                invalid_entries.append(
+                    (
+                        number,
+                        raw,
+                        logical_offset,
+                        physical_offset,
+                        str(error),
+                    )
+                )
                 if len(diagnostics) < 200:
                     diagnostics.append(f"mft_record_invalid:{number}:{error}")
                 continue
@@ -239,6 +289,18 @@ class NTFSBitcoinArtifactLocator:
             allocated += int(record.allocated)
             deleted += int(not record.allocated)
             records[(number, record.sequence)] = record
+            main_by_number[number] = record
+
+        recovery_diagnostic = self._build_mft_recovery_diagnostic(
+            path=path,
+            image=image,
+            boot=boot,
+            records=records,
+            main_by_number=main_by_number,
+            main_mirror_raw=main_mirror_raw,
+            invalid_entries=invalid_entries,
+            mirror_expected=mirror_expected,
+        )
 
         candidates: list[NTFSBitcoinArtifactCandidate] = []
         for record in records.values():
@@ -282,7 +344,392 @@ class NTFSBitcoinArtifactLocator:
             candidates=ordered, diagnostics=tuple(diagnostics),
             mft_attribute_list_present=attribute_list,
             mft_stream_may_be_incomplete=incomplete,
+            mft_recovery_diagnostic=recovery_diagnostic,
         )
+
+    def _build_mft_recovery_diagnostic(
+        self,
+        *,
+        path: Path,
+        image: _Image,
+        boot: _Boot,
+        records: dict[tuple[int, int], _Record],
+        main_by_number: dict[int, _Record],
+        main_mirror_raw: dict[int, bytes],
+        invalid_entries: list[
+            tuple[int, bytes | None, int, int | None, str]
+        ],
+        mirror_expected: int,
+    ) -> NTFSMFTRecoveryDiagnostic:
+        diagnostic_messages: list[str] = []
+        mirror_offset = (
+            boot.volume_offset + boot.mft_mirror_lcn * boot.cluster_size
+        )
+        mirror_raw: dict[int, bytes] = {}
+        mirror_records: dict[int, _Record] = {}
+        mirror_invalid_reasons: dict[int, str] = {}
+        mirror_read = 0
+        for number in range(mirror_expected):
+            offset = mirror_offset + number * boot.record_size
+            if (
+                offset < boot.volume_offset
+                or offset + boot.record_size > boot.volume_end
+                or offset + boot.record_size > image.size
+            ):
+                diagnostic_messages.append(
+                    f"mirror_record_outside_volume:{number}"
+                )
+                break
+            try:
+                raw = image.read_at(offset, boot.record_size)
+            except (OSError, ValueError) as error:
+                diagnostic_messages.append(
+                    f"mirror_record_read_error:{number}:{error}"
+                )
+                break
+            mirror_read += 1
+            mirror_raw[number] = raw
+            try:
+                mirror_records[number] = self._parse_record(
+                    raw, number, boot, boot.volume_end
+                )
+            except (ValueError, NtfsMftRecordError) as error:
+                mirror_invalid_reasons[number] = str(error)
+
+        comparisons: list[NTFSMirrorRecordComparison] = []
+        difference_counts: Counter[str] = Counter()
+        mirror_artifacts: list[NTFSMirrorArtifactCandidate] = []
+        for number in range(mirror_read):
+            main = main_by_number.get(number)
+            mirror = mirror_records.get(number)
+            main_valid = main is not None
+            mirror_valid = mirror is not None
+            main_hash = self._fixed_record_hash(
+                main_mirror_raw.get(number), boot
+            ) if main_valid else None
+            mirror_hash = self._fixed_record_hash(
+                mirror_raw.get(number), boot
+            ) if mirror_valid else None
+            if main_valid and mirror_valid:
+                classification = (
+                    "identical"
+                    if main_hash == mirror_hash
+                    else "mirror_valid_main_valid_different"
+                )
+            elif mirror_valid:
+                classification = "mirror_valid_main_invalid"
+            elif main_valid:
+                classification = "mirror_invalid_main_valid"
+            else:
+                classification = "both_invalid"
+            difference_counts[classification] += 1
+            comparisons.append(
+                self._mirror_comparison(
+                    number,
+                    classification,
+                    main,
+                    mirror,
+                    main_mirror_raw.get(number),
+                    mirror_raw.get(number),
+                    main_hash,
+                    mirror_hash,
+                    boot,
+                )
+            )
+            if mirror is not None:
+                artifact_class = self._classify(mirror, records)
+                if artifact_class is not None and mirror.aliases:
+                    alias = self._primary_alias(mirror.aliases)
+                    data = mirror.data
+                    mirror_artifacts.append(
+                        NTFSMirrorArtifactCandidate(
+                            mft_record_number=number,
+                            sequence_number=mirror.sequence,
+                            allocation_state=(
+                                "allocated" if mirror.allocated else "deleted"
+                            ),
+                            filename=alias.filename,
+                            aliases=mirror.aliases,
+                            artifact_class=artifact_class,
+                            resident=None if data is None else data.resident,
+                            nonresident=None if data is None else not data.resident,
+                            logical_size=(
+                                None if data is None else data.logical_size
+                            ),
+                            allocated_size=(
+                                None if data is None else data.allocated_size
+                            ),
+                            extents=() if data is None else data.extents,
+                        )
+                    )
+
+        invalid_diagnostics: list[NTFSInvalidMainRecordDiagnostic] = []
+        partial_salvage: list[NTFSPartialFileRecordSalvage] = []
+        reason_counts: Counter[str] = Counter()
+        for number, raw, logical, physical, reason in invalid_entries:
+            stage = self._failure_stage(reason)
+            reason_counts[reason] += 1
+            invalid_diagnostics.append(
+                NTFSInvalidMainRecordDiagnostic(
+                    mft_record_number=number,
+                    logical_mft_offset=logical,
+                    physical_offset=physical,
+                    failure_stage=stage,
+                    failure_reason=reason,
+                )
+            )
+            salvage = self._partial_salvage(
+                raw=raw,
+                number=number,
+                logical_offset=logical,
+                physical_offset=physical,
+                failure_stage=stage,
+                failure_reason=reason,
+                boot=boot,
+                records=records,
+            )
+            if salvage is not None:
+                partial_salvage.append(salvage)
+
+        return NTFSMFTRecoveryDiagnostic(
+            source=str(path),
+            mirror_physical_offset=mirror_offset,
+            mirror_record_count_expected=mirror_expected,
+            mirror_record_count_read=mirror_read,
+            mirror_record_count_valid=len(mirror_records),
+            mirror_record_count_invalid=(
+                mirror_read - len(mirror_records)
+            ),
+            mirror_difference_counts=tuple(sorted(difference_counts.items())),
+            mirror_comparisons=tuple(comparisons),
+            invalid_main_record_count=len(invalid_entries),
+            invalid_reason_counts=tuple(sorted(reason_counts.items())),
+            invalid_main_records=tuple(invalid_diagnostics),
+            partial_salvage_count=len(partial_salvage),
+            salvaged_wallet_candidate_count=sum(
+                item.artifact_class in {"wallet_dat", "wallet_backup_like"}
+                for item in partial_salvage
+            ),
+            salvaged_bitcoin_context_count=sum(
+                item.artifact_class == "bitcoin_context_artifact"
+                for item in partial_salvage
+            ),
+            mirror_artifact_candidates=tuple(mirror_artifacts),
+            partial_salvage_candidates=tuple(partial_salvage),
+            diagnostics=tuple(
+                diagnostic_messages
+                + [
+                    f"mirror_record_invalid:{number}:{reason}"
+                    for number, reason in sorted(mirror_invalid_reasons.items())
+                ]
+            ),
+        )
+
+    def _partial_salvage(
+        self,
+        *,
+        raw: bytes | None,
+        number: int,
+        logical_offset: int,
+        physical_offset: int | None,
+        failure_stage: str,
+        failure_reason: str,
+        boot: _Boot,
+        records: dict[tuple[int, int], _Record],
+    ) -> NTFSPartialFileRecordSalvage | None:
+        if raw is None:
+            return None
+        try:
+            fixed, first, used, sequence, flags = (
+                self._validated_record_header(raw, boot)
+            )
+        except (ValueError, NtfsMftRecordError):
+            return None
+
+        aliases: list[NTFSFileNameAlias] = []
+        data_attributes: list[_Data] = []
+        valid_prefix_count = 0
+        offset = first
+        while offset <= used:
+            try:
+                next_offset, alias, data, _, ended = (
+                    self._parse_one_attribute(
+                        fixed, offset, used, boot, boot.volume_end
+                    )
+                )
+            except (ValueError, NtfsMftRecordError):
+                break
+            if ended:
+                break
+            valid_prefix_count += 1
+            if alias is not None:
+                aliases.append(alias)
+            if data is not None:
+                data_attributes.append(data)
+            offset = next_offset
+        if valid_prefix_count == 0:
+            return None
+        unique_aliases = tuple(
+            {
+                (
+                    item.filename.casefold(),
+                    item.namespace,
+                    item.parent_mft_record_number,
+                    item.parent_sequence_number,
+                ): item
+                for item in aliases
+            }.values()
+        )
+        data = data_attributes[0] if len(data_attributes) == 1 else None
+        partial_record = _Record(
+            number=number,
+            sequence=sequence,
+            allocated=bool(flags & FILE_IN_USE),
+            directory=bool(flags & FILE_DIRECTORY),
+            aliases=unique_aliases,
+            data=data,
+        )
+        artifact_class = self._classify(partial_record, records)
+        return NTFSPartialFileRecordSalvage(
+            mft_record_number=number,
+            logical_mft_offset=logical_offset,
+            physical_offset=physical_offset,
+            failure_stage=failure_stage,
+            failure_reason=failure_reason,
+            valid_prefix_attribute_count=valid_prefix_count,
+            aliases=unique_aliases,
+            artifact_class=artifact_class,
+            resident=None if data is None else data.resident,
+            nonresident=None if data is None else not data.resident,
+            logical_size=None if data is None else data.logical_size,
+            allocated_size=None if data is None else data.allocated_size,
+            extents=() if data is None else data.extents,
+            extent_trust="partial_invalid_record",
+            confidence="structural_partial",
+        )
+
+    def _mirror_comparison(
+        self,
+        number: int,
+        classification: str,
+        main: _Record | None,
+        mirror: _Record | None,
+        main_raw: bytes | None,
+        mirror_raw: bytes | None,
+        main_hash: str | None,
+        mirror_hash: str | None,
+        boot: _Boot,
+    ) -> NTFSMirrorRecordComparison:
+        both = main is not None and mirror is not None
+        main_header = self._safe_fixed_header(main_raw, boot) if both else None
+        mirror_header = self._safe_fixed_header(mirror_raw, boot) if both else None
+        main_data = self._data_identity(main.data) if main is not None else None
+        mirror_data = (
+            self._data_identity(mirror.data) if mirror is not None else None
+        )
+        return NTFSMirrorRecordComparison(
+            mft_record_number=number,
+            classification=classification,
+            main_valid=main is not None,
+            mirror_valid=mirror is not None,
+            main_sequence_number=None if main is None else main.sequence,
+            mirror_sequence_number=None if mirror is None else mirror.sequence,
+            sequence_equal=None if not both else main.sequence == mirror.sequence,
+            flags_equal=(
+                None
+                if main_header is None or mirror_header is None
+                else main_header[2] == mirror_header[2]
+            ),
+            bytes_in_use_equal=(
+                None
+                if main_header is None or mirror_header is None
+                else main_header[1] == mirror_header[1]
+            ),
+            first_attribute_offset_equal=(
+                None
+                if main_header is None or mirror_header is None
+                else main_header[0] == mirror_header[0]
+            ),
+            filename_metadata_equal=(
+                None if not both else main.aliases == mirror.aliases
+            ),
+            data_metadata_equal=(
+                None if not both else main_data == mirror_data
+            ),
+            fixed_record_sha256_equal=(
+                None if not both else main_hash == mirror_hash
+            ),
+            main_fixed_sha256=main_hash,
+            mirror_fixed_sha256=mirror_hash,
+        )
+
+    def _safe_fixed_header(
+        self, raw: bytes | None, boot: _Boot
+    ) -> tuple[int, int, int] | None:
+        if raw is None:
+            return None
+        try:
+            fixed, first, used, _, flags = self._validated_record_header(
+                raw, boot
+            )
+        except (ValueError, NtfsMftRecordError):
+            return None
+        return first, used, flags
+
+    def _fixed_record_hash(self, raw: bytes | None, boot: _Boot) -> str | None:
+        if raw is None:
+            return None
+        try:
+            fixed, _, _, _, _ = self._validated_record_header(raw, boot)
+        except (ValueError, NtfsMftRecordError):
+            return None
+        return hashlib.sha256(fixed).hexdigest()
+
+    @staticmethod
+    def _data_identity(data: _Data | None) -> tuple | None:
+        if data is None:
+            return None
+        return (
+            data.resident,
+            data.logical_size,
+            data.allocated_size,
+            data.extents,
+            data.state,
+        )
+
+    @staticmethod
+    def _failure_stage(reason: str) -> str:
+        if reason == "file_signature_invalid":
+            return "signature_invalid"
+        if reason.startswith("update_sequence"):
+            return "usa_invalid"
+        if reason in {
+            "file_record_size_invalid",
+            "logical_read_outside_stream",
+            "logical_stream_gap_or_sparse",
+            "short_image_read",
+        }:
+            return "truncated_record"
+        if reason == "sequence_number_invalid" or "file_header" in reason:
+            return "header_invalid"
+        if "first_attribute" in reason:
+            return "first_attribute_invalid"
+        if reason.startswith("mapping_pairs_invalid"):
+            return "mapping_pairs_invalid"
+        if "attribute_list" in reason:
+            return "unsupported_attribute_list"
+        if "attribute" in reason and (
+            "bounds" in reason
+            or "record_invalid" in reason
+            or "header_truncated" in reason
+        ):
+            return "attribute_bounds_invalid"
+        if any(
+            token in reason
+            for token in ("filename", "resident_data", "nonresident_header")
+        ):
+            return "attribute_parse_invalid"
+        return "other_invalid"
 
     def _discover(self, image: _Image, diagnostics: list[str]) -> _Boot | None:
         offsets = [(0, image.size)]
@@ -342,58 +789,121 @@ class NTFSBitcoinArtifactLocator:
             raise ValueError("volume_outside_image")
         return _Boot(offset, bps, cluster, mft_lcn, mirror_lcn, record_size, volume_end)
 
-    def _parse_record(self, raw: bytes, number: int, boot: _Boot, image_size: int) -> _Record:
+    def _validated_record_header(
+        self,
+        raw: bytes,
+        boot: _Boot,
+    ) -> tuple[bytes, int, int, int, int]:
         extractor = NtfsMftDataExtractor()
         if len(raw) != boot.record_size or len(raw) % boot.bytes_per_sector:
             raise NtfsMftRecordError("file_record_size_invalid")
+        if raw[:4] != b"FILE":
+            raise NtfsMftRecordError("file_signature_invalid")
         fixed, usa_offset, usa_count = extractor._apply_fixup(
             raw, boot.bytes_per_sector
         )
-        if fixed[:4] != b"FILE":
-            raise NtfsMftRecordError("file_signature_invalid")
         first = self._u16(fixed, 20)
         used = self._u32(fixed, 24)
+        allocated = self._u32(fixed, 28)
         if (
             first < 48
             or first < usa_offset + usa_count * 2
             or first % 8
             or used < first + 4
-            or used > len(fixed)
+            or used > allocated
+            or allocated > len(fixed)
         ):
             raise NtfsMftRecordError("file_header_bounds_invalid")
         sequence = self._u16(fixed, 16)
         if sequence == 0:
             raise NtfsMftRecordError("sequence_number_invalid")
         flags = self._u16(fixed, 22)
+        return fixed, first, used, sequence, flags
+
+    def _parse_one_attribute(
+        self,
+        fixed: bytes,
+        offset: int,
+        used: int,
+        boot: _Boot,
+        image_size: int,
+    ) -> tuple[int, NTFSFileNameAlias | None, _Data | None, bool, bool]:
+        if offset + 4 > used:
+            raise NtfsMftRecordError("attribute_end_marker_missing")
+        type_code = self._u32(fixed, offset)
+        if type_code == ATTRIBUTE_END:
+            return offset, None, None, False, True
+        if offset + 16 > used:
+            raise NtfsMftRecordError("attribute_header_truncated")
+        length = self._u32(fixed, offset + 4)
+        nonresident = fixed[offset + 8]
+        name_length = fixed[offset + 9]
+        if (
+            length < 16
+            or length % 8
+            or offset + length > used
+            or nonresident not in (0, 1)
+        ):
+            raise NtfsMftRecordError("attribute_record_invalid")
+        alias = None
+        data = None
+        attribute_list = type_code == ATTRIBUTE_LIST
+        if type_code == ATTRIBUTE_FILE_NAME:
+            if nonresident:
+                raise NtfsMftRecordError("filename_nonresident")
+            alias = self._filename(fixed, offset, length)
+        elif type_code == ATTRIBUTE_DATA and name_length == 0:
+            data = self._data(
+                fixed,
+                offset,
+                length,
+                nonresident,
+                boot,
+                image_size,
+            )
+        return offset + length, alias, data, attribute_list, False
+
+    def _parse_record(
+        self,
+        raw: bytes,
+        number: int,
+        boot: _Boot,
+        image_size: int,
+    ) -> _Record:
+        fixed, first, used, sequence, flags = self._validated_record_header(
+            raw, boot
+        )
         aliases: list[NTFSFileNameAlias] = []
         data_attributes: list[_Data] = []
         attribute_list = False
         offset = first
         ended = False
-        while offset + 4 <= used:
-            type_code = self._u32(fixed, offset)
-            if type_code == ATTRIBUTE_END:
+        while offset <= used:
+            next_offset, alias, data, found_list, ended = (
+                self._parse_one_attribute(
+                    fixed, offset, used, boot, image_size
+                )
+            )
+            if ended:
                 ended = True
                 break
-            if offset + 16 > used:
-                raise NtfsMftRecordError("attribute_header_truncated")
-            length = self._u32(fixed, offset + 4)
-            nonresident = fixed[offset + 8]
-            name_length = fixed[offset + 9]
-            if length < 16 or length % 8 or offset + length > used or nonresident not in (0, 1):
-                raise NtfsMftRecordError("attribute_record_invalid")
-            if type_code == ATTRIBUTE_LIST:
-                attribute_list = True
-            elif type_code == ATTRIBUTE_FILE_NAME:
-                if nonresident:
-                    raise NtfsMftRecordError("filename_nonresident")
-                aliases.append(self._filename(fixed, offset, length))
-            elif type_code == ATTRIBUTE_DATA and name_length == 0:
-                data_attributes.append(self._data(fixed, offset, length, nonresident, boot, image_size))
-            offset += length
+            attribute_list |= found_list
+            if alias is not None:
+                aliases.append(alias)
+            if data is not None:
+                data_attributes.append(data)
+            offset = next_offset
         if not ended:
             raise NtfsMftRecordError("attribute_end_marker_missing")
-        unique = {(item.filename.casefold(), item.namespace, item.parent_mft_record_number, item.parent_sequence_number): item for item in aliases}
+        unique = {
+            (
+                item.filename.casefold(),
+                item.namespace,
+                item.parent_mft_record_number,
+                item.parent_sequence_number,
+            ): item
+            for item in aliases
+        }
         data: _Data | None
         if attribute_list:
             data = self._unsupported_data(data_attributes, "unsupported_attribute_list")
@@ -401,7 +911,14 @@ class NTFSBitcoinArtifactLocator:
             data = self._unsupported_data(data_attributes, "unsupported_multiple_data_extents")
         else:
             data = data_attributes[0] if data_attributes else None
-        return _Record(number, sequence, bool(flags & FILE_IN_USE), bool(flags & FILE_DIRECTORY), tuple(unique.values()), data)
+        return _Record(
+            number,
+            sequence,
+            bool(flags & FILE_IN_USE),
+            bool(flags & FILE_DIRECTORY),
+            tuple(unique.values()),
+            data,
+        )
 
     def _filename(self, fixed: bytes, offset: int, length: int) -> NTFSFileNameAlias:
         value_length = self._u32(fixed, offset + 16)
@@ -574,6 +1091,9 @@ class NTFSBitcoinArtifactLocator:
             None if boot is None else boot.cluster_size,
             None if boot is None else boot.record_size,
             0, 0, 0, 0, 0, 0, 0, (), tuple(diagnostics), attribute_list, incomplete,
+            mft_recovery_diagnostic=empty_ntfs_mft_recovery_diagnostic(
+                str(path), "mft_stream_not_available"
+            ),
         )
 
     @staticmethod
