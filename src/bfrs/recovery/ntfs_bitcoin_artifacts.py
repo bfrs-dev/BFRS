@@ -441,9 +441,30 @@ class NTFSBitcoinArtifactLocator:
         logical_size = self._u64(fixed, offset + 48)
         if pairs_offset < 64 or pairs_offset >= length:
             raise NtfsMftRecordError("mapping_pairs_offset_invalid")
+        mapping_region = bytes(
+            fixed[offset + pairs_offset:offset + length]
+        )
+        mapping_diagnostic = (
+            NtfsMftDataExtractor.diagnose_mapping_pairs_input(
+                mapping_region,
+                mapping_pairs_offset=pairs_offset,
+                attribute_boundary_ok=True,
+            )
+        )
+        if (
+            mapping_diagnostic.terminator_offset is not None
+            and mapping_diagnostic.trailing_byte_count
+            != mapping_diagnostic.required_alignment_padding
+        ):
+            raise NtfsMftRecordError(
+                "mapping_pairs_invalid:mapping_pairs_trailing_data"
+            )
+        mapping_bytes = mapping_region[
+            : mapping_diagnostic.mapping_pairs_input_length
+        ]
         try:
             mapping = NtfsMappingPairsDecoder().decode(
-                bytes(fixed[offset + pairs_offset:offset + length]), lowest_vcn=lowest,
+                mapping_bytes, lowest_vcn=lowest,
                 highest_vcn=highest, cluster_size=boot.cluster_size,
                 partition_offset=boot.volume_offset,
             )

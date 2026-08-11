@@ -106,6 +106,7 @@ def file_record(
     in_use: bool = True,
     directory: bool = False,
     first_attribute_offset: int = FIRST_ATTRIBUTE_OFFSET,
+    record_number: int = 1234,
     mutate_fixed: Callable[[bytearray], None] | None = None,
 ) -> bytes:
     fixed = bytearray(RECORD_SIZE)
@@ -116,7 +117,7 @@ def file_record(
     flags = (1 if in_use else 0) | (2 if directory else 0)
     fixed[22:24] = flags.to_bytes(2, "little")
     fixed[28:32] = RECORD_SIZE.to_bytes(4, "little")
-    fixed[44:48] = (1234).to_bytes(4, "little")
+    fixed[44:48] = record_number.to_bytes(4, "little")
     cursor = first_attribute_offset
     for attribute in attributes:
         fixed[cursor : cursor + len(attribute)] = attribute
@@ -218,6 +219,52 @@ def test_named_ads_is_ignored_and_unnamed_data_is_selected() -> None:
     assert result.evidence["named_data_attribute_count"] == 1
 
 
+def test_mapping_pairs_slice_excludes_following_attribute() -> None:
+    data = nonresident_data(basic_pairs(), highest_vcn=3)
+    following = unknown_attribute(32, type_code=0xB0)
+    result = extract(file_record((data, following), record_number=0))
+    assert result is not None
+    assert result.record_number == 0
+    assert result.evidence["selected_attribute_length"] == len(data)
+    assert result.evidence["mapping_pairs_input_length"] == len(basic_pairs())
+    assert result.evidence["mapping_pairs_region_length"] < (
+        len(data) + len(following)
+    )
+    assert result.evidence["attribute_boundary_ok"] is True
+
+
+def test_zero_alignment_padding_is_trimmed_before_decoder() -> None:
+    result = extract(
+        file_record((nonresident_data(basic_pairs(), highest_vcn=3),))
+    )
+    assert result is not None
+    assert result.evidence["mapping_pairs_terminator_offset"] == 8
+    assert result.evidence["mapping_pairs_trailing_byte_count"] == 7
+    assert result.evidence["mapping_pairs_trailing_nonzero_count"] == 0
+    assert result.evidence["mapping_pairs_trailing_classification"] == (
+        "zero_attribute_alignment_padding"
+    )
+
+
+def test_bounded_nonzero_attribute_alignment_slack_is_trimmed() -> None:
+    pairs = basic_pairs() + bytes.fromhex("ca44860060608a")
+    result = extract(file_record((nonresident_data(pairs, highest_vcn=3),)))
+    assert result is not None
+    assert result.evidence["mapping_pairs_input_length"] == len(basic_pairs())
+    assert result.evidence["mapping_pairs_trailing_byte_count"] == 7
+    assert result.evidence["mapping_pairs_trailing_nonzero_count"] == 6
+    assert result.evidence["mapping_pairs_trailing_classification"] == (
+        "nonzero_attribute_alignment_slack"
+    )
+
+
+def test_nonzero_trailing_beyond_alignment_slack_is_rejected() -> None:
+    pairs = basic_pairs() + b"\x99" * 8
+    data = nonresident_data(pairs, highest_vcn=3)
+    with pytest.raises(NtfsMftRecordError, match="mapping_pairs_trailing_data"):
+        extract(file_record((data,)))
+
+
 def test_resident_unnamed_data_returns_none() -> None:
     assert extract(file_record((resident_data(),))) is None
 
@@ -236,6 +283,20 @@ def test_attribute_record_length_beyond_file_is_rejected() -> None:
         extract(file_record((unknown_attribute(),), mutate_fixed=corrupt))
 
 
+def test_attribute_must_end_within_file_record_bytes_in_use() -> None:
+    data = nonresident_data(basic_pairs(), highest_vcn=3)
+
+    def shorten_bytes_in_use(fixed: bytearray) -> None:
+        boundary = FIRST_ATTRIBUTE_OFFSET + len(data) - 8
+        fixed[24:28] = boundary.to_bytes(4, "little")
+
+    with pytest.raises(
+        NtfsMftRecordError,
+        match="attribute_record_length_invalid",
+    ):
+        extract(file_record((data,), mutate_fixed=shorten_bytes_in_use))
+
+
 @pytest.mark.parametrize("before_header", [True, False])
 def test_mapping_pairs_offset_outside_nonresident_payload_is_rejected(before_header: bool) -> None:
     data = bytearray(nonresident_data(basic_pairs(), highest_vcn=3))
@@ -252,6 +313,19 @@ def test_truncated_mapping_pairs_are_rejected() -> None:
         mapping_pairs_offset=69,
     )
     with pytest.raises(NtfsMftRecordError, match="mapping_pairs_invalid"):
+        extract(file_record((data,)))
+
+
+def test_complete_mapping_pair_without_terminator_is_rejected() -> None:
+    data = nonresident_data(
+        b"\x11\x01\x01",
+        highest_vcn=0,
+        mapping_pairs_offset=69,
+    )
+    with pytest.raises(
+        NtfsMftRecordError,
+        match="mapping_pairs_terminator_missing",
+    ):
         extract(file_record((data,)))
 
 

@@ -26,6 +26,18 @@ class NtfsMftRecordError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class NtfsMappingPairsInputDiagnostic:
+    mapping_pairs_region_length: int
+    mapping_pairs_input_length: int
+    terminator_offset: int | None
+    trailing_byte_count: int
+    trailing_nonzero_count: int
+    required_alignment_padding: int | None
+    trailing_classification: str
+    attribute_boundary_ok: bool
+
+
+@dataclass(frozen=True, slots=True)
 class NtfsMftDataMapping:
     record_number: int | None
     in_use: bool
@@ -44,6 +56,7 @@ class NtfsMftDataMapping:
 class _DataAttribute:
     start: int
     record_length: int
+    flags: int
     lowest_vcn: int
     highest_vcn: int
     mapping_pairs_offset: int
@@ -74,25 +87,50 @@ class NtfsMftDataExtractor:
             bytes_per_sector,
         )
         first_attribute_offset = self._u16(fixed, 20)
+        bytes_in_use = self._u32(fixed, 24)
+        bytes_allocated = self._u32(fixed, 28)
         usa_end = usa_offset + usa_count * 2
         if (
             first_attribute_offset < FILE_HEADER_SIZE
             or first_attribute_offset < usa_end
             or first_attribute_offset % 8
-            or first_attribute_offset + 4 > len(fixed)
+            or first_attribute_offset + 4 > bytes_in_use
         ):
             raise NtfsMftRecordError("first_attribute_offset_invalid")
+        if (
+            bytes_in_use < first_attribute_offset + 4
+            or bytes_in_use > bytes_allocated
+            or bytes_allocated > len(fixed)
+        ):
+            raise NtfsMftRecordError("file_record_size_fields_invalid")
 
         selected, evidence = self._walk_attributes(
             fixed,
             first_attribute_offset,
+            bytes_in_use,
         )
         if selected is None:
             return None
 
         attribute_end = selected.start + selected.record_length
         mapping_start = selected.start + selected.mapping_pairs_offset
-        mapping_bytes = bytes(fixed[mapping_start:attribute_end])
+        mapping_region = bytes(fixed[mapping_start:attribute_end])
+        mapping_diagnostic = self.diagnose_mapping_pairs_input(
+            mapping_region,
+            mapping_pairs_offset=selected.mapping_pairs_offset,
+            attribute_boundary_ok=attribute_end <= bytes_in_use,
+        )
+        if (
+            mapping_diagnostic.terminator_offset is not None
+            and mapping_diagnostic.trailing_byte_count
+            != mapping_diagnostic.required_alignment_padding
+        ):
+            raise NtfsMftRecordError(
+                "mapping_pairs_invalid:mapping_pairs_trailing_data"
+            )
+        mapping_bytes = mapping_region[
+            : mapping_diagnostic.mapping_pairs_input_length
+        ]
         try:
             extent_mapping = NtfsMappingPairsDecoder().decode(
                 mapping_bytes,
@@ -112,9 +150,38 @@ class NtfsMftDataExtractor:
             "usa_count": usa_count,
             "sector_count": len(record) // bytes_per_sector,
             "first_attribute_offset": first_attribute_offset,
+            "bytes_in_use": bytes_in_use,
+            "bytes_allocated": bytes_allocated,
             "selected_attribute_offset": selected.start,
+            "selected_attribute_length": selected.record_length,
+            "selected_attribute_flags": selected.flags,
+            "selected_attribute_nonresident": True,
             "mapping_pairs_offset": selected.mapping_pairs_offset,
             "mapping_pairs_absolute_record_offset": mapping_start,
+            "mapping_pairs_region_length": (
+                mapping_diagnostic.mapping_pairs_region_length
+            ),
+            "mapping_pairs_input_length": (
+                mapping_diagnostic.mapping_pairs_input_length
+            ),
+            "mapping_pairs_terminator_offset": (
+                mapping_diagnostic.terminator_offset
+            ),
+            "mapping_pairs_trailing_byte_count": (
+                mapping_diagnostic.trailing_byte_count
+            ),
+            "mapping_pairs_trailing_nonzero_count": (
+                mapping_diagnostic.trailing_nonzero_count
+            ),
+            "mapping_pairs_required_alignment_padding": (
+                mapping_diagnostic.required_alignment_padding
+            ),
+            "mapping_pairs_trailing_classification": (
+                mapping_diagnostic.trailing_classification
+            ),
+            "attribute_boundary_ok": (
+                mapping_diagnostic.attribute_boundary_ok
+            ),
         }
         return NtfsMftDataMapping(
             record_number=record_number,
@@ -197,6 +264,7 @@ class NtfsMftDataExtractor:
         self,
         fixed: bytes,
         first_attribute_offset: int,
+        bytes_in_use: int,
     ) -> tuple[_DataAttribute | None, dict[str, Any]]:
         offset = first_attribute_offset
         attribute_count = 0
@@ -207,18 +275,18 @@ class NtfsMftDataExtractor:
         selected: _DataAttribute | None = None
         end_marker_found = False
 
-        while offset + 4 <= len(fixed):
+        while offset + 4 <= bytes_in_use:
             type_code = self._u32(fixed, offset)
             if type_code == ATTRIBUTE_END:
                 end_marker_found = True
                 break
-            if offset % 8 or offset + ATTRIBUTE_HEADER_SIZE > len(fixed):
+            if offset % 8 or offset + ATTRIBUTE_HEADER_SIZE > bytes_in_use:
                 raise NtfsMftRecordError("attribute_header_truncated")
             record_length = self._u32(fixed, offset + 4)
             if (
                 record_length < ATTRIBUTE_HEADER_SIZE
                 or record_length % 8
-                or offset + record_length > len(fixed)
+                or offset + record_length > bytes_in_use
             ):
                 raise NtfsMftRecordError("attribute_record_length_invalid")
             nonresident = fixed[offset + 8]
@@ -260,6 +328,75 @@ class NtfsMftDataExtractor:
             "attribute_list_present": attribute_list_present,
         }
 
+    @staticmethod
+    def diagnose_mapping_pairs_input(
+        data: bytes,
+        *,
+        mapping_pairs_offset: int,
+        attribute_boundary_ok: bool,
+    ) -> NtfsMappingPairsInputDiagnostic:
+        """Locate a semantic runlist terminator without exposing raw bytes."""
+        if not isinstance(data, bytes):
+            raise ValueError("data must be bytes")
+        if mapping_pairs_offset < NONRESIDENT_HEADER_SIZE:
+            raise ValueError("mapping_pairs_offset is invalid")
+
+        offset = 0
+        terminator_offset: int | None = None
+        while offset < len(data):
+            header_offset = offset
+            header = data[offset]
+            offset += 1
+            if header == 0:
+                terminator_offset = header_offset
+                break
+            length_size = header & 0x0F
+            delta_size = header >> 4
+            if (
+                length_size == 0
+                or length_size > 8
+                or delta_size > 8
+                or offset + length_size + delta_size > len(data)
+            ):
+                offset = len(data)
+                break
+            offset += length_size + delta_size
+
+        if terminator_offset is None:
+            return NtfsMappingPairsInputDiagnostic(
+                mapping_pairs_region_length=len(data),
+                mapping_pairs_input_length=len(data),
+                terminator_offset=None,
+                trailing_byte_count=0,
+                trailing_nonzero_count=0,
+                required_alignment_padding=None,
+                trailing_classification="terminator_missing_or_unreachable",
+                attribute_boundary_ok=attribute_boundary_ok,
+            )
+
+        input_length = terminator_offset + 1
+        trailing = data[input_length:]
+        required_padding = (-(mapping_pairs_offset + input_length)) % 8
+        nonzero_count = sum(byte != 0 for byte in trailing)
+        if len(trailing) != required_padding:
+            classification = "trailing_data_not_alignment_padding"
+        elif not trailing:
+            classification = "no_trailing_bytes"
+        elif nonzero_count:
+            classification = "nonzero_attribute_alignment_slack"
+        else:
+            classification = "zero_attribute_alignment_padding"
+        return NtfsMappingPairsInputDiagnostic(
+            mapping_pairs_region_length=len(data),
+            mapping_pairs_input_length=input_length,
+            terminator_offset=terminator_offset,
+            trailing_byte_count=len(trailing),
+            trailing_nonzero_count=nonzero_count,
+            required_alignment_padding=required_padding,
+            trailing_classification=classification,
+            attribute_boundary_ok=attribute_boundary_ok,
+        )
+
     def _parse_nonresident_data(
         self,
         fixed: bytes,
@@ -279,6 +416,7 @@ class NtfsMftDataExtractor:
         return _DataAttribute(
             start=offset,
             record_length=record_length,
+            flags=self._u16(fixed, offset + 12),
             lowest_vcn=lowest_vcn,
             highest_vcn=highest_vcn,
             mapping_pairs_offset=mapping_pairs_offset,
