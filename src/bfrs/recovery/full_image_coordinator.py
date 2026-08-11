@@ -23,6 +23,10 @@ from bfrs.recovery.metadata_less_fragments import (
     MetadataLessBerkeleyFragmentRecovery,
     MetadataLessBerkeleyFragmentRecoveryPipeline,
 )
+from bfrs.recovery.orphan_record_key_diagnostic import (
+    OrphanBitcoinRecordKeyDiagnostic,
+    OrphanBitcoinRecordKeyDiagnosticPipeline,
+)
 from bfrs.recovery.reconstructed_wallet_pipeline import (
     ReconstructedBerkeleyWalletPipeline,
     ReconstructedBerkeleyWalletRecovery,
@@ -59,6 +63,7 @@ class FullImageRecoveryResult:
         ReconstructedBerkeleyWalletRecovery, ...
     ]
     metadata_less_fragment_recovery: MetadataLessBerkeleyFragmentRecovery
+    orphan_record_key_diagnostic: OrphanBitcoinRecordKeyDiagnostic
     structural_wallet_count: int
     fragment_wallet_count: int
     reasons: tuple[str, ...]
@@ -211,6 +216,13 @@ class FullImageRecoveryCoordinator:
             range_end=range_end,
             range_reader=range_reader,
         ).run()
+        orphan_record_keys = OrphanBitcoinRecordKeyDiagnosticPipeline(
+            accepted_hits,
+            source=str(reader.path.resolve()),
+            range_start=start,
+            range_end=range_end,
+            range_reader=range_reader,
+        ).run()
         ordered_direct = tuple(item[2] for item in sorted(direct_with_ranges))
         all_statuses = tuple(result.status for result in ordered_direct) + tuple(
             result.status for result in wallet_results
@@ -244,6 +256,7 @@ class FullImageRecoveryCoordinator:
             reconstructed_databases=databases,
             reconstructed_wallet_results=wallet_results,
             metadata_less_fragment_recovery=metadata_less,
+            orphan_record_key_diagnostic=orphan_record_keys,
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,
             reasons=reasons,

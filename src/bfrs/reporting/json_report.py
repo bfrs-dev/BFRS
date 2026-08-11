@@ -224,6 +224,40 @@ def _metadata_less_fragment(result) -> dict[str, Any]:
     }
 
 
+def _orphan_record_key_diagnostic(result) -> dict[str, Any]:
+    return {
+        "source": result.source,
+        "raw_strong_hit_count": result.raw_strong_hit_count,
+        "valid_record_key_count": result.valid_record_key_count,
+        "valid_key_count": result.valid_key_count,
+        "valid_wkey_count": result.valid_wkey_count,
+        "valid_ckey_keyside_count": result.valid_ckey_keyside_count,
+        "valid_mkey_keyside_count": result.valid_mkey_keyside_count,
+        "valid_defaultkey_count": result.valid_defaultkey_count,
+        "valid_keymeta_count": result.valid_keymeta_count,
+        "canonical_framing_count": result.canonical_framing_count,
+        "noncanonical_framing_count": result.noncanonical_framing_count,
+        "locations": [
+            {
+                "record_type": location.record_type,
+                "absolute_offset": location.absolute_offset,
+                "canonical_framing": location.canonical_framing,
+                "master_key_id": location.master_key_id,
+            }
+            for location in result.locations
+        ],
+        "diagnostics": {
+            name: result.evidence.get(name, 0)
+            for name in (
+                "maximum_read_size",
+                "read_failure_count",
+                "short_read_count",
+                "record_type_mismatch_count",
+            )
+        },
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -279,6 +313,9 @@ def serialize_full_image_result(
         ],
         "metadata_less_fragment_summary": _metadata_less_fragment(
             result.metadata_less_fragment_recovery
+        ),
+        "orphan_record_key_diagnostic": _orphan_record_key_diagnostic(
+            result.orphan_record_key_diagnostic
         ),
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())
