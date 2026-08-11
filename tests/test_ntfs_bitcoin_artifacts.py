@@ -13,6 +13,12 @@ from bfrs.recovery.ntfs_stale_file import (
     NTFS_FILE_RECORD_SIGNATURE,
     NTFSStaleFileRecordRecoveryPipeline,
 )
+from bfrs.recovery.ntfs_directory_index import (
+    NTFSDirectoryIndexArtifactRecoveryPipeline,
+)
+from bfrs.reporting.json_report import (
+    _ntfs_directory_index_artifact_recovery,
+)
 from bfrs.reporting.json_report import _ntfs_bitcoin_artifact_index
 from bfrs.reporting.json_report import _ntfs_mft_recovery_diagnostic
 from bfrs.reporting.json_report import _ntfs_stale_file_record_recovery
@@ -179,6 +185,348 @@ def locate(tmp_path, records: dict[int, bytes], *, mbr: bool = False):
     path = tmp_path / "ntfs.img"
     path.write_bytes(image_with(records, mbr=mbr))
     return NTFSBitcoinArtifactLocator().index(path)
+
+
+def filename_value(
+    name: str,
+    *,
+    parent: int = 6,
+    parent_sequence: int = 1,
+    namespace: int = 1,
+) -> bytes:
+    encoded = name.encode("utf-16-le")
+    value = bytearray(66 + len(encoded))
+    value[0:8] = (parent | (parent_sequence << 48)).to_bytes(8, "little")
+    value[64] = len(name)
+    value[65] = namespace
+    value[66:] = encoded
+    return bytes(value)
+
+
+def named_resident(type_code: int, name: str, value: bytes) -> bytes:
+    encoded_name = name.encode("utf-16-le")
+    value_offset = align8(24 + len(encoded_name))
+    size = align8(value_offset + len(value))
+    result = bytearray(size)
+    result[0:4] = type_code.to_bytes(4, "little")
+    result[4:8] = size.to_bytes(4, "little")
+    result[9] = len(name)
+    result[10:12] = (24).to_bytes(2, "little")
+    result[16:20] = len(value).to_bytes(4, "little")
+    result[20:22] = value_offset.to_bytes(2, "little")
+    result[24:24 + len(encoded_name)] = encoded_name
+    result[value_offset:value_offset + len(value)] = value
+    return bytes(result)
+
+
+def index_entry(
+    name: str,
+    *,
+    record: int = 7,
+    sequence: int = 1,
+    parent: int = 6,
+    parent_sequence: int = 1,
+) -> bytes:
+    key = filename_value(
+        name, parent=parent, parent_sequence=parent_sequence
+    )
+    size = align8(16 + len(key))
+    result = bytearray(size)
+    result[0:8] = (record | (sequence << 48)).to_bytes(8, "little")
+    result[8:10] = size.to_bytes(2, "little")
+    result[10:12] = len(key).to_bytes(2, "little")
+    result[16:16 + len(key)] = key
+    return bytes(result)
+
+
+def index_end() -> bytes:
+    result = bytearray(16)
+    result[8:10] = (16).to_bytes(2, "little")
+    result[12:14] = (2).to_bytes(2, "little")
+    return bytes(result)
+
+
+def index_root(
+    active: tuple[bytes, ...],
+    *,
+    slack: bytes = b"",
+    name: str = "$I30",
+    block_size: int = CLUSTER,
+) -> bytes:
+    chain = b"".join(active) + index_end()
+    value = bytearray(32 + len(chain) + len(slack))
+    value[0:4] = (0x30).to_bytes(4, "little")
+    value[4:8] = (1).to_bytes(4, "little")
+    value[8:12] = block_size.to_bytes(4, "little")
+    value[12] = block_size // CLUSTER
+    value[16:20] = (16).to_bytes(4, "little")
+    value[20:24] = (16 + len(chain)).to_bytes(4, "little")
+    value[24:28] = (16 + len(chain) + len(slack)).to_bytes(4, "little")
+    value[32:32 + len(chain)] = chain
+    value[32 + len(chain):] = slack
+    return named_resident(0x90, name, bytes(value))
+
+
+def named_nonresident(
+    type_code: int,
+    name: str,
+    pairs: bytes,
+    *,
+    logical_size: int,
+    highest_vcn: int,
+) -> bytes:
+    encoded_name = name.encode("utf-16-le")
+    pairs_offset = align8(64 + len(encoded_name))
+    size = align8(pairs_offset + len(pairs))
+    result = bytearray(size)
+    result[0:4] = type_code.to_bytes(4, "little")
+    result[4:8] = size.to_bytes(4, "little")
+    result[8] = 1
+    result[9] = len(name)
+    result[10:12] = (64).to_bytes(2, "little")
+    result[24:32] = highest_vcn.to_bytes(8, "little")
+    result[32:34] = pairs_offset.to_bytes(2, "little")
+    result[40:48] = logical_size.to_bytes(8, "little")
+    result[48:56] = logical_size.to_bytes(8, "little")
+    result[56:64] = logical_size.to_bytes(8, "little")
+    result[64:64 + len(encoded_name)] = encoded_name
+    result[pairs_offset:pairs_offset + len(pairs)] = pairs
+    return bytes(result)
+
+
+def indx_block(
+    active: tuple[bytes, ...],
+    *,
+    slack: bytes = b"",
+    valid_usa: bool = True,
+) -> bytes:
+    chain = b"".join(active) + index_end()
+    result = bytearray(CLUSTER)
+    result[:4] = b"INDX"
+    result[4:6] = (40).to_bytes(2, "little")
+    result[6:8] = (CLUSTER // SECTOR + 1).to_bytes(2, "little")
+    result[16:24] = (0).to_bytes(8, "little")
+    result[24:28] = (40).to_bytes(4, "little")
+    result[28:32] = (40 + len(chain)).to_bytes(4, "little")
+    result[32:36] = (40 + len(chain) + len(slack)).to_bytes(4, "little")
+    result[64:64 + len(chain)] = chain
+    result[64 + len(chain):64 + len(chain) + len(slack)] = slack
+    usn = b"\xa5\x5a"
+    replacements = []
+    for sector in range(1, CLUSTER // SECTOR + 1):
+        trailer = sector * SECTOR - 2
+        replacements.append(bytes(result[trailer:trailer + 2]))
+        result[trailer:trailer + 2] = usn
+    result[40:42] = usn
+    for index, replacement in enumerate(replacements, start=1):
+        result[40 + index * 2:42 + index * 2] = replacement
+    if not valid_usa:
+        result[SECTOR - 2:SECTOR] = b"\x00\x00"
+    return bytes(result)
+
+
+def directory_recovery(
+    tmp_path,
+    directory_attributes: tuple[bytes, ...],
+    *,
+    target_sequence: int = 1,
+    allocation_block: bytes | None = None,
+):
+    directory = file_record(
+        6,
+        (filename("Bitcoin", parent=5),) + directory_attributes,
+        directory=True,
+    )
+    target = file_record(7, (filename("current.dat"),), sequence=target_sequence)
+    image = bytearray(image_with({6: directory, 7: target}))
+    if allocation_block is not None:
+        image[80 * CLUSTER:81 * CLUSTER] = allocation_block
+    path = tmp_path / "directory-index.img"
+    path.write_bytes(image)
+    locator = NTFSBitcoinArtifactLocator()
+    locator.index(path)
+    return NTFSDirectoryIndexArtifactRecoveryPipeline(
+        context=locator.stale_recovery_context,
+        locator=locator,
+    ).run()
+
+
+def test_directory_index_active_root_and_current_reference(tmp_path) -> None:
+    result = directory_recovery(
+        tmp_path, (index_root((index_entry("wallet.dat"),)),)
+    )
+    assert result.directory_record_count == 1
+    assert result.index_root_count == 1
+    assert result.active_entry_count == 1
+    assert result.wallet_candidate_count == 1
+    candidate = result.candidates[0]
+    assert candidate.entry_state == "active"
+    assert candidate.reference_state == "current_reference_matches"
+    assert candidate.validation_strength == "active_ntfs_directory_index_entry"
+
+
+def test_directory_index_root_structural_slack_and_raw_string(tmp_path) -> None:
+    structural = index_entry("wallet.dat")
+    result = directory_recovery(
+        tmp_path, (index_root((index_entry("example.txt"),), slack=structural),)
+    )
+    assert result.active_entry_count == 1
+    assert result.structural_slack_entry_count == 1
+    assert result.slack_wallet_candidate_count == 1
+    wallet = next(
+        item
+        for item in result.candidates
+        if item.artifact_class in {"wallet_dat", "wallet_backup_like"}
+    )
+    assert wallet.entry_state == "slack"
+
+    false_positive = "wallet.dat".encode("utf-16-le") + bytes(96)
+    rejected = directory_recovery(
+        tmp_path, (index_root((), slack=false_positive),)
+    )
+    assert rejected.wallet_candidate_count == 0
+    assert rejected.structural_slack_entry_count == 0
+
+
+def test_directory_index_wallet_empty_and_other_index_name(tmp_path) -> None:
+    result = directory_recovery(
+        tmp_path,
+        (
+            index_root((), slack=index_entry("Wallet-Empty.png")),
+            index_root((index_entry("wallet.dat"),), name="$O"),
+        ),
+    )
+    assert result.index_root_count == 1
+    assert result.wallet_candidate_count == 0
+
+
+def test_directory_index_reused_sequence_and_parent_mismatch(tmp_path) -> None:
+    result = directory_recovery(
+        tmp_path,
+        (
+            index_root(
+                (),
+                slack=index_entry(
+                    "wallet.dat", sequence=5, parent=9, parent_sequence=2
+                ),
+            ),
+        ),
+        target_sequence=12,
+    )
+    candidate = result.candidates[0]
+    assert candidate.reference_state == "current_record_reused_sequence_differs"
+    assert candidate.parent_reference_state == "embedded_parent_reference_mismatch"
+
+
+def test_directory_index_end_marker_and_entry_bounds(tmp_path) -> None:
+    bytes_after_end = index_entry("wallet.dat")
+    root = index_root((), slack=bytes_after_end)
+    result = directory_recovery(tmp_path, (root,))
+    assert result.active_entry_count == 0
+    assert result.slack_wallet_candidate_count == 1
+
+    malformed = bytearray(index_entry("wallet.dat"))
+    malformed[8:10] = (0xFFF8).to_bytes(2, "little")
+    bounded = directory_recovery(
+        tmp_path, (index_root((), slack=bytes(malformed)),)
+    )
+    assert bounded.structural_slack_entry_count == 0
+    assert bounded.wallet_candidate_count == 0
+
+
+def test_directory_index_allocation_valid_and_bad_usa(tmp_path) -> None:
+    allocation = named_nonresident(
+        0xA0,
+        "$I30",
+        run(1, 80) + b"\x00",
+        logical_size=CLUSTER,
+        highest_vcn=0,
+    )
+    valid = directory_recovery(
+        tmp_path,
+        (index_root(()), allocation),
+        allocation_block=indx_block((index_entry("wallet.dat"),)),
+    )
+    assert valid.index_allocation_stream_count == 1
+    assert valid.indx_block_count == 1
+    assert valid.indx_block_valid_count == 1
+    assert valid.active_wallet_candidate_count == 1
+
+    invalid = directory_recovery(
+        tmp_path,
+        (index_root(()), allocation),
+        allocation_block=indx_block(
+            (), slack=index_entry("wallet.dat"), valid_usa=False
+        ),
+    )
+    assert invalid.indx_block_invalid_count == 1
+    assert invalid.wallet_candidate_count == 0
+    assert invalid.structural_slack_entry_count == 0
+
+
+def test_directory_index_allocation_structural_slack_and_safe_json(tmp_path) -> None:
+    allocation = named_nonresident(
+        0xA0,
+        "$I30",
+        run(1, 80) + b"\x00",
+        logical_size=CLUSTER,
+        highest_vcn=0,
+    )
+    result = directory_recovery(
+        tmp_path,
+        (index_root(()), allocation),
+        allocation_block=indx_block((), slack=index_entry("wallet.dat")),
+    )
+    assert result.slack_wallet_candidate_count == 1
+    assert result.candidates[0].index_source == "index_allocation"
+    payload = _ntfs_directory_index_artifact_recovery(result)
+    encoded = json.dumps(payload, sort_keys=True).lower()
+    assert payload["wallet_candidate_count"] == 1
+    assert "raw" not in payload["candidates"][0]
+    assert "private_key" not in encoded
+
+
+def test_directory_index_missing_and_out_of_range_references(tmp_path) -> None:
+    result = directory_recovery(
+        tmp_path,
+        (
+            index_root(
+                (
+                    index_entry("debug.log", record=4),
+                    index_entry("peers.dat", record=8),
+                )
+            ),
+        ),
+    )
+    states = {item.filename: item.reference_state for item in result.candidates}
+    assert states["debug.log"] == "current_record_missing"
+    assert states["peers.dat"] == "record_number_out_of_range"
+
+
+def test_directory_index_duplicate_location_is_one_candidate(
+    tmp_path, monkeypatch
+) -> None:
+    original = NTFSDirectoryIndexArtifactRecoveryPipeline._parse_node
+
+    def duplicate_slack(self, *args, **kwargs):
+        active, slack, attempts = original(self, *args, **kwargs)
+        return active, slack + slack, attempts
+
+    monkeypatch.setattr(
+        NTFSDirectoryIndexArtifactRecoveryPipeline,
+        "_parse_node",
+        duplicate_slack,
+    )
+    result = directory_recovery(
+        tmp_path, (index_root((), slack=index_entry("wallet.dat")),)
+    )
+    wallet_candidates = tuple(
+        item
+        for item in result.candidates
+        if item.artifact_class in {"wallet_dat", "wallet_backup_like"}
+    )
+    assert result.wallet_candidate_count == 1
+    assert len(wallet_candidates) == 1
 
 
 def test_allocated_wallet_fragmented_nonresident_extents(tmp_path) -> None:

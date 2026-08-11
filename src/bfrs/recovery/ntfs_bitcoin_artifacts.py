@@ -1019,14 +1019,21 @@ class NTFSBitcoinArtifactLocator:
         if value_offset < 24 or value_length < 66 or value_offset + value_length > length:
             raise NtfsMftRecordError("filename_value_bounds_invalid")
         start = offset + value_offset
-        parent_ref = int.from_bytes(fixed[start:start + 8], "little")
-        name_length = fixed[start + 64]
-        namespace = fixed[start + 65]
-        name_end = start + 66 + name_length * 2
-        if namespace not in NAMESPACE_NAMES or name_end > start + value_length:
+        return self._filename_value(fixed[start:start + value_length])
+
+    @staticmethod
+    def _filename_value(value: bytes) -> NTFSFileNameAlias:
+        """Parse one complete NTFS FILE_NAME value or $I30 key."""
+        if len(value) < 66:
+            raise NtfsMftRecordError("filename_value_bounds_invalid")
+        parent_ref = int.from_bytes(value[0:8], "little")
+        name_length = value[64]
+        namespace = value[65]
+        name_end = 66 + name_length * 2
+        if namespace not in NAMESPACE_NAMES or name_end > len(value):
             raise NtfsMftRecordError("filename_name_bounds_invalid")
         try:
-            filename = fixed[start + 66:name_end].decode("utf-16-le", errors="strict")
+            filename = value[66:name_end].decode("utf-16-le", errors="strict")
         except UnicodeDecodeError as error:
             raise NtfsMftRecordError("filename_utf16_invalid") from error
         if not filename or "\x00" in filename or "/" in filename or "\\" in filename:

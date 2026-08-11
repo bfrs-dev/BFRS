@@ -28,6 +28,10 @@ from bfrs.recovery.ntfs_bitcoin_artifacts import (
     NTFSBitcoinArtifactIndex,
     NTFSBitcoinArtifactLocator,
 )
+from bfrs.recovery.ntfs_directory_index import (
+    NTFSDirectoryIndexArtifactRecovery,
+    NTFSDirectoryIndexArtifactRecoveryPipeline,
+)
 from bfrs.recovery.ntfs_stale_file import (
     NTFS_FILE_RECORD_SIGNATURE,
     NTFSStaleFileRecordRecovery,
@@ -93,6 +97,9 @@ class FullImageRecoveryResult:
     logical_ntfs_results: tuple[Any, ...] = ()
     ntfs_bitcoin_artifact_index: NTFSBitcoinArtifactIndex | None = None
     ntfs_stale_file_record_recovery: NTFSStaleFileRecordRecovery | None = None
+    ntfs_directory_index_artifact_recovery: (
+        NTFSDirectoryIndexArtifactRecovery | None
+    ) = None
 
 
 class _AcceptedContextRangeReader:
@@ -175,6 +182,12 @@ class FullImageRecoveryCoordinator:
         range_end = reader.file_size if end is None else end
         ntfs_locator = NTFSBitcoinArtifactLocator()
         ntfs_bitcoin_artifact_index = ntfs_locator.index(reader.path)
+        ntfs_directory_index_artifact_recovery = (
+            NTFSDirectoryIndexArtifactRecoveryPipeline(
+                context=ntfs_locator.stale_recovery_context,
+                locator=ntfs_locator,
+            ).run()
+        )
         stale_pipeline = NTFSStaleFileRecordRecoveryPipeline(
             source=reader.path,
             range_start=start,
@@ -326,6 +339,9 @@ class FullImageRecoveryCoordinator:
             ntfs_bitcoin_artifact_index=ntfs_bitcoin_artifact_index,
             ntfs_stale_file_record_recovery=(
                 ntfs_stale_file_record_recovery
+            ),
+            ntfs_directory_index_artifact_recovery=(
+                ntfs_directory_index_artifact_recovery
             ),
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,

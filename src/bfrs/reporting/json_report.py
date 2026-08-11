@@ -602,6 +602,75 @@ def _ntfs_stale_file_record_recovery(result) -> dict[str, Any]:
     }
 
 
+def _ntfs_directory_index_artifact_recovery(result) -> dict[str, Any]:
+    if result is None:
+        return {
+            "source": None,
+            "directory_record_count": 0,
+            "index_root_count": 0,
+            "index_allocation_stream_count": 0,
+            "indx_block_count": 0,
+            "indx_block_valid_count": 0,
+            "indx_block_invalid_count": 0,
+            "active_entry_count": 0,
+            "slack_candidate_count": 0,
+            "structural_slack_entry_count": 0,
+            "wallet_candidate_count": 0,
+            "active_wallet_candidate_count": 0,
+            "slack_wallet_candidate_count": 0,
+            "bitcoin_context_candidate_count": 0,
+            "rejection_counts": {},
+            "candidates": [],
+            "diagnostics": [
+                "ntfs_directory_index_artifact_recovery_not_available"
+            ],
+        }
+    return {
+        "source": result.source,
+        "directory_record_count": result.directory_record_count,
+        "index_root_count": result.index_root_count,
+        "index_allocation_stream_count": result.index_allocation_stream_count,
+        "indx_block_count": result.indx_block_count,
+        "indx_block_valid_count": result.indx_block_valid_count,
+        "indx_block_invalid_count": result.indx_block_invalid_count,
+        "active_entry_count": result.active_entry_count,
+        "slack_candidate_count": result.slack_candidate_count,
+        "structural_slack_entry_count": result.structural_slack_entry_count,
+        "wallet_candidate_count": result.wallet_candidate_count,
+        "active_wallet_candidate_count": result.active_wallet_candidate_count,
+        "slack_wallet_candidate_count": result.slack_wallet_candidate_count,
+        "bitcoin_context_candidate_count": (
+            result.bitcoin_context_candidate_count
+        ),
+        "rejection_counts": dict(result.rejection_counts),
+        "candidates": [
+            {
+                "source_directory_mft_record": (
+                    item.source_directory_mft_record
+                ),
+                "source_directory_sequence": item.source_directory_sequence,
+                "source_directory_path": item.source_directory_path,
+                "recovered_path": item.recovered_path,
+                "partial_path": item.partial_path,
+                "index_source": item.index_source,
+                "index_vcn": item.index_vcn,
+                "entry_offset": item.entry_offset,
+                "file_reference_record": item.file_reference_record,
+                "file_reference_sequence": item.file_reference_sequence,
+                "filename": item.filename,
+                "namespace": item.namespace,
+                "entry_state": item.entry_state,
+                "reference_state": item.reference_state,
+                "parent_reference_state": item.parent_reference_state,
+                "artifact_class": item.artifact_class,
+                "validation_strength": item.validation_strength,
+            }
+            for item in result.candidates
+        ],
+        "diagnostics": list(result.diagnostics),
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -678,6 +747,11 @@ def serialize_full_image_result(
         "ntfs_stale_file_record_recovery": (
             _ntfs_stale_file_record_recovery(
                 result.ntfs_stale_file_record_recovery
+            )
+        ),
+        "ntfs_directory_index_artifact_recovery": (
+            _ntfs_directory_index_artifact_recovery(
+                result.ntfs_directory_index_artifact_recovery
             )
         ),
         "raw_hit_counts_by_signature": dict(
