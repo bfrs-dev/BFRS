@@ -258,6 +258,40 @@ def _orphan_record_key_diagnostic(result) -> dict[str, Any]:
     }
 
 
+def _orphan_private_key_recovery(result) -> dict[str, Any]:
+    return {
+        "source": result.source,
+        "raw_der_anchor_count": result.raw_der_anchor_count,
+        "candidate_der_count": result.candidate_der_count,
+        "valid_secp256k1_der_count": result.valid_secp256k1_der_count,
+        "canonical_der_count": result.canonical_der_count,
+        "valid_with_embedded_pubkey_count": (
+            result.valid_with_embedded_pubkey_count
+        ),
+        "valid_without_embedded_pubkey_count": (
+            result.valid_without_embedded_pubkey_count
+        ),
+        "locations": [
+            {
+                "absolute_der_offset": location.absolute_der_offset,
+                "der_length": location.der_length,
+                "public_key_encoding": location.public_key_encoding,
+                "validation_strength": location.validation_strength,
+            }
+            for location in result.locations
+        ],
+        "reasons": list(result.reasons),
+        "diagnostics": {
+            "maximum_read_size": result.evidence.get("maximum_read_size", 0),
+            "read_failure_count": result.evidence.get("read_failure_count", 0),
+            "truncated_read_count": result.evidence.get(
+                "truncated_read_count", 0
+            ),
+            "rejection_counts": result.evidence.get("rejection_counts", ()),
+        },
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -316,6 +350,9 @@ def serialize_full_image_result(
         ),
         "orphan_record_key_diagnostic": _orphan_record_key_diagnostic(
             result.orphan_record_key_diagnostic
+        ),
+        "orphan_private_key_recovery": _orphan_private_key_recovery(
+            result.orphan_private_key_recovery
         ),
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())

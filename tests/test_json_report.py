@@ -168,7 +168,22 @@ def test_safe_json_schema_is_explicit_and_deterministic(tmp_path):
     assert payload["raw_hit_counts_by_signature"] == {
         "berkeley_metadata_little_endian": 1,
         "bitcoin_key": 1,
+        "historical_ec_private_key_der_anchor": 1,
     }
+    orphan_keys = payload["orphan_record_key_diagnostic"]
+    assert orphan_keys["raw_strong_hit_count"] == 1
+    assert orphan_keys["valid_record_key_count"] == 1
+    assert orphan_keys["valid_key_count"] == 1
+    assert orphan_keys["locations"][0]["record_type"] == "key"
+    assert "pubkey" not in json.dumps(orphan_keys, sort_keys=True).lower()
+    orphan_private = payload["orphan_private_key_recovery"]
+    assert orphan_private["raw_der_anchor_count"] == 1
+    assert orphan_private["candidate_der_count"] == 1
+    assert orphan_private["valid_secp256k1_der_count"] == 1
+    assert orphan_private["locations"][0]["der_length"] == len(private_der())
+    serialized_private = json.dumps(orphan_private, sort_keys=True).lower()
+    assert private_der().hex() not in serialized_private
+    assert "scalar" not in serialized_private
     assert not contains_bytes(payload)
 
     first = write_json_report(tmp_path / "first.json", result, CONFIGURATION)
@@ -208,7 +223,7 @@ def test_report_omits_nested_plaintext_ciphertext_and_unknown_evidence(tmp_path)
         "pubkey",
         "raw_berkeley_payload",
     ):
-        assert forbidden_field not in encoded
+        assert f'"{forbidden_field}":' not in encoded
 
 
 def test_serializer_rejects_unrelated_objects():

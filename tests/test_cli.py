@@ -223,6 +223,7 @@ def test_cli_defaults_and_signature_set_are_explicit():
         "bitcoin_ckey",
         "bitcoin_mkey",
         "bitcoin_keymeta",
+        "historical_ec_private_key_der_anchor",
     }
 
 

@@ -7,6 +7,10 @@ from typing import Sequence
 
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
 from bfrs.recovery.metadata_less_fragments import FRAMED_BITCOIN_RECORD_PATTERNS
+from bfrs.recovery.orphan_private_key_der import (
+    HISTORICAL_EC_PRIVATE_KEY_DER_ANCHOR,
+    HISTORICAL_EC_PRIVATE_KEY_DER_SIGNATURE,
+)
 from bfrs.reporting.json_report import write_json_report
 from bfrs.scanners.fast_scanner import Signature
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
@@ -32,6 +36,11 @@ BITCOIN_CORE_SIGNATURES_V1 = (
         "berkeley_metadata_big_endian",
         BTREE_MAGIC.to_bytes(4, "big"),
         "berkeley_metadata",
+    ),
+    Signature(
+        HISTORICAL_EC_PRIVATE_KEY_DER_SIGNATURE,
+        HISTORICAL_EC_PRIVATE_KEY_DER_ANCHOR,
+        "historical_private_key_der",
     ),
     *(
         Signature(name, pattern, "bitcoin_record")
