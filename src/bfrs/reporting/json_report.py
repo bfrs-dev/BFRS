@@ -537,6 +537,71 @@ def _ntfs_mft_recovery_diagnostic(index) -> dict[str, Any]:
     }
 
 
+def _ntfs_stale_file_record_recovery(result) -> dict[str, Any]:
+    if result is None:
+        return {
+            "source": None,
+            "raw_file_hit_count": 0,
+            "current_mft_excluded_count": 0,
+            "mftmirr_excluded_count": 0,
+            "candidate_record_count": 0,
+            "structural_stale_record_count": 0,
+            "rejected_record_count": 0,
+            "wallet_candidate_count": 0,
+            "bitcoin_context_candidate_count": 0,
+            "rejection_counts": {},
+            "diagnostic_sample_limit": 0,
+            "records": [],
+            "diagnostics": ["ntfs_stale_file_record_recovery_not_available"],
+        }
+    return {
+        "source": result.source,
+        "raw_file_hit_count": result.raw_file_hit_count,
+        "current_mft_excluded_count": result.current_mft_excluded_count,
+        "mftmirr_excluded_count": result.mftmirr_excluded_count,
+        "candidate_record_count": result.candidate_record_count,
+        "structural_stale_record_count": (
+            result.structural_stale_record_count
+        ),
+        "rejected_record_count": result.rejected_record_count,
+        "wallet_candidate_count": result.wallet_candidate_count,
+        "bitcoin_context_candidate_count": (
+            result.bitcoin_context_candidate_count
+        ),
+        "rejection_counts": dict(result.rejection_counts),
+        "diagnostic_sample_limit": result.diagnostic_sample_limit,
+        "records": [
+            {
+                "physical_offset": record.physical_offset,
+                "embedded_record_number": record.embedded_record_number,
+                "sequence_number": record.sequence_number,
+                "allocation_state": record.allocation_state,
+                "flags": record.flags,
+                "aliases": [_ntfs_alias(alias) for alias in record.aliases],
+                "artifact_class": record.artifact_class,
+                "parent_mft_record_number": (
+                    record.parent_mft_record_number
+                ),
+                "parent_sequence_number": record.parent_sequence_number,
+                "path": record.path,
+                "partial_path": record.partial_path,
+                "resident": record.resident,
+                "nonresident": record.nonresident,
+                "logical_size": record.logical_size,
+                "allocated_size": record.allocated_size,
+                "extent_count": record.extent_count,
+                "extents": [_ntfs_extent(extent) for extent in record.extents],
+                "extent_trust": record.extent_trust,
+                "data_recovery_state": record.data_recovery_state,
+                "comparison_to_current": record.comparison_to_current,
+                "validation_strength": record.validation_strength,
+            }
+            for record in result.records
+        ],
+        "diagnostics": list(result.diagnostics),
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -609,6 +674,11 @@ def serialize_full_image_result(
         ),
         "ntfs_mft_recovery_diagnostic": _ntfs_mft_recovery_diagnostic(
             result.ntfs_bitcoin_artifact_index
+        ),
+        "ntfs_stale_file_record_recovery": (
+            _ntfs_stale_file_record_recovery(
+                result.ntfs_stale_file_record_recovery
+            )
         ),
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())

@@ -129,6 +129,60 @@ class _Record:
     data: _Data | None
 
 
+@dataclass(frozen=True, slots=True)
+class NTFSStaleRecoveryContext:
+    source: str
+    boot: _Boot
+    mft_extents: tuple
+    mft_logical_size: int
+    current_records: dict[tuple[int, int], _Record]
+    current_records_by_number: dict[int, _Record]
+
+    def current_mft_record_at(self, physical_offset: int) -> int | None:
+        for extent in self.mft_extents:
+            physical_end = extent.physical_start + extent.length
+            if (
+                extent.physical_start <= physical_offset
+                and physical_offset + self.boot.record_size <= physical_end
+            ):
+                logical_offset = (
+                    extent.logical_start
+                    + physical_offset
+                    - extent.physical_start
+                )
+                if (
+                    logical_offset % self.boot.record_size == 0
+                    and logical_offset + self.boot.record_size
+                    <= self.mft_logical_size
+                ):
+                    return logical_offset // self.boot.record_size
+        return None
+
+    def is_mft_mirror_record(self, physical_offset: int) -> bool:
+        mirror_start = (
+            self.boot.volume_offset
+            + self.boot.mft_mirror_lcn * self.boot.cluster_size
+        )
+        return any(
+            physical_offset == mirror_start + number * self.boot.record_size
+            for number in range(MFT_MIRROR_RECORD_COUNT)
+        )
+
+    def read_current_record(self, number: int) -> bytes | None:
+        logical_offset = number * self.boot.record_size
+        if (
+            number < 0
+            or logical_offset + self.boot.record_size > self.mft_logical_size
+        ):
+            return None
+        image = _Image(Path(self.source))
+        stream = _LogicalStream(image, self.mft_extents, self.mft_logical_size)
+        try:
+            return stream.read_at(logical_offset, self.boot.record_size)
+        except (OSError, ValueError):
+            return None
+
+
 class _Image:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -191,7 +245,15 @@ class _LogicalStream:
 class NTFSBitcoinArtifactLocator:
     """Discover one supported NTFS volume and index MFT filename artifacts."""
 
+    def __init__(self) -> None:
+        self._stale_context: NTFSStaleRecoveryContext | None = None
+
+    @property
+    def stale_recovery_context(self) -> NTFSStaleRecoveryContext | None:
+        return self._stale_context
+
     def index(self, source: str | Path) -> NTFSBitcoinArtifactIndex:
+        self._stale_context = None
         path = Path(source).resolve()
         image = _Image(path)
         diagnostics: list[str] = []
@@ -300,6 +362,14 @@ class NTFSBitcoinArtifactLocator:
             main_mirror_raw=main_mirror_raw,
             invalid_entries=invalid_entries,
             mirror_expected=mirror_expected,
+        )
+        self._stale_context = NTFSStaleRecoveryContext(
+            source=str(path),
+            boot=boot,
+            mft_extents=tuple(mft.extent_mapping.extents),
+            mft_logical_size=safe_stream_size,
+            current_records=records,
+            current_records_by_number=main_by_number,
         )
 
         candidates: list[NTFSBitcoinArtifactCandidate] = []
@@ -827,6 +897,7 @@ class NTFSBitcoinArtifactLocator:
         used: int,
         boot: _Boot,
         image_size: int,
+        allow_invalid_data: bool = False,
     ) -> tuple[int, NTFSFileNameAlias | None, _Data | None, bool, bool]:
         if offset + 4 > used:
             raise NtfsMftRecordError("attribute_end_marker_missing")
@@ -853,14 +924,30 @@ class NTFSBitcoinArtifactLocator:
                 raise NtfsMftRecordError("filename_nonresident")
             alias = self._filename(fixed, offset, length)
         elif type_code == ATTRIBUTE_DATA and name_length == 0:
-            data = self._data(
-                fixed,
-                offset,
-                length,
-                nonresident,
-                boot,
-                image_size,
-            )
+            try:
+                data = self._data(
+                    fixed,
+                    offset,
+                    length,
+                    nonresident,
+                    boot,
+                    image_size,
+                )
+            except NtfsMftRecordError as error:
+                if (
+                    not allow_invalid_data
+                    or not str(error).startswith("mapping_pairs")
+                    or not nonresident
+                    or length < 64
+                ):
+                    raise
+                data = _Data(
+                    resident=False,
+                    logical_size=self._u64(fixed, offset + 48),
+                    allocated_size=self._u64(fixed, offset + 40),
+                    extents=(),
+                    state=f"invalid:{error}",
+                )
         return offset + length, alias, data, attribute_list, False
 
     def _parse_record(
@@ -869,6 +956,7 @@ class NTFSBitcoinArtifactLocator:
         number: int,
         boot: _Boot,
         image_size: int,
+        allow_invalid_data: bool = False,
     ) -> _Record:
         fixed, first, used, sequence, flags = self._validated_record_header(
             raw, boot
@@ -881,7 +969,12 @@ class NTFSBitcoinArtifactLocator:
         while offset <= used:
             next_offset, alias, data, found_list, ended = (
                 self._parse_one_attribute(
-                    fixed, offset, used, boot, image_size
+                    fixed,
+                    offset,
+                    used,
+                    boot,
+                    image_size,
+                    allow_invalid_data=allow_invalid_data,
                 )
             )
             if ended:

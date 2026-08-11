@@ -4,12 +4,18 @@ import pytest
 
 from bfrs.cli import BITCOIN_CORE_SIGNATURES_V1
 from bfrs.core.models import ValidationStatus
+from bfrs.core.models import RawHit
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
 from bfrs.recovery.ntfs_bitcoin_artifacts import (
     NTFSBitcoinArtifactLocator,
 )
+from bfrs.recovery.ntfs_stale_file import (
+    NTFS_FILE_RECORD_SIGNATURE,
+    NTFSStaleFileRecordRecoveryPipeline,
+)
 from bfrs.reporting.json_report import _ntfs_bitcoin_artifact_index
 from bfrs.reporting.json_report import _ntfs_mft_recovery_diagnostic
+from bfrs.reporting.json_report import _ntfs_stale_file_record_recovery
 from bfrs.validators.candidate_policy import CandidatePolicy
 
 
@@ -322,6 +328,10 @@ def test_coordinator_runs_index_without_changing_wallet_status(tmp_path) -> None
     assert result.status is ValidationStatus.REJECTED
     assert result.structural_wallet_count == 0
     assert result.fragment_wallet_count == 0
+    stale = result.ntfs_stale_file_record_recovery
+    assert stale.raw_file_hit_count >= 2
+    assert stale.current_mft_excluded_count >= 2
+    assert stale.wallet_candidate_count == 0
 
 
 def malformed_attribute() -> bytes:
@@ -503,3 +513,251 @@ def test_mirror_bitcoin_context_uses_existing_path_classification(tmp_path) -> N
     candidates = result.mft_recovery_diagnostic.mirror_artifact_candidates
     debug_candidate = next(item for item in candidates if item.filename == "debug.log")
     assert debug_candidate.artifact_class == "bitcoin_context_artifact"
+
+
+def image_with_physical_records(
+    base: bytes,
+    records: dict[int, bytes],
+) -> bytes:
+    raw = bytearray(base)
+    for offset, record in records.items():
+        raw[offset:offset + len(record)] = record
+    return bytes(raw)
+
+
+def stale_recovery(
+    tmp_path,
+    raw: bytes,
+    offsets: list[int],
+    *,
+    range_start: int = 0,
+    range_end: int | None = None,
+    sample_limit: int = 100,
+):
+    path = tmp_path / "stale-file.img"
+    path.write_bytes(raw)
+    locator = NTFSBitcoinArtifactLocator()
+    locator.index(path)
+    pipeline = NTFSStaleFileRecordRecoveryPipeline(
+        source=path,
+        range_start=range_start,
+        range_end=len(raw) if range_end is None else range_end,
+        context=locator.stale_recovery_context,
+        locator=locator,
+        diagnostic_sample_limit=sample_limit,
+    )
+    for offset in offsets:
+        pipeline.process_hit(
+            RawHit(
+                start_offset=offset,
+                end_offset=offset + 4,
+                hit_type=NTFS_FILE_RECORD_SIGNATURE,
+                confidence=0.0,
+                source=str(path),
+            )
+        )
+    return pipeline.finish()
+
+
+def test_stale_recovery_excludes_exact_current_mft_boundary(tmp_path) -> None:
+    raw = image_with({})
+    result = stale_recovery(tmp_path, raw, [MFT_LCN * CLUSTER])
+    assert result.raw_file_hit_count == 1
+    assert result.current_mft_excluded_count == 1
+    assert result.structural_stale_record_count == 0
+
+
+def test_stale_recovery_excludes_four_mft_mirror_records(tmp_path) -> None:
+    mirror = file_record(0, (filename("$MFT"),))
+    raw = image_with({}, mirror_records={0: mirror})
+    mirror_offset = 8 * CLUSTER
+    result = stale_recovery(tmp_path, raw, [mirror_offset])
+    assert result.mftmirr_excluded_count == 1
+    assert result.structural_stale_record_count == 0
+
+
+def test_valid_stale_wallet_and_deleted_state_are_structural_only(tmp_path) -> None:
+    offset = 600_000
+    wallet = file_record(
+        900,
+        (filename("wallet.dat"), data_resident(b"SECRET")),
+        allocated=False,
+        sequence=7,
+    )
+    raw = image_with_physical_records(image_with({}), {offset: wallet})
+    result = stale_recovery(tmp_path, raw, [offset])
+    record = result.records[0]
+    assert result.structural_stale_record_count == 1
+    assert result.wallet_candidate_count == 1
+    assert record.allocation_state == "deleted"
+    assert record.validation_strength == "structural_stale_ntfs_file"
+    assert record.resident is True
+    assert record.logical_size == len(b"SECRET")
+    assert record.comparison_to_current == (
+        "stale_copy_record_number_out_of_range"
+    )
+    encoded = json.dumps(_ntfs_stale_file_record_recovery(result))
+    assert "SECRET" not in encoded
+
+
+def test_stale_wallet_empty_png_is_not_wallet(tmp_path) -> None:
+    offset = 600_000
+    record = file_record(900, (filename("Wallet-Empty.png"),))
+    raw = image_with_physical_records(image_with({}), {offset: record})
+    result = stale_recovery(tmp_path, raw, [offset])
+    assert result.structural_stale_record_count == 1
+    assert result.wallet_candidate_count == 0
+
+
+def test_raw_file_and_random_wallet_string_fail_strict_usa(tmp_path) -> None:
+    first = 600_000
+    second = 602_000
+    bad_usa = bytearray(file_record(900, (filename("wallet.dat"),)))
+    bad_usa[510:512] = b"XX"
+    random = (b"FILE" + b"wallet.dat").ljust(RECORD, b"\x00")
+    raw = image_with_physical_records(
+        image_with({}), {first: bytes(bad_usa), second: random}
+    )
+    result = stale_recovery(tmp_path, raw, [first, second])
+    assert result.structural_stale_record_count == 0
+    assert result.wallet_candidate_count == 0
+    assert result.rejected_record_count == 2
+
+
+def test_stale_fragmented_nonresident_data_has_stale_extent_trust(tmp_path) -> None:
+    offset = 600_000
+    pairs = run(1, 40) + run(1, 20) + b"\x00"
+    record = file_record(
+        900,
+        (filename("wallet.dat"), data_nonresident(pairs, 1)),
+    )
+    raw = image_with_physical_records(image_with({}), {offset: record})
+    result = stale_recovery(tmp_path, raw, [offset])
+    recovered = result.records[0]
+    assert recovered.extent_count == 2
+    assert recovered.extent_trust == "stale_record_possible"
+    assert [item.physical_lcn_start for item in recovered.extents] == [40, 60]
+
+
+def test_invalid_stale_runlist_preserves_name_but_not_extents(tmp_path) -> None:
+    offset = 600_000
+    invalid_data = data_nonresident(run(1, 40) + b"\x00", 5)
+    record = file_record(900, (filename("wallet.dat"), invalid_data))
+    raw = image_with_physical_records(image_with({}), {offset: record})
+    result = stale_recovery(tmp_path, raw, [offset])
+    recovered = result.records[0]
+    assert result.wallet_candidate_count == 1
+    assert recovered.data_recovery_state.startswith("invalid:mapping_pairs")
+    assert recovered.extent_count == 0
+    assert recovered.extents == ()
+
+
+def test_stale_extent_outside_volume_is_not_reported_as_valid(tmp_path) -> None:
+    offset = 600_000
+    outside = data_nonresident(
+        run(1, 5000) + b"\x00",
+        0,
+        logical_size=CLUSTER,
+        allocated_size=CLUSTER,
+    )
+    record = file_record(900, (filename("wallet.dat"), outside))
+    raw = image_with_physical_records(image_with({}), {offset: record})
+    recovered = stale_recovery(tmp_path, raw, [offset]).records[0]
+    assert recovered.data_recovery_state == "extent_outside_image"
+    assert recovered.extent_count == 0
+    assert recovered.extents == ()
+
+
+def test_stale_bitcoin_context_is_not_wallet_evidence(tmp_path) -> None:
+    offset = 600_000
+    record = file_record(900, (filename("debug.log"),))
+    raw = image_with_physical_records(image_with({}), {offset: record})
+    result = stale_recovery(tmp_path, raw, [offset])
+    assert result.wallet_candidate_count == 0
+    assert result.bitcoin_context_candidate_count == 1
+    assert result.records[0].artifact_class == "bitcoin_context_artifact"
+
+
+def test_stale_record_number_collision_differs_from_current(tmp_path) -> None:
+    offset = 600_000
+    current = file_record(6, (filename("current.txt"),), sequence=1)
+    stale = file_record(6, (filename("wallet.dat"),), sequence=2)
+    raw = image_with_physical_records(
+        image_with({6: current}), {offset: stale}
+    )
+    result = stale_recovery(tmp_path, raw, [offset])
+    assert result.records[0].comparison_to_current == (
+        "stale_copy_differs_current"
+    )
+
+
+def test_exact_current_copy_outside_mft_is_stale_match(tmp_path) -> None:
+    offset = 600_000
+    current = file_record(6, (filename("current.txt"),), sequence=3)
+    raw = image_with_physical_records(
+        image_with({6: current}), {offset: current}
+    )
+    result = stale_recovery(tmp_path, raw, [offset, offset])
+    assert result.raw_file_hit_count == 2
+    assert result.candidate_record_count == 1
+    assert result.structural_stale_record_count == 1
+    assert result.records[0].comparison_to_current == (
+        "stale_copy_matches_current"
+    )
+
+
+def test_stale_record_read_respects_requested_range(tmp_path) -> None:
+    offset = 600_000
+    record = file_record(900, (filename("wallet.dat"),))
+    raw = image_with_physical_records(image_with({}), {offset: record})
+    result = stale_recovery(
+        tmp_path,
+        raw,
+        [offset],
+        range_start=offset,
+        range_end=offset + RECORD - 1,
+    )
+    assert result.structural_stale_record_count == 0
+    assert dict(result.rejection_counts) == {"candidate_outside_safe_range": 1}
+
+
+def test_coordinator_same_scan_pass_recovers_stale_wallet_without_status_change(
+    tmp_path,
+) -> None:
+    offset = 600_000
+    stale_wallet = file_record(900, (filename("wallet.dat"),))
+    path = tmp_path / "coordinator-stale.img"
+    path.write_bytes(
+        image_with_physical_records(image_with({}), {offset: stale_wallet})
+    )
+    result = FullImageRecoveryCoordinator(
+        BITCOIN_CORE_SIGNATURES_V1,
+        CandidatePolicy(min_hits=1, min_distinct_types=1),
+        chunk_size=64 * 1024,
+    ).scan(path)
+    stale = result.ntfs_stale_file_record_recovery
+    assert dict(result.evidence["raw_hit_counts_by_signature"])[
+        NTFS_FILE_RECORD_SIGNATURE
+    ] >= 2
+    assert stale.wallet_candidate_count == 1
+    assert stale.records[0].physical_offset == offset
+    assert result.hotspot_count == 0
+    assert result.status is ValidationStatus.REJECTED
+    assert result.structural_wallet_count == 0
+    assert result.fragment_wallet_count == 0
+
+
+def test_stale_json_sample_is_deterministic_and_aggregate_is_complete(
+    tmp_path,
+) -> None:
+    offsets = [600_000, 602_000, 604_000]
+    physical_records = {
+        offset: file_record(900 + index, (filename(f"old-{index}.tmp"),))
+        for index, offset in enumerate(offsets)
+    }
+    raw = image_with_physical_records(image_with({}), physical_records)
+    result = stale_recovery(
+        tmp_path, raw, offsets, sample_limit=2
+    )
+    assert result.structural_stale_record_count == 3
+    assert [item.physical_offset for item in result.records] == offsets[:2]

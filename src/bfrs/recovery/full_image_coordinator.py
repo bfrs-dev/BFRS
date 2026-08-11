@@ -1,5 +1,6 @@
 """Coordinate conservative Bitcoin wallet recovery over an image range."""
 
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,11 @@ from bfrs.recovery.metadata_less_fragments import (
 from bfrs.recovery.ntfs_bitcoin_artifacts import (
     NTFSBitcoinArtifactIndex,
     NTFSBitcoinArtifactLocator,
+)
+from bfrs.recovery.ntfs_stale_file import (
+    NTFS_FILE_RECORD_SIGNATURE,
+    NTFSStaleFileRecordRecovery,
+    NTFSStaleFileRecordRecoveryPipeline,
 )
 from bfrs.recovery.orphan_record_key_diagnostic import (
     OrphanBitcoinRecordKeyDiagnostic,
@@ -86,6 +92,7 @@ class FullImageRecoveryResult:
     evidence: dict[str, Any]
     logical_ntfs_results: tuple[Any, ...] = ()
     ntfs_bitcoin_artifact_index: NTFSBitcoinArtifactIndex | None = None
+    ntfs_stale_file_record_recovery: NTFSStaleFileRecordRecovery | None = None
 
 
 class _AcceptedContextRangeReader:
@@ -166,7 +173,29 @@ class FullImageRecoveryCoordinator:
     ) -> FullImageRecoveryResult:
         reader = ChunkReader(path, chunk_size=self._chunk_size, overlap=self._overlap)
         range_end = reader.file_size if end is None else end
-        hits = tuple(self._scanner.scan(reader, start=start, end=range_end))
+        ntfs_locator = NTFSBitcoinArtifactLocator()
+        ntfs_bitcoin_artifact_index = ntfs_locator.index(reader.path)
+        stale_pipeline = NTFSStaleFileRecordRecoveryPipeline(
+            source=reader.path,
+            range_start=start,
+            range_end=range_end,
+            context=ntfs_locator.stale_recovery_context,
+            locator=ntfs_locator,
+        )
+        recovery_hits: list[RawHit] = []
+        raw_hit_counts: Counter[str] = Counter()
+        try:
+            for hit in self._scanner.scan(reader, start=start, end=range_end):
+                raw_hit_counts[hit.hit_type] += 1
+                if hit.hit_type == NTFS_FILE_RECORD_SIGNATURE:
+                    stale_pipeline.process_hit(hit)
+                else:
+                    recovery_hits.append(hit)
+        except BaseException:
+            stale_pipeline.close()
+            raise
+        ntfs_stale_file_record_recovery = stale_pipeline.finish()
+        hits = tuple(recovery_hits)
         hotspots = self._range_hotspots(hits, start, range_end)
 
         decisions = tuple(
@@ -256,9 +285,6 @@ class FullImageRecoveryCoordinator:
                 range_reader=range_reader,
             ).run()
         )
-        ntfs_bitcoin_artifact_index = NTFSBitcoinArtifactLocator().index(
-            reader.path
-        )
         ordered_direct = tuple(item[2] for item in sorted(direct_with_ranges))
         all_statuses = tuple(result.status for result in ordered_direct) + tuple(
             result.status for result in wallet_results
@@ -285,7 +311,7 @@ class FullImageRecoveryCoordinator:
             start_offset=start,
             end_offset=range_end,
             status=status,
-            raw_hit_count=len(hits),
+            raw_hit_count=sum(raw_hit_counts.values()),
             hotspot_count=len(hotspots),
             accepted_hotspot_count=len(accepted),
             direct_results=ordered_direct,
@@ -298,6 +324,9 @@ class FullImageRecoveryCoordinator:
                 orphan_private_key_fragments
             ),
             ntfs_bitcoin_artifact_index=ntfs_bitcoin_artifact_index,
+            ntfs_stale_file_record_recovery=(
+                ntfs_stale_file_record_recovery
+            ),
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,
             reasons=reasons,
@@ -344,8 +373,7 @@ class FullImageRecoveryCoordinator:
                 ),
                 "errors": tuple(errors),
                 "raw_hit_counts_by_signature": tuple(
-                    (hit_type, sum(hit.hit_type == hit_type for hit in hits))
-                    for hit_type in sorted({hit.hit_type for hit in hits})
+                    sorted(raw_hit_counts.items())
                 ),
             },
         )

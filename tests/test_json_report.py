@@ -200,6 +200,9 @@ def test_safe_json_schema_is_explicit_and_deterministic(tmp_path):
     mft_diagnostic = payload["ntfs_mft_recovery_diagnostic"]
     assert mft_diagnostic["mirror_record_count_expected"] == 0
     assert mft_diagnostic["partial_salvage_candidates"] == []
+    stale_ntfs = payload["ntfs_stale_file_record_recovery"]
+    assert stale_ntfs["structural_stale_record_count"] == 0
+    assert stale_ntfs["records"] == []
     assert not contains_bytes(payload)
 
     first = write_json_report(tmp_path / "first.json", result, CONFIGURATION)

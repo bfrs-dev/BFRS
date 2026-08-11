@@ -214,7 +214,9 @@ def test_cli_defaults_and_signature_set_are_explicit():
     patterns = {item.name: item.pattern for item in BITCOIN_CORE_SIGNATURES_V1}
     assert patterns["berkeley_metadata_little_endian"] == BTREE_MAGIC.to_bytes(4, "little")
     assert patterns["berkeley_metadata_big_endian"] == BTREE_MAGIC.to_bytes(4, "big")
+    assert patterns["ntfs_file_record_anchor"] == b"FILE"
     assert set(patterns) == {
+        "ntfs_file_record_anchor",
         "berkeley_metadata_little_endian",
         "berkeley_metadata_big_endian",
         "bitcoin_key",

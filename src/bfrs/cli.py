@@ -11,6 +11,10 @@ from bfrs.recovery.orphan_private_key_der import (
     HISTORICAL_EC_PRIVATE_KEY_DER_ANCHOR,
     HISTORICAL_EC_PRIVATE_KEY_DER_SIGNATURE,
 )
+from bfrs.recovery.ntfs_stale_file import (
+    NTFS_FILE_RECORD_PATTERN,
+    NTFS_FILE_RECORD_SIGNATURE,
+)
 from bfrs.reporting.json_report import write_json_report
 from bfrs.scanners.fast_scanner import Signature
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
@@ -27,6 +31,11 @@ DEFAULT_MINIMUM_DISTINCT_TYPES = 1
 
 
 BITCOIN_CORE_SIGNATURES_V1 = (
+    Signature(
+        NTFS_FILE_RECORD_SIGNATURE,
+        NTFS_FILE_RECORD_PATTERN,
+        "ntfs_file_record",
+    ),
     Signature(
         "berkeley_metadata_little_endian",
         BTREE_MAGIC.to_bytes(4, "little"),
