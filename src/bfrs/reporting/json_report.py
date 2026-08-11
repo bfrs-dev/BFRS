@@ -292,6 +292,33 @@ def _orphan_private_key_recovery(result) -> dict[str, Any]:
     }
 
 
+def _orphan_private_key_fragment_recovery(result) -> dict[str, Any]:
+    return {
+        "source": result.source,
+        "raw_inner_anchor_count": result.raw_inner_anchor_count,
+        "candidate_inner_fragment_count": result.candidate_inner_fragment_count,
+        "valid_inner_fragment_count": result.valid_inner_fragment_count,
+        "locations": [
+            {
+                "absolute_anchor_offset": location.absolute_anchor_offset,
+                "recovered_fragment_length": location.recovered_fragment_length,
+                "public_key_encoding": location.public_key_encoding,
+                "validation_strength": location.validation_strength,
+            }
+            for location in result.locations
+        ],
+        "reasons": list(result.reasons),
+        "diagnostics": {
+            "maximum_read_size": result.evidence.get("maximum_read_size", 0),
+            "read_failure_count": result.evidence.get("read_failure_count", 0),
+            "truncated_read_count": result.evidence.get(
+                "truncated_read_count", 0
+            ),
+            "rejection_counts": result.evidence.get("rejection_counts", ()),
+        },
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -353,6 +380,11 @@ def serialize_full_image_result(
         ),
         "orphan_private_key_recovery": _orphan_private_key_recovery(
             result.orphan_private_key_recovery
+        ),
+        "orphan_private_key_fragment_recovery": (
+            _orphan_private_key_fragment_recovery(
+                result.orphan_private_key_fragment_recovery
+            )
         ),
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())

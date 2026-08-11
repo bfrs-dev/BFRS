@@ -184,6 +184,16 @@ def test_safe_json_schema_is_explicit_and_deterministic(tmp_path):
     serialized_private = json.dumps(orphan_private, sort_keys=True).lower()
     assert private_der().hex() not in serialized_private
     assert "scalar" not in serialized_private
+    inner_private = payload["orphan_private_key_fragment_recovery"]
+    assert inner_private["raw_inner_anchor_count"] == 1
+    assert inner_private["candidate_inner_fragment_count"] == 1
+    assert inner_private["valid_inner_fragment_count"] == 1
+    assert inner_private["locations"][0]["validation_strength"] == (
+        "cryptographic_inner_fragment"
+    )
+    serialized_inner = json.dumps(inner_private, sort_keys=True).lower()
+    assert private_der().hex() not in serialized_inner
+    assert "scalar" not in serialized_inner
     assert not contains_bytes(payload)
 
     first = write_json_report(tmp_path / "first.json", result, CONFIGURATION)

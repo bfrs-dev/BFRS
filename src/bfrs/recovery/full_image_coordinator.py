@@ -31,6 +31,10 @@ from bfrs.recovery.orphan_private_key_der import (
     OrphanHistoricalECPrivateKeyRecovery,
     OrphanHistoricalECPrivateKeyRecoveryPipeline,
 )
+from bfrs.recovery.orphan_private_key_fragment import (
+    OrphanHistoricalECPrivateKeyFragmentRecovery,
+    OrphanHistoricalECPrivateKeyFragmentRecoveryPipeline,
+)
 from bfrs.recovery.reconstructed_wallet_pipeline import (
     ReconstructedBerkeleyWalletPipeline,
     ReconstructedBerkeleyWalletRecovery,
@@ -69,6 +73,9 @@ class FullImageRecoveryResult:
     metadata_less_fragment_recovery: MetadataLessBerkeleyFragmentRecovery
     orphan_record_key_diagnostic: OrphanBitcoinRecordKeyDiagnostic
     orphan_private_key_recovery: OrphanHistoricalECPrivateKeyRecovery
+    orphan_private_key_fragment_recovery: (
+        OrphanHistoricalECPrivateKeyFragmentRecovery
+    )
     structural_wallet_count: int
     fragment_wallet_count: int
     reasons: tuple[str, ...]
@@ -235,6 +242,15 @@ class FullImageRecoveryCoordinator:
             range_end=range_end,
             range_reader=range_reader,
         ).run()
+        orphan_private_key_fragments = (
+            OrphanHistoricalECPrivateKeyFragmentRecoveryPipeline(
+                accepted_hits,
+                source=str(reader.path.resolve()),
+                range_start=start,
+                range_end=range_end,
+                range_reader=range_reader,
+            ).run()
+        )
         ordered_direct = tuple(item[2] for item in sorted(direct_with_ranges))
         all_statuses = tuple(result.status for result in ordered_direct) + tuple(
             result.status for result in wallet_results
@@ -270,6 +286,9 @@ class FullImageRecoveryCoordinator:
             metadata_less_fragment_recovery=metadata_less,
             orphan_record_key_diagnostic=orphan_record_keys,
             orphan_private_key_recovery=orphan_private_keys,
+            orphan_private_key_fragment_recovery=(
+                orphan_private_key_fragments
+            ),
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,
             reasons=reasons,
