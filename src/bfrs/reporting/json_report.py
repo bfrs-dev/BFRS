@@ -553,6 +553,10 @@ def _ntfs_stale_file_record_recovery(result) -> dict[str, Any]:
             "diagnostic_sample_limit": 0,
             "records": [],
             "diagnostics": ["ntfs_stale_file_record_recovery_not_available"],
+            "outside_current_volume_before_count": 0,
+            "outside_current_volume_after_count": 0,
+            "image_end_truncated_count": 0,
+            "cli_range_truncated_count": 0,
         }
     return {
         "source": result.source,
@@ -599,6 +603,10 @@ def _ntfs_stale_file_record_recovery(result) -> dict[str, Any]:
             for record in result.records
         ],
         "diagnostics": list(result.diagnostics),
+        "outside_current_volume_before_count": result.outside_current_volume_before_count,
+        "outside_current_volume_after_count": result.outside_current_volume_after_count,
+        "image_end_truncated_count": result.image_end_truncated_count,
+        "cli_range_truncated_count": result.cli_range_truncated_count,
     }
 
 
@@ -690,6 +698,10 @@ def _ntfs_stale_indx_recovery(result) -> dict[str, Any]:
             "blocks": [],
             "candidates": [],
             "diagnostics": ["ntfs_stale_indx_recovery_not_available"],
+            "outside_current_volume_before_count": 0,
+            "outside_current_volume_after_count": 0,
+            "image_end_truncated_count": 0,
+            "cli_range_truncated_count": 0,
         }
     return {
         "source": result.source,
@@ -739,6 +751,106 @@ def _ntfs_stale_indx_recovery(result) -> dict[str, Any]:
                 "source_directory_known": item.source_directory_known,
             }
             for item in result.candidates
+        ],
+        "diagnostics": list(result.diagnostics),
+        "outside_current_volume_before_count": result.outside_current_volume_before_count,
+        "outside_current_volume_after_count": result.outside_current_volume_after_count,
+        "image_end_truncated_count": result.image_end_truncated_count,
+        "cli_range_truncated_count": result.cli_range_truncated_count,
+    }
+
+
+def _ntfs_detached_volume_discovery(result) -> dict[str, Any]:
+    if result is None:
+        return {"source": None, "raw_boot_anchor_count": 0,
+                "candidate_boot_sector_count": 0, "valid_boot_sector_count": 0,
+                "invalid_boot_sector_count": 0, "geometry_hypothesis_count": 0,
+                "boot_only_geometry_count": 0, "correlated_geometry_count": 0,
+                "detached_volume_count": 0, "current_volume_copy_count": 0,
+                "rejection_counts": {}, "volumes": [], "diagnostics": ["ntfs_detached_volume_discovery_not_available"]}
+    return {
+        "source": result.source,
+        "raw_boot_anchor_count": result.raw_boot_anchor_count,
+        "candidate_boot_sector_count": result.candidate_boot_sector_count,
+        "valid_boot_sector_count": result.valid_boot_sector_count,
+        "invalid_boot_sector_count": result.invalid_boot_sector_count,
+        "geometry_hypothesis_count": result.geometry_hypothesis_count,
+        "boot_only_geometry_count": result.boot_only_geometry_count,
+        "correlated_geometry_count": result.correlated_geometry_count,
+        "detached_volume_count": result.detached_volume_count,
+        "current_volume_copy_count": result.current_volume_copy_count,
+        "rejection_counts": dict(result.rejection_counts),
+        "volumes": [
+            {name: getattr(volume, name) for name in (
+                "classification", "validation_strength", "provenance", "volume_start", "volume_end",
+                "volume_size_bytes", "bytes_per_sector", "sectors_per_cluster", "cluster_size",
+                "total_sectors", "mft_lcn", "mftmirr_lcn", "mft_record_size",
+                "index_block_size", "volume_serial", "boot_copy_count",
+                "primary_boot_offsets", "backup_boot_offsets", "mft0_physical_offset",
+                "mft0_valid", "mft0_failure_reason", "mftmirr0_physical_offset",
+                "mftmirr0_valid", "mftmirr0_failure_reason", "boot_pair_valid", "reasons")}
+            for volume in result.volumes
+        ],
+        "diagnostics": list(result.diagnostics),
+    }
+
+
+def _ntfs_detached_metadata_recovery(result) -> dict[str, Any]:
+    if result is None:
+        return {
+            "source": None, "volume_count": 0, "volumes": [],
+            "wallet_candidate_count": 0,
+            "bitcoin_context_candidate_count": 0,
+            "logical_wallet_candidate_count": 0,
+            "stale_wallet_candidate_count": 0,
+            "diagnostics": ["ntfs_detached_metadata_recovery_not_available"],
+        }
+    scalar_names = (
+        "volume_start", "volume_end", "volume_size_bytes", "provenance",
+        "validation_strength", "mft_logical_size", "mft_record_count",
+        "mft_records_scanned", "mft_records_valid", "mft_records_invalid",
+        "directory_record_count", "index_root_count",
+        "index_allocation_stream_count", "indx_block_count",
+        "indx_block_valid_count", "indx_block_invalid_count",
+        "active_index_entry_count", "structural_index_slack_entry_count",
+        "raw_file_hit_count_within_volume",
+        "detached_current_mft_excluded_count", "structural_stale_file_count",
+        "raw_indx_hit_count_within_volume",
+        "detached_current_indx_excluded_count", "structural_stale_indx_count",
+        "wallet_candidate_count", "bitcoin_context_candidate_count",
+    )
+    candidate_names = (
+        "volume_start", "volume_end", "provenance", "source_layer",
+        "artifact_class", "filename", "path", "partial_path",
+        "mft_record_number", "sequence_number", "allocation_state",
+        "resident", "nonresident", "logical_size", "allocated_size",
+        "initialized_size", "extent_trust", "physical_metadata_offset",
+        "source_directory_mft_record", "entry_offset", "entry_state",
+        "file_reference_record", "file_reference_sequence", "reference_state",
+        "validation_strength",
+    )
+    return {
+        "source": result.source,
+        "volume_count": result.volume_count,
+        "wallet_candidate_count": result.wallet_candidate_count,
+        "bitcoin_context_candidate_count": result.bitcoin_context_candidate_count,
+        "logical_wallet_candidate_count": result.logical_wallet_candidate_count,
+        "stale_wallet_candidate_count": result.stale_wallet_candidate_count,
+        "volumes": [
+            {
+                **{name: getattr(volume, name) for name in scalar_names},
+                "rejection_counts": dict(volume.rejection_counts),
+                "candidates": [
+                    {
+                        **{name: getattr(item, name) for name in candidate_names},
+                        "aliases": [_ntfs_alias(alias) for alias in item.aliases],
+                        "extents": [_ntfs_extent(extent) for extent in item.extents],
+                    }
+                    for item in volume.candidates
+                ],
+                "diagnostics": list(volume.diagnostics),
+            }
+            for volume in result.volumes
         ],
         "diagnostics": list(result.diagnostics),
     }
@@ -829,6 +941,12 @@ def serialize_full_image_result(
         ),
         "ntfs_stale_indx_recovery": _ntfs_stale_indx_recovery(
             result.ntfs_stale_indx_recovery
+        ),
+        "ntfs_detached_volume_discovery": _ntfs_detached_volume_discovery(
+            result.ntfs_detached_volume_discovery
+        ),
+        "ntfs_detached_metadata_recovery": _ntfs_detached_metadata_recovery(
+            result.ntfs_detached_metadata_recovery
         ),
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())

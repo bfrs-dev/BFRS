@@ -63,6 +63,10 @@ class NTFSStaleFileRecordRecovery:
     records: tuple[NTFSStaleFileRecord, ...]
     diagnostic_sample_limit: int
     diagnostics: tuple[str, ...]
+    outside_current_volume_before_count: int = 0
+    outside_current_volume_after_count: int = 0
+    image_end_truncated_count: int = 0
+    cli_range_truncated_count: int = 0
 
 
 class NTFSStaleFileRecordRecoveryPipeline:
@@ -79,6 +83,7 @@ class NTFSStaleFileRecordRecoveryPipeline:
         diagnostic_sample_limit: int = DEFAULT_DIAGNOSTIC_SAMPLE_LIMIT,
     ) -> None:
         self._path = Path(source).resolve()
+        self._image_size = self._path.stat().st_size
         self._range_start = range_start
         self._range_end = range_end
         self._context = context
@@ -123,13 +128,9 @@ class NTFSStaleFileRecordRecoveryPipeline:
             self._mirror_excluded += 1
             return
         self._candidate_count += 1
-        if (
-            offset < self._range_start
-            or offset + record_size > self._range_end
-            or offset < context.boot.volume_offset
-            or offset + record_size > context.boot.volume_end
-        ):
-            self._reject("candidate_outside_safe_range")
+        reason = self._range_rejection(offset, record_size, context)
+        if reason is not None:
+            self._reject(reason)
             return
         try:
             raw = self._read_at(offset, record_size)
@@ -231,7 +232,24 @@ class NTFSStaleFileRecordRecoveryPipeline:
             records=records,
             diagnostic_sample_limit=self._sample_limit,
             diagnostics=tuple(diagnostics),
+            outside_current_volume_before_count=self._rejections["outside_current_ntfs_volume_before"],
+            outside_current_volume_after_count=self._rejections["outside_current_ntfs_volume_after"],
+            image_end_truncated_count=self._rejections["image_end_truncated"],
+            cli_range_truncated_count=self._rejections["cli_range_truncated"],
         )
+
+    def _range_rejection(self, offset, size, context):
+        if offset < self._range_start:
+            return "before_cli_range"
+        if offset + size > self._image_size:
+            return "image_end_truncated"
+        if offset + size > self._range_end:
+            return "cli_range_truncated"
+        if offset < context.boot.volume_offset:
+            return "outside_current_ntfs_volume_before"
+        if offset + size > context.boot.volume_end:
+            return "outside_current_ntfs_volume_after"
+        return None
 
     def close(self) -> None:
         if self._source is not None:

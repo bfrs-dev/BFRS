@@ -219,6 +219,7 @@ def test_cli_defaults_and_signature_set_are_explicit():
     assert set(patterns) == {
         "ntfs_file_record_anchor",
         "ntfs_indx_record_anchor",
+        "ntfs_boot_sector_oem_anchor",
         "berkeley_metadata_little_endian",
         "berkeley_metadata_big_endian",
         "bitcoin_key",

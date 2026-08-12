@@ -32,6 +32,15 @@ from bfrs.recovery.ntfs_directory_index import (
     NTFSDirectoryIndexArtifactRecovery,
     NTFSDirectoryIndexArtifactRecoveryPipeline,
 )
+from bfrs.recovery.ntfs_detached_volume import (
+    NTFS_BOOT_SECTOR_SIGNATURE,
+    NTFSDetachedVolumeDiscovery,
+    NTFSDetachedVolumeDiscoveryPipeline,
+)
+from bfrs.recovery.ntfs_detached_metadata import (
+    NTFSDetachedMetadataRecovery,
+    NTFSDetachedMetadataRecoveryPipeline,
+)
 from bfrs.recovery.ntfs_stale_file import (
     NTFS_FILE_RECORD_SIGNATURE,
     NTFSStaleFileRecordRecovery,
@@ -106,6 +115,8 @@ class FullImageRecoveryResult:
         NTFSDirectoryIndexArtifactRecovery | None
     ) = None
     ntfs_stale_indx_recovery: NTFSStaleINDXRecovery | None = None
+    ntfs_detached_volume_discovery: NTFSDetachedVolumeDiscovery | None = None
+    ntfs_detached_metadata_recovery: NTFSDetachedMetadataRecovery | None = None
 
 
 class _AcceptedContextRangeReader:
@@ -209,15 +220,26 @@ class FullImageRecoveryCoordinator:
             locator=ntfs_locator,
             current_index=ntfs_directory_index_artifact_recovery,
         )
+        detached_pipeline = NTFSDetachedVolumeDiscoveryPipeline(
+            source=reader.path,
+            current_context=ntfs_locator.stale_recovery_context,
+            locator=ntfs_locator,
+        )
         recovery_hits: list[RawHit] = []
+        detached_file_offsets: list[int] = []
+        detached_indx_offsets: list[int] = []
         raw_hit_counts: Counter[str] = Counter()
         try:
             for hit in self._scanner.scan(reader, start=start, end=range_end):
                 raw_hit_counts[hit.hit_type] += 1
                 if hit.hit_type == NTFS_FILE_RECORD_SIGNATURE:
+                    detached_file_offsets.append(hit.start_offset)
                     stale_pipeline.process_hit(hit)
                 elif hit.hit_type == NTFS_INDX_RECORD_SIGNATURE:
+                    detached_indx_offsets.append(hit.start_offset)
                     stale_indx_pipeline.process_hit(hit)
+                elif hit.hit_type == NTFS_BOOT_SECTOR_SIGNATURE:
+                    detached_pipeline.process_hit(hit)
                 else:
                     recovery_hits.append(hit)
         except BaseException:
@@ -226,6 +248,16 @@ class FullImageRecoveryCoordinator:
             raise
         ntfs_stale_file_record_recovery = stale_pipeline.finish()
         ntfs_stale_indx_recovery = stale_indx_pipeline.finish()
+        ntfs_detached_volume_discovery = detached_pipeline.finish()
+        ntfs_detached_metadata_recovery = NTFSDetachedMetadataRecoveryPipeline(
+            source=reader.path,
+            discovery=ntfs_detached_volume_discovery,
+            locator=ntfs_locator,
+            raw_file_offsets=detached_file_offsets,
+            raw_indx_offsets=detached_indx_offsets,
+            range_start=start,
+            range_end=range_end,
+        ).run()
         hits = tuple(recovery_hits)
         hotspots = self._range_hotspots(hits, start, range_end)
 
@@ -362,6 +394,8 @@ class FullImageRecoveryCoordinator:
                 ntfs_directory_index_artifact_recovery
             ),
             ntfs_stale_indx_recovery=ntfs_stale_indx_recovery,
+            ntfs_detached_volume_discovery=ntfs_detached_volume_discovery,
+            ntfs_detached_metadata_recovery=ntfs_detached_metadata_recovery,
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,
             reasons=reasons,

@@ -709,7 +709,7 @@ def test_stale_indx_range_safety_and_safe_json(tmp_path) -> None:
     pipeline.process_hit(indx_hit(stale_offset))
     result = pipeline.finish()
     assert result.structural_stale_indx_count == 0
-    assert dict(result.rejection_counts)["candidate_outside_safe_range"] == 1
+    assert dict(result.rejection_counts)["cli_range_truncated"] == 1
     payload = _ntfs_stale_indx_recovery(result)
     encoded = json.dumps(payload, sort_keys=True).lower()
     assert "raw_indx_bytes" not in encoded
@@ -1278,7 +1278,7 @@ def test_stale_record_read_respects_requested_range(tmp_path) -> None:
         range_end=offset + RECORD - 1,
     )
     assert result.structural_stale_record_count == 0
-    assert dict(result.rejection_counts) == {"candidate_outside_safe_range": 1}
+    assert dict(result.rejection_counts) == {"cli_range_truncated": 1}
 
 
 def test_coordinator_same_scan_pass_recovers_stale_wallet_without_status_change(

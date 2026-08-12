@@ -73,6 +73,10 @@ class NTFSStaleINDXRecovery:
     candidates: tuple[NTFSStaleINDXArtifactCandidate, ...]
     diagnostic_sample_limit: int
     diagnostics: tuple[str, ...]
+    outside_current_volume_before_count: int = 0
+    outside_current_volume_after_count: int = 0
+    image_end_truncated_count: int = 0
+    cli_range_truncated_count: int = 0
 
 
 class NTFSStaleINDXRecoveryPipeline:
@@ -172,7 +176,7 @@ class NTFSStaleINDXRecoveryPipeline:
             )
         )
         if not safe_sizes:
-            self._reject("candidate_outside_safe_range")
+            self._reject(self._range_rejection(offset, min(block_sizes), context))
             return
 
         valid: list[
@@ -269,7 +273,24 @@ class NTFSStaleINDXRecoveryPipeline:
             candidates=candidates,
             diagnostic_sample_limit=self._sample_limit,
             diagnostics=tuple(diagnostics),
+            outside_current_volume_before_count=self._rejections["outside_current_ntfs_volume_before"],
+            outside_current_volume_after_count=self._rejections["outside_current_ntfs_volume_after"],
+            image_end_truncated_count=self._rejections["image_end_truncated"],
+            cli_range_truncated_count=self._rejections["cli_range_truncated"],
         )
+
+    def _range_rejection(self, offset, size, context):
+        if offset < self._range_start:
+            return "before_cli_range"
+        if offset + size > self._image_size:
+            return "image_end_truncated"
+        if offset + size > self._range_end:
+            return "cli_range_truncated"
+        if offset < context.boot.volume_offset:
+            return "outside_current_ntfs_volume_before"
+        if offset + size > context.boot.volume_end:
+            return "outside_current_ntfs_volume_after"
+        return "candidate_outside_safe_range"
 
     def close(self) -> None:
         if self._source is not None:

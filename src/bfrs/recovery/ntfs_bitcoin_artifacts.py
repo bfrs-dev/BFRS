@@ -108,6 +108,10 @@ class _Boot:
     mft_mirror_lcn: int
     record_size: int
     volume_end: int
+    sectors_per_cluster: int = 0
+    total_sectors: int = 0
+    index_block_size: int = 0
+    volume_serial: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +119,7 @@ class _Data:
     resident: bool
     logical_size: int
     allocated_size: int
+    initialized_size: int
     extents: tuple[NTFSDataExtent, ...]
     state: str
 
@@ -251,6 +256,23 @@ class NTFSBitcoinArtifactLocator:
     @property
     def stale_recovery_context(self) -> NTFSStaleRecoveryContext | None:
         return self._stale_context
+
+    def validate_ntfs_boot_sector_at(
+        self,
+        source: str | Path,
+        offset: int,
+        *,
+        allow_truncated_volume: bool = False,
+    ) -> _Boot:
+        """Apply the shared strict NTFS boot parser at an exact image offset."""
+        image = _Image(Path(source).resolve())
+        return self._parse_boot(
+            image,
+            offset,
+            image.size,
+            allow_truncated_volume=allow_truncated_volume,
+            require_index_geometry=True,
+        )
 
     def index(self, source: str | Path) -> NTFSBitcoinArtifactIndex:
         self._stale_context = None
@@ -829,7 +851,14 @@ class NTFSBitcoinArtifactLocator:
         return None
 
     @staticmethod
-    def _parse_boot(image: _Image, offset: int, declared_end: int) -> _Boot:
+    def _parse_boot(
+        image: _Image,
+        offset: int,
+        declared_end: int,
+        *,
+        allow_truncated_volume: bool = False,
+        require_index_geometry: bool = False,
+    ) -> _Boot:
         sector = image.read_at(offset, 512)
         if sector[3:11] != b"NTFS    ":
             raise ValueError("oem_id_invalid")
@@ -850,14 +879,38 @@ class NTFSBitcoinArtifactLocator:
         record_size = encoded * cluster if encoded > 0 else 1 << -encoded if encoded < 0 else 0
         if record_size < 512 or record_size > 65536 or record_size % bps:
             raise ValueError("file_record_size_invalid")
+        encoded_index = int.from_bytes(sector[68:69], "little", signed=True)
+        index_size = (
+            encoded_index * cluster
+            if encoded_index > 0
+            else 1 << -encoded_index
+            if encoded_index < 0
+            else 0
+        )
+        if require_index_geometry and (
+            index_size < bps or index_size > 16 * 1024 * 1024 or index_size % bps
+        ):
+            raise ValueError("index_block_size_invalid")
         volume_end = offset + total_sectors * bps
         if (
-            volume_end > image.size
-            or volume_end > declared_end
+            (not allow_truncated_volume and volume_end > image.size)
+            or (not allow_truncated_volume and volume_end > declared_end)
             or volume_end <= offset
         ):
             raise ValueError("volume_outside_image")
-        return _Boot(offset, bps, cluster, mft_lcn, mirror_lcn, record_size, volume_end)
+        return _Boot(
+            volume_offset=offset,
+            bytes_per_sector=bps,
+            cluster_size=cluster,
+            mft_lcn=mft_lcn,
+            mft_mirror_lcn=mirror_lcn,
+            record_size=record_size,
+            volume_end=volume_end,
+            sectors_per_cluster=spc,
+            total_sectors=total_sectors,
+            index_block_size=index_size,
+            volume_serial=int.from_bytes(sector[72:80], "little"),
+        )
 
     def _validated_record_header(
         self,
@@ -945,6 +998,7 @@ class NTFSBitcoinArtifactLocator:
                     resident=False,
                     logical_size=self._u64(fixed, offset + 48),
                     allocated_size=self._u64(fixed, offset + 40),
+                    initialized_size=self._u64(fixed, offset + 56),
                     extents=(),
                     state=f"invalid:{error}",
                 )
@@ -1048,7 +1102,7 @@ class NTFSBitcoinArtifactLocator:
             value_offset = self._u16(fixed, offset + 20)
             if value_offset < 24 or value_offset + value_length > length:
                 raise NtfsMftRecordError("resident_data_bounds_invalid")
-            return _Data(True, value_length, value_length, (), unsupported or "resident_metadata_only")
+            return _Data(True, value_length, value_length, value_length, (), unsupported or "resident_metadata_only")
         if length < 64:
             raise NtfsMftRecordError("nonresident_header_truncated")
         lowest = self._u64(fixed, offset + 16)
@@ -1056,6 +1110,7 @@ class NTFSBitcoinArtifactLocator:
         pairs_offset = self._u16(fixed, offset + 32)
         allocated_size = self._u64(fixed, offset + 40)
         logical_size = self._u64(fixed, offset + 48)
+        initialized_size = self._u64(fixed, offset + 56)
         if pairs_offset < 64 or pairs_offset >= length:
             raise NtfsMftRecordError("mapping_pairs_offset_invalid")
         mapping_region = bytes(
@@ -1099,14 +1154,17 @@ class NTFSBitcoinArtifactLocator:
         state = unsupported or ("extent_outside_image" if outside else "nonresident_extent_map_only")
         if flags & ATTRIBUTE_SPARSE and not any(item.sparse for item in extents):
             state = "sparse_flag_without_sparse_run"
-        return _Data(False, logical_size, allocated_size, extents, state)
+        return _Data(False, logical_size, allocated_size, initialized_size, extents, state)
 
     @staticmethod
     def _unsupported_data(items: list[_Data], state: str) -> _Data | None:
         if not items:
             return None
         item = items[0]
-        return _Data(item.resident, item.logical_size, item.allocated_size, item.extents, state)
+        return _Data(
+            item.resident, item.logical_size, item.allocated_size,
+            item.initialized_size, item.extents, state
+        )
 
     def _classify(
         self,

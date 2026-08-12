@@ -19,6 +19,10 @@ from bfrs.recovery.ntfs_stale_indx import (
     NTFS_INDX_RECORD_PATTERN,
     NTFS_INDX_RECORD_SIGNATURE,
 )
+from bfrs.recovery.ntfs_detached_volume import (
+    NTFS_BOOT_SECTOR_PATTERN,
+    NTFS_BOOT_SECTOR_SIGNATURE,
+)
 from bfrs.reporting.json_report import write_json_report
 from bfrs.scanners.fast_scanner import Signature
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
@@ -35,6 +39,11 @@ DEFAULT_MINIMUM_DISTINCT_TYPES = 1
 
 
 BITCOIN_CORE_SIGNATURES_V1 = (
+    Signature(
+        NTFS_BOOT_SECTOR_SIGNATURE,
+        NTFS_BOOT_SECTOR_PATTERN,
+        "ntfs_boot_sector",
+    ),
     Signature(
         NTFS_FILE_RECORD_SIGNATURE,
         NTFS_FILE_RECORD_PATTERN,
