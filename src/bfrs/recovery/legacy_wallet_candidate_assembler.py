@@ -133,6 +133,25 @@ class LegacyWalletCandidate:
             "era_confidence": self.era_confidence,
             "encryption_state": self.encryption_state.value,
             "record_counts": dict(self.record_counts),
+            "physical_image_ranges": [list(item) for item in self.physical_ranges],
+            "relationships": [
+                {
+                    "relationship": relationship.relationship,
+                    "left": {
+                        "record_type": relationship.left.record_type,
+                        "provenance": self._provenance_dict(
+                            relationship.left.provenance
+                        ),
+                    },
+                    "right": {
+                        "record_type": relationship.right.record_type,
+                        "provenance": self._provenance_dict(
+                            relationship.right.provenance
+                        ),
+                    },
+                }
+                for relationship in self.matched_relationships
+            ],
             "crypto_summary": {
                 "crypto_valid_plain_keys": self.crypto_valid_plain_keys,
                 "unique_crypto_valid_plain_keys": self.unique_crypto_valid_plain_keys,
@@ -143,12 +162,11 @@ class LegacyWalletCandidate:
                 {
                     "state": result.state.value,
                     "recovery_classification": result.recovery_classification.value,
-                    "original_public_key": self._hex(result.original_public_key),
-                    "original_private_value_payload": self._hex(
-                        result.original_private_value_payload
+                    "public_key": self._hex(result.original_public_key),
+                    "public_key_fingerprint": self._fingerprint(
+                        result.original_public_key
                     ),
                     "serialization_layout": result.serialization_layout,
-                    "private_key_bytes": self._hex(result.private_key_bytes),
                     "checksum_present": result.checksum_present,
                     "checksum_valid": result.checksum_valid,
                     "public_key_compressed": result.public_key_compressed,
@@ -178,6 +196,10 @@ class LegacyWalletCandidate:
     @staticmethod
     def _hex(value: bytes | None) -> str | None:
         return None if value is None else value.hex()
+
+    @staticmethod
+    def _fingerprint(value: bytes | None) -> str | None:
+        return None if value is None else hashlib.sha256(value).hexdigest()[:16]
 
     @staticmethod
     def _provenance_dict(

@@ -24,6 +24,7 @@ from bfrs.recovery.ntfs_detached_volume import (
     NTFS_BOOT_SECTOR_SIGNATURE,
 )
 from bfrs.reporting.json_report import write_json_report
+from bfrs.reporting.json_report import serialize_full_image_result
 from bfrs.scanners.fast_scanner import Signature
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
 from bfrs.validators.candidate_policy import CandidatePolicy
@@ -195,6 +196,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"reconstructed results: {len(result.reconstructed_wallet_results)}")
     print(f"structural results: {result.structural_wallet_count}")
     print(f"fragment results: {result.fragment_wallet_count}")
+    legacy = serialize_full_image_result(result, _configuration(arguments))[
+        "legacy_wallet_recovery"
+    ]
+    summary = legacy["summary"]
+    print(f"legacy wallet candidates: {summary['wallet_candidates']}")
+    print(
+        "legacy priorities: "
+        f"CRITICAL={summary['critical_candidates']} "
+        f"HIGH={summary['high_candidates']} "
+        f"MEDIUM={summary['medium_candidates']} "
+        f"LOW={summary['low_candidates']}"
+    )
+    print(
+        "crypto-valid key occurrences: "
+        f"{summary['crypto_valid_key_occurrences']}"
+    )
+    print(
+        "unique crypto-valid private keys: "
+        f"{summary['unique_crypto_valid_private_keys']}"
+    )
     print(f"report path: {report_path}")
     return 0
 

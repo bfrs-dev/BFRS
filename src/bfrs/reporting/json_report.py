@@ -171,6 +171,65 @@ def _reconstructed_wallet(wallet) -> dict[str, Any]:
     }
 
 
+def _legacy_wallet_recovery(result: FullImageRecoveryResult) -> dict[str, Any]:
+    logical_results = result.logical_wallet_results
+    candidates = tuple(
+        candidate
+        for logical in logical_results
+        for candidate in logical.wallet_candidate_reports
+    )
+    candidates = tuple(sorted(candidates, key=lambda item: item["candidate_id"]))
+    priorities = {name: 0 for name in ("CRITICAL", "HIGH", "MEDIUM", "LOW")}
+    for candidate in candidates:
+        priority = candidate["priority"]
+        if priority in priorities:
+            priorities[priority] += 1
+    return {
+        "source": result.source,
+        "summary": {
+            "logical_records_examined": sum(
+                item.logical_records_examined for item in logical_results
+            ),
+            "wallet_records_valid": sum(
+                item.wallet_records_valid for item in logical_results
+            ),
+            "wallet_records_partial": sum(
+                item.wallet_records_partial for item in logical_results
+            ),
+            "wallet_records_rejected": sum(
+                item.wallet_records_rejected for item in logical_results
+            ),
+            "wallet_candidates": len(candidates),
+            "critical_candidates": priorities["CRITICAL"],
+            "high_candidates": priorities["HIGH"],
+            "medium_candidates": priorities["MEDIUM"],
+            "low_candidates": priorities["LOW"],
+            "crypto_valid_key_occurrences": sum(
+                item["crypto_summary"]["crypto_valid_plain_keys"]
+                for item in candidates
+            ),
+            "unique_crypto_valid_private_keys": sum(
+                item["crypto_summary"]["unique_crypto_valid_plain_keys"]
+                for item in candidates
+            ),
+            "crypto_duplicate_occurrences": sum(
+                item["crypto_summary"]["crypto_duplicate_occurrences"]
+                for item in candidates
+            ),
+            "encrypted_complete_candidates": sum(
+                item["encryption_state"] == "ENCRYPTED_COMPLETE_EVIDENCE"
+                for item in candidates
+            ),
+        },
+        "candidates": list(candidates),
+        "pipeline_failures": [
+            list(item)
+            for item in result.evidence.get("errors", ())
+            if len(item) >= 3 and item[2] == "logical_wallet_pipeline_error"
+        ],
+    }
+
+
 def _metadata_less_fragment(result) -> dict[str, Any]:
     return {
         "status": result.status.value,
@@ -909,6 +968,7 @@ def serialize_full_image_result(
             _reconstructed_wallet(item)
             for item in result.reconstructed_wallet_results
         ],
+        "legacy_wallet_recovery": _legacy_wallet_recovery(result),
         "metadata_less_fragment_summary": _metadata_less_fragment(
             result.metadata_less_fragment_recovery
         ),

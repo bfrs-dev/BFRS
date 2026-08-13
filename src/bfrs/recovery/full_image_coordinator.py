@@ -20,6 +20,14 @@ from bfrs.recovery.fragmented_berkeley_reassembler import (
     ReconstructedBerkeleyDatabase,
 )
 from bfrs.recovery.logical_berkeley_reader import PhysicalRangeReadError
+from bfrs.recovery.logical_berkeley_database_pipeline import (
+    LogicalBerkeleyDatabaseRecoveryPipeline,
+    LogicalBerkeleyDatabaseRecoveryResult,
+)
+from bfrs.recovery.logical_page_map import (
+    LogicalBerkeleyPageMap,
+    LogicalPageLocation,
+)
 from bfrs.recovery.metadata_less_fragments import (
     MetadataLessBerkeleyFragmentRecovery,
     MetadataLessBerkeleyFragmentRecoveryPipeline,
@@ -98,6 +106,7 @@ class FullImageRecoveryResult:
     reconstructed_wallet_results: tuple[
         ReconstructedBerkeleyWalletRecovery, ...
     ]
+    logical_wallet_results: tuple[LogicalBerkeleyDatabaseRecoveryResult, ...]
     metadata_less_fragment_recovery: MetadataLessBerkeleyFragmentRecovery
     orphan_record_key_diagnostic: OrphanBitcoinRecordKeyDiagnostic
     orphan_private_key_recovery: OrphanHistoricalECPrivateKeyRecovery
@@ -307,6 +316,52 @@ class FullImageRecoveryCoordinator:
             ).run()
             for database in databases
         )
+        logical_wallet_results: list[LogicalBerkeleyDatabaseRecoveryResult] = []
+        for database in databases:
+            identity = database.identity
+            locations = (
+                LogicalPageLocation(
+                    identity.metadata_page_number,
+                    identity.metadata_physical_offset,
+                    identity.page_size,
+                    identity.source,
+                ),
+                *(
+                    LogicalPageLocation(
+                        page.page_number,
+                        page.physical_offset,
+                        page.page_size,
+                        identity.source,
+                    )
+                    for page in database.selected_pages
+                ),
+            )
+            try:
+                page_map = LogicalBerkeleyPageMap(
+                    identity.source,
+                    identity.page_size,
+                    identity.byte_order,
+                    locations,
+                )
+                logical_wallet_results.append(
+                    LogicalBerkeleyDatabaseRecoveryPipeline(
+                        page_map,
+                        logical_file_id=(
+                            f"reconstructed-{identity.metadata_physical_offset:x}-"
+                            f"{identity.root_page_number}"
+                        ),
+                        range_reader=range_reader,
+                    ).run()
+                )
+            except (OSError, ValueError) as error:
+                errors.append(
+                    (
+                        identity.metadata_physical_offset,
+                        identity.metadata_physical_offset + identity.page_size,
+                        "logical_wallet_pipeline_error",
+                        type(error).__name__,
+                    )
+                )
         accepted_hits = tuple(
             hit
             for hit in hits
@@ -380,6 +435,7 @@ class FullImageRecoveryCoordinator:
             direct_results=ordered_direct,
             reconstructed_databases=databases,
             reconstructed_wallet_results=wallet_results,
+            logical_wallet_results=tuple(logical_wallet_results),
             metadata_less_fragment_recovery=metadata_less,
             orphan_record_key_diagnostic=orphan_record_keys,
             orphan_private_key_recovery=orphan_private_keys,

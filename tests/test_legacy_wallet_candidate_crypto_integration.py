@@ -146,3 +146,6 @@ def test_integrated_output_order_is_deterministic():
     assert forward_json == reverse_json
     assert "WIF" not in forward_json
     assert "address" not in forward_json
+    assert first.private_key_payload.hex() not in forward_json
+    assert "private_key_bytes" not in forward_json
+    assert "original_private_value_payload" not in forward_json

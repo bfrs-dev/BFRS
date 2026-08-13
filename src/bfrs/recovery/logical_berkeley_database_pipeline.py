@@ -16,6 +16,13 @@ from bfrs.recovery.logical_btree_membership import (
     LogicalBtreeMembershipResolver,
 )
 from bfrs.recovery.logical_page_map import LogicalBerkeleyPageMap
+from bfrs.recovery.legacy_wallet_candidate_assembler import (
+    LegacyBitcoinWalletCandidateAssemblerV1,
+)
+from bfrs.recovery.logical_wallet_record_decoder import (
+    LogicalBitcoinWalletRecordDecoderV1,
+    LogicalWalletRecordState,
+)
 from bfrs.validators.bitcoin_plain_key import HistoricalPlainKeyValidator
 from bfrs.validators.logical_encrypted_wallet_evidence import (
     LogicalBerkeleyRecordPageContext,
@@ -39,6 +46,11 @@ class LogicalBerkeleySubdatabaseRecovery:
     noncanonical_plaintext_key_count: int
     deleted_plaintext_key_count: int
     encrypted_wallet_evidence: LogicalEncryptedWalletEvidence
+    logical_records_examined: int
+    wallet_records_valid: int
+    wallet_records_partial: int
+    wallet_records_rejected: int
+    wallet_candidate_reports: tuple[dict[str, Any], ...]
     reasons: tuple[str, ...]
     evidence: dict[str, Any]
 
@@ -55,6 +67,11 @@ class LogicalBerkeleyDatabaseRecoveryResult:
     fragment_subdatabase_count: int
     rejected_subdatabase_count: int
     valid_plaintext_key_count: int
+    logical_records_examined: int
+    wallet_records_valid: int
+    wallet_records_partial: int
+    wallet_records_rejected: int
+    wallet_candidate_reports: tuple[dict[str, Any], ...]
     reasons: tuple[str, ...]
     evidence: dict[str, Any]
 
@@ -90,6 +107,8 @@ class LogicalBerkeleyDatabaseRecoveryPipeline:
         self._encrypted_correlator = (
             LogicalEncryptedWalletEvidenceCorrelator()
         )
+        self._wallet_decoder = LogicalBitcoinWalletRecordDecoderV1()
+        self._candidate_assembler = LegacyBitcoinWalletCandidateAssemblerV1()
 
     def run(self) -> LogicalBerkeleyDatabaseRecoveryResult:
         metadata_pages = self.page_reader.validate_metadata_pages()
@@ -159,6 +178,17 @@ class LogicalBerkeleyDatabaseRecoveryPipeline:
             rejected_subdatabase_count=rejected_count,
             valid_plaintext_key_count=sum(
                 item.valid_plaintext_key_count for item in subdatabases
+            ),
+            logical_records_examined=sum(
+                item.logical_records_examined for item in subdatabases
+            ),
+            wallet_records_valid=sum(item.wallet_records_valid for item in subdatabases),
+            wallet_records_partial=sum(item.wallet_records_partial for item in subdatabases),
+            wallet_records_rejected=sum(item.wallet_records_rejected for item in subdatabases),
+            wallet_candidate_reports=tuple(
+                report
+                for item in subdatabases
+                for report in item.wallet_candidate_reports
             ),
             reasons=reasons,
             evidence={
@@ -255,6 +285,12 @@ class LogicalBerkeleyDatabaseRecoveryPipeline:
             record_contexts,
             membership=membership,
         )
+        decoded_records = tuple(
+            record
+            for context in sorted(record_contexts, key=lambda item: item.page_number)
+            for record in self._wallet_decoder.decode_context(context)
+        )
+        candidates = self._candidate_assembler.assemble(decoded_records)
         status, reasons = self._subdatabase_status(
             membership,
             structural_plaintext_count=structural_plaintext_count,
@@ -283,6 +319,22 @@ class LogicalBerkeleyDatabaseRecoveryPipeline:
                 item.deleted for item in ordered_plaintext
             ),
             encrypted_wallet_evidence=encrypted,
+            logical_records_examined=len(decoded_records),
+            wallet_records_valid=sum(
+                record.state is LogicalWalletRecordState.VALID
+                for record in decoded_records
+            ),
+            wallet_records_partial=sum(
+                record.state is LogicalWalletRecordState.PARTIAL
+                for record in decoded_records
+            ),
+            wallet_records_rejected=sum(
+                record.state is LogicalWalletRecordState.REJECTED
+                for record in decoded_records
+            ),
+            wallet_candidate_reports=tuple(
+                candidate.to_report_dict() for candidate in candidates
+            ),
             reasons=reasons,
             evidence={
                 "plaintext_key_locations": tuple(

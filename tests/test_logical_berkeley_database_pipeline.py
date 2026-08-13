@@ -283,6 +283,9 @@ def test_fragmented_encrypted_wallet_is_structural() -> None:
             900: leaf(900, mkey_pair()),
         },
     )
+    candidate = result.wallet_candidate_reports[0]
+    assert candidate["priority"] == "HIGH"
+    assert candidate["encryption_state"] == "ENCRYPTED_COMPLETE_EVIDENCE"
 
     subdatabase = result.subdatabases[0]
     assert subdatabase.status is ValidationStatus.STRUCTURAL
@@ -373,6 +376,36 @@ def test_structural_plaintext_key_is_structural() -> None:
     assert subdatabase.structural_plaintext_key_count == 1
     assert subdatabase.status is ValidationStatus.STRUCTURAL
     assert result.status is ValidationStatus.STRUCTURAL
+    assert result.logical_records_examined == 1
+    assert result.wallet_records_valid == 1
+    candidate = result.wallet_candidate_reports[0]
+    assert candidate["priority"] == "CRITICAL"
+    assert candidate["crypto_summary"]["crypto_valid_plain_keys"] == 1
+    assert candidate["provenance"][0]["source"] == SOURCE.lower()
+
+
+def test_malformed_record_does_not_abort_valid_candidate() -> None:
+    mappings = {5: 500, 10: 1_000, 20: 2_000}
+    result = run(
+        mappings,
+        {
+            5: metadata(5, 10),
+            10: internal(10, 2, 20),
+            20: leaf(
+                20,
+                (
+                    *plain_pair(),
+                    string("version"),
+                    b"\x01",
+                ),
+            ),
+        },
+    )
+
+    assert result.logical_records_examined == 2
+    assert result.wallet_records_valid == 1
+    assert result.wallet_records_partial == 1
+    assert result.wallet_candidate_reports[0]["priority"] == "CRITICAL"
 
 
 def test_fragment_plaintext_key_stays_fragment() -> None:

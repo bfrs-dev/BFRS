@@ -161,6 +161,19 @@ def test_safe_json_schema_is_explicit_and_deterministic(tmp_path):
     assert payload["structural_result_count"] == 2
     assert payload["fragment_result_count"] == 1
     assert payload["status"] == "structural"
+    legacy = payload["legacy_wallet_recovery"]
+    assert legacy["source"] == str((tmp_path / "historical-wallet.img").resolve())
+    assert legacy["summary"]["wallet_candidates"] == 1
+    assert legacy["summary"]["critical_candidates"] == 1
+    assert legacy["summary"]["crypto_valid_key_occurrences"] == 1
+    candidate = legacy["candidates"][0]
+    assert candidate["priority"] == "CRITICAL"
+    assert candidate["physical_image_ranges"]
+    assert candidate["provenance"][0]["logical_page_number"] == 1
+    safe_candidate_json = json.dumps(candidate, sort_keys=True).lower()
+    assert private_der().hex() not in safe_candidate_json
+    assert "private_key_bytes" not in safe_candidate_json
+    assert "original_private_value_payload" not in safe_candidate_json
     metadata_less = payload["metadata_less_fragment_summary"]
     assert metadata_less["status"] == "fragment"
     assert metadata_less["valid_plaintext_key_count"] == 1
