@@ -12,6 +12,12 @@ from bfrs.recovery.legacy_wallet_era_estimator import (
     LegacyBitcoinWalletEraEstimatorV1,
     LegacyWalletEraEstimate,
 )
+from bfrs.recovery.legacy_plaintext_key_crypto_validator import (
+    LegacyPlaintextKeyCryptoSummary,
+    LegacyPlaintextKeyCryptographicValidatorV1,
+    PlaintextKeyCryptoState,
+    PlaintextKeyCryptoValidation,
+)
 from bfrs.recovery.logical_btree_membership import (
     LogicalBerkeleySubdatabaseIdentity,
 )
@@ -78,6 +84,121 @@ class LegacyWalletCandidate:
     era_estimate: LegacyWalletEraEstimate
     recovery_priority: RecoveryPriority
     fragmentary: bool
+    crypto_summary: LegacyPlaintextKeyCryptoSummary
+    crypto_validation_results: tuple[PlaintextKeyCryptoValidation, ...]
+    provenance: tuple[LogicalWalletRecordProvenance, ...]
+
+    @property
+    def priority(self) -> RecoveryPriority:
+        return self.recovery_priority
+
+    @property
+    def era(self) -> str:
+        return self.era_estimate.estimated_era.value
+
+    @property
+    def era_confidence(self) -> str:
+        return self.era_estimate.confidence.value
+
+    @property
+    def encryption_state(self) -> EncryptionEvidenceState:
+        return self.encryption_evidence
+
+    @property
+    def conflicts(self) -> tuple[CandidateConflict, ...]:
+        return self.conflicting_records
+
+    @property
+    def crypto_valid_plain_keys(self) -> int:
+        return self.crypto_summary.crypto_valid_plain_keys
+
+    @property
+    def unique_crypto_valid_plain_keys(self) -> int:
+        return self.crypto_summary.unique_crypto_valid_plain_keys
+
+    @property
+    def crypto_invalid_plain_records(self) -> int:
+        return self.crypto_summary.crypto_invalid_plain_records
+
+    @property
+    def crypto_duplicate_occurrences(self) -> int:
+        return self.crypto_summary.crypto_duplicate_occurrences
+
+    def to_report_dict(self) -> dict[str, Any]:
+        """Return a deterministic JSON-compatible V1 candidate report."""
+        return {
+            "candidate_id": self.candidate_id,
+            "priority": self.priority.value,
+            "era": self.era,
+            "era_confidence": self.era_confidence,
+            "encryption_state": self.encryption_state.value,
+            "record_counts": dict(self.record_counts),
+            "crypto_summary": {
+                "crypto_valid_plain_keys": self.crypto_valid_plain_keys,
+                "unique_crypto_valid_plain_keys": self.unique_crypto_valid_plain_keys,
+                "crypto_invalid_plain_records": self.crypto_invalid_plain_records,
+                "crypto_duplicate_occurrences": self.crypto_duplicate_occurrences,
+            },
+            "crypto_validation_results": [
+                {
+                    "state": result.state.value,
+                    "recovery_classification": result.recovery_classification.value,
+                    "original_public_key": self._hex(result.original_public_key),
+                    "original_private_value_payload": self._hex(
+                        result.original_private_value_payload
+                    ),
+                    "serialization_layout": result.serialization_layout,
+                    "private_key_bytes": self._hex(result.private_key_bytes),
+                    "checksum_present": result.checksum_present,
+                    "checksum_valid": result.checksum_valid,
+                    "public_key_compressed": result.public_key_compressed,
+                    "findings": list(result.findings),
+                    "provenance": self._provenance_dict(result.provenance),
+                }
+                for result in self.crypto_validation_results
+            ],
+            "conflicts": [
+                {
+                    "finding": conflict.finding,
+                    "records": [
+                        {
+                            "record_type": reference.record_type,
+                            "provenance": self._provenance_dict(reference.provenance),
+                        }
+                        for reference in conflict.records
+                    ],
+                }
+                for conflict in self.conflicts
+            ],
+            "provenance": [
+                self._provenance_dict(item) for item in self.provenance
+            ],
+        }
+
+    @staticmethod
+    def _hex(value: bytes | None) -> str | None:
+        return None if value is None else value.hex()
+
+    @staticmethod
+    def _provenance_dict(
+        provenance: LogicalWalletRecordProvenance,
+    ) -> dict[str, Any]:
+        identity, page_number = provenance.logical_page_identity
+        database = identity.database
+        return {
+            "source": provenance.source,
+            "logical_file_id": database.logical_file_id,
+            "metadata_page_number": identity.metadata_page_number,
+            "root_page_number": identity.root_page_number,
+            "logical_page_number": page_number,
+            "physical_key_range": list(provenance.physical_key_range),
+            "physical_value_range": list(provenance.physical_value_range),
+            "logical_key_range": list(provenance.logical_key_range),
+            "logical_value_range": list(provenance.logical_value_range),
+            "key_length": provenance.key_length,
+            "value_length": provenance.value_length,
+            "page_validation_status": provenance.page_validation_status.value,
+        }
 
 
 class LegacyBitcoinWalletCandidateAssemblerV1:
@@ -89,6 +210,7 @@ class LegacyBitcoinWalletCandidateAssemblerV1:
 
     def __init__(self) -> None:
         self._estimator = LegacyBitcoinWalletEraEstimatorV1()
+        self._crypto_validator = LegacyPlaintextKeyCryptographicValidatorV1()
 
     def assemble(
         self, records: Iterable[DecodedLogicalWalletRecord]
@@ -134,6 +256,10 @@ class LegacyBitcoinWalletCandidateAssemblerV1:
         )
         encryption = self._encryption_state(counts)
         era = self._estimator.estimate(ordered)
+        candidate_id = self._candidate_id(identity)
+        crypto = self._crypto_validator.validate_records(
+            candidate_id, identity, ordered
+        )
         private_payloads = sum(
             item.record_type == "key" and item.private_key_payload is not None
             for item in ordered
@@ -146,10 +272,10 @@ class LegacyBitcoinWalletCandidateAssemblerV1:
             }
         )
         priority = self._priority(
-            counts, private_payloads, encryption, fragmentary, conflicts
+            counts, private_payloads, encryption, fragmentary, conflicts, crypto
         )
         return LegacyWalletCandidate(
-            candidate_id=self._candidate_id(identity),
+            candidate_id=candidate_id,
             identity=identity,
             records=ordered,
             physical_ranges=self._physical_ranges(ordered),
@@ -175,6 +301,9 @@ class LegacyBitcoinWalletCandidateAssemblerV1:
             era_estimate=era,
             recovery_priority=priority,
             fragmentary=fragmentary,
+            crypto_summary=crypto,
+            crypto_validation_results=crypto.validations,
+            provenance=tuple(item.provenance for item in ordered),
         )
 
     def _correlate(
@@ -260,6 +389,19 @@ class LegacyBitcoinWalletCandidateAssemblerV1:
                 )
             )
 
+        plain_by_public_key: dict[bytes, list[DecodedLogicalWalletRecord]] = defaultdict(list)
+        for _, item in by_type["key"]:
+            if item.public_key is not None:
+                plain_by_public_key[item.public_key].append(item)
+        for _public_key, entries in plain_by_public_key.items():
+            if len({item.private_key_payload for item in entries}) > 1:
+                conflicts.append(
+                    CandidateConflict(
+                        "conflicting_plain_private_payloads_for_public_key",
+                        tuple(self._reference(item) for item in entries),
+                    )
+                )
+
         return (
             tuple(sorted(relationships, key=self._relationship_sort_key)),
             matched,
@@ -283,15 +425,22 @@ class LegacyBitcoinWalletCandidateAssemblerV1:
         encryption: EncryptionEvidenceState,
         fragmentary: bool,
         conflicts: tuple[CandidateConflict, ...],
+        crypto: LegacyPlaintextKeyCryptoSummary,
     ) -> RecoveryPriority:
-        if private_payloads and not fragmentary and not conflicts:
+        if crypto.crypto_valid_plain_keys and not conflicts:
             return RecoveryPriority.CRITICAL
         if encryption is EncryptionEvidenceState.ENCRYPTED_COMPLETE_EVIDENCE:
             return RecoveryPriority.MEDIUM if fragmentary or conflicts else RecoveryPriority.HIGH
-        if private_payloads:
-            return RecoveryPriority.HIGH if fragmentary else RecoveryPriority.MEDIUM
+        if counts["key"]:
+            explicitly_truncated = any(
+                result.state is PlaintextKeyCryptoState.TRUNCATED
+                for result in crypto.validations
+            )
+            if private_payloads and (fragmentary or explicitly_truncated) and not conflicts:
+                return RecoveryPriority.HIGH
+            return RecoveryPriority.MEDIUM
         if counts["ckey"] or counts["mkey"]:
-            return RecoveryPriority.MEDIUM if not fragmentary else RecoveryPriority.LOW
+            return RecoveryPriority.MEDIUM
         return RecoveryPriority.LOW
 
     @staticmethod

@@ -1,8 +1,10 @@
 """Cryptographically validate plaintext keys in assembled legacy candidates."""
 
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from bfrs.core.secp256k1 import (
     GROUP_ORDER,
@@ -10,7 +12,6 @@ from bfrs.core.secp256k1 import (
     encode_sec_public_key,
     scalar_multiply,
 )
-from bfrs.recovery.legacy_wallet_candidate_assembler import LegacyWalletCandidate
 from bfrs.recovery.logical_btree_membership import LogicalBerkeleySubdatabaseIdentity
 from bfrs.recovery.logical_wallet_record_decoder import (
     DecodedLogicalWalletRecord,
@@ -22,6 +23,9 @@ from bfrs.validators.bitcoin_plain_key import (
     historical_plain_key_checksum,
 )
 from bfrs.validators.bitcoin_record_type import decode_compact_size
+
+if TYPE_CHECKING:
+    from bfrs.recovery.legacy_wallet_candidate_assembler import LegacyWalletCandidate
 
 
 class PlaintextKeyCryptoState(Enum):
@@ -81,18 +85,44 @@ class LegacyPlaintextKeyCryptoSummary:
     def unique_crypto_valid_plain_keys(self) -> int:
         return self.unique_crypto_valid_private_keys
 
+    @property
+    def crypto_duplicate_occurrences(self) -> int:
+        return self.duplicate_occurrences
+
 
 class LegacyPlaintextKeyCryptographicValidatorV1:
     """Validate strict K1/K2 DER values already decoded as logical key records."""
 
     def validate_candidate(
-        self, candidate: LegacyWalletCandidate
+        self, candidate: "LegacyWalletCandidate"
     ) -> LegacyPlaintextKeyCryptoSummary:
+        # Keep the public runtime type check without creating an import cycle:
+        # the assembler itself uses this validator during candidate creation.
+        from bfrs.recovery.legacy_wallet_candidate_assembler import LegacyWalletCandidate
+
         if not isinstance(candidate, LegacyWalletCandidate):
             raise TypeError("candidate must be LegacyWalletCandidate")
+        return self.validate_records(
+            candidate.candidate_id, candidate.identity, candidate.records
+        )
+
+    def validate_records(
+        self,
+        candidate_id: str,
+        identity: LogicalBerkeleySubdatabaseIdentity,
+        records: Iterable[DecodedLogicalWalletRecord],
+    ) -> LegacyPlaintextKeyCryptoSummary:
+        """Validate already-decoded plaintext records without assembling again."""
+        if not candidate_id:
+            raise ValueError("candidate_id must not be empty")
+        if not isinstance(identity, LogicalBerkeleySubdatabaseIdentity):
+            raise TypeError("identity must be LogicalBerkeleySubdatabaseIdentity")
+        items = tuple(records)
+        if any(not isinstance(item, DecodedLogicalWalletRecord) for item in items):
+            raise TypeError("records must contain decoded logical wallet records")
         validations = tuple(
-            self.validate_record(candidate.candidate_id, candidate.identity, record)
-            for record in candidate.records
+            self.validate_record(candidate_id, identity, record)
+            for record in items
             if record.record_type == "key"
         )
         valid = tuple(
@@ -110,8 +140,8 @@ class LegacyPlaintextKeyCryptographicValidatorV1:
             if len(occurrences) > 1
         )
         return LegacyPlaintextKeyCryptoSummary(
-            candidate_id=candidate.candidate_id,
-            identity=candidate.identity,
+            candidate_id=candidate_id,
+            identity=identity,
             validations=validations,
             total_crypto_valid_records=len(valid),
             unique_crypto_valid_private_keys=len(by_key),

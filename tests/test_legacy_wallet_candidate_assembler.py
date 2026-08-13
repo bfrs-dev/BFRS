@@ -128,10 +128,10 @@ def test_fragmentary_candidate_lowers_priority():
     assert "complete_database_evidence_missing" in candidate.era_estimate.missing_evidence
 
 
-def test_critical_requires_private_key_and_strong_structure():
-    critical = assemble(decode([specs_key()]))[0]
+def test_structural_private_payload_without_crypto_confirmation_is_not_critical():
+    unconfirmed = assemble(decode([specs_key()]))[0]
     metadata = assemble(decode([specs_meta(), specs_default()]))[0]
-    assert critical.recovery_priority is RecoveryPriority.CRITICAL
+    assert unconfirmed.recovery_priority is not RecoveryPriority.CRITICAL
     assert metadata.recovery_priority is RecoveryPriority.LOW
 
 
