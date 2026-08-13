@@ -391,3 +391,17 @@ def _read_positive_integer(reader: _DerReader) -> int:
 
 def _hash256(data: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+
+
+def decode_historical_ec_private_key(der: bytes) -> tuple[bytes, bytes] | None:
+    """Return the scalar bytes and embedded SEC key for strict legacy DER."""
+    try:
+        parsed = _parse_ec_private_key(der)
+    except _DerError:
+        return None
+    return parsed.private_bytes, parsed.embedded_public_key
+
+
+def historical_plain_key_checksum(public_key: bytes, der: bytes) -> bytes:
+    """Calculate the documented K2 wallet checksum over public key and DER."""
+    return _hash256(public_key + der)
