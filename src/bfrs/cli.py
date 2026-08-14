@@ -1,4 +1,4 @@
-"""Command-line entry point for the Bitcoin Core / Berkeley recovery scan."""
+"""Command-line entry point for BFRS filesystem and wallet recovery."""
 
 import argparse
 from pathlib import Path
@@ -81,6 +81,18 @@ BITCOIN_CORE_SIGNATURES_V1 = (
     ),
 )
 
+ELECTRUM_ONLY_SIGNATURES_V1 = (
+    Signature(
+        NTFS_BOOT_SECTOR_SIGNATURE,
+        NTFS_BOOT_SECTOR_PATTERN,
+        "ntfs_boot_sector",
+    ),
+    *(
+        Signature(name, pattern, "electrum_raw_anchor")
+        for name, pattern in ELECTRUM_SIGNATURE_PATTERNS
+    ),
+)
+
 
 def _integer(value: str) -> int:
     try:
@@ -92,7 +104,7 @@ def _integer(value: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m bfrs.cli",
-        description="BFRS Bitcoin Core / Berkeley recovery scan",
+        description="BFRS filesystem and wallet recovery scan",
     )
     parser.add_argument("--input", required=True, type=Path, help="source image path")
     parser.add_argument("--output", required=True, type=Path, help="JSON report path")
@@ -100,6 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end", type=_integer, help="exclusive byte offset")
     parser.add_argument("--chunk-mib", type=_integer, default=DEFAULT_CHUNK_MIB)
     parser.add_argument("--overlap-kib", type=_integer, default=DEFAULT_OVERLAP_KIB)
+    parser.add_argument(
+        "--electrum-only",
+        action="store_true",
+        help="run only Electrum raw recovery and required NTFS correlation",
+    )
     parser.add_argument("--cluster-mib", type=_integer, default=DEFAULT_CLUSTER_MIB)
     parser.add_argument("--padding-mib", type=_integer, default=DEFAULT_PADDING_MIB)
     parser.add_argument(
@@ -135,6 +152,10 @@ def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
 
 
 def _configuration(arguments) -> dict[str, object]:
+    signatures = (
+        ELECTRUM_ONLY_SIGNATURES_V1
+        if arguments.electrum_only else BITCOIN_CORE_SIGNATURES_V1
+    )
     return {
         "chunk_mib": arguments.chunk_mib,
         "overlap_kib": arguments.overlap_kib,
@@ -142,7 +163,8 @@ def _configuration(arguments) -> dict[str, object]:
         "padding_mib": arguments.padding_mib,
         "minimum_hits": arguments.minimum_hits,
         "minimum_distinct_types": arguments.minimum_distinct_types,
-        "signature_set": [signature.name for signature in BITCOIN_CORE_SIGNATURES_V1],
+        "electrum_only": arguments.electrum_only,
+        "signature_set": [signature.name for signature in signatures],
     }
 
 
@@ -164,8 +186,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_hits=arguments.minimum_hits,
         min_distinct_types=arguments.minimum_distinct_types,
     )
+    signatures = (
+        ELECTRUM_ONLY_SIGNATURES_V1
+        if arguments.electrum_only else BITCOIN_CORE_SIGNATURES_V1
+    )
     coordinator = FullImageRecoveryCoordinator(
-        BITCOIN_CORE_SIGNATURES_V1,
+        signatures,
         policy,
         chunk_size=arguments.chunk_mib * 1024 * 1024,
         overlap=arguments.overlap_kib * 1024,
@@ -177,6 +203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.input,
             start=arguments.start,
             end=arguments.end,
+            electrum_only=arguments.electrum_only,
         )
     except OSError as error:
         print(f"input error: {error}", file=sys.stderr)
@@ -201,6 +228,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"reconstructed results: {len(result.reconstructed_wallet_results)}")
     print(f"structural results: {result.structural_wallet_count}")
     print(f"fragment results: {result.fragment_wallet_count}")
+    if arguments.electrum_only:
+        electrum = result.electrum_raw_recovery
+        print(f"electrum candidates: {electrum.candidates_total}")
+        print(f"electrum complete: {electrum.complete_candidates}")
+        print(f"electrum active duplicates: {electrum.known_active_duplicates}")
+        print(f"report path: {report_path}")
+        return 0
     legacy = serialize_full_image_result(result, _configuration(arguments))[
         "legacy_wallet_recovery"
     ]

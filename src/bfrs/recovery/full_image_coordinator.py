@@ -2,7 +2,7 @@
 
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -215,11 +215,18 @@ class FullImageRecoveryCoordinator:
         path: str | Path,
         start: int = 0,
         end: int | None = None,
+        *,
+        electrum_only: bool = False,
     ) -> FullImageRecoveryResult:
         reader = ChunkReader(path, chunk_size=self._chunk_size, overlap=self._overlap)
         range_end = reader.file_size if end is None else end
         ntfs_locator = NTFSBitcoinArtifactLocator()
         ntfs_bitcoin_artifact_index = ntfs_locator.index(reader.path)
+        if electrum_only:
+            return self._scan_electrum_only(
+                reader, start, range_end, ntfs_locator,
+                ntfs_bitcoin_artifact_index,
+            )
         ntfs_directory_index_artifact_recovery = (
             NTFSDirectoryIndexArtifactRecoveryPipeline(
                 context=ntfs_locator.stale_recovery_context,
@@ -534,6 +541,160 @@ class FullImageRecoveryCoordinator:
                 ),
             },
         )
+
+    def _scan_electrum_only(
+        self,
+        reader: ChunkReader,
+        start: int,
+        range_end: int,
+        ntfs_locator: NTFSBitcoinArtifactLocator,
+        ntfs_index: NTFSBitcoinArtifactIndex,
+    ) -> FullImageRecoveryResult:
+        """Run only raw Electrum validation and required NTFS correlation."""
+        detached_pipeline = NTFSDetachedVolumeDiscoveryPipeline(
+            source=reader.path,
+            current_context=ntfs_locator.stale_recovery_context,
+            locator=ntfs_locator,
+        )
+        electrum_hits: list[RawHit] = []
+        raw_hit_counts: Counter[str] = Counter()
+        for hit in self._scanner.scan(reader, start=start, end=range_end):
+            raw_hit_counts[hit.hit_type] += 1
+            if hit.hit_type == NTFS_BOOT_SECTOR_SIGNATURE:
+                detached_pipeline.process_hit(hit)
+            elif hit.hit_type in ELECTRUM_SIGNATURE_NAMES:
+                electrum_hits.append(hit)
+        discovery = detached_pipeline.finish()
+        detached_contexts = NTFSDetachedMetadataRecoveryPipeline(
+            source=reader.path,
+            discovery=discovery,
+            locator=ntfs_locator,
+            range_start=start,
+            range_end=range_end,
+        ).build_confirmed_volume_contexts()
+        contexts = tuple(
+            context for context in (
+                ntfs_locator.stale_recovery_context,
+                *detached_contexts.contexts,
+            ) if context is not None
+        )
+        electrum = ElectrumRawRecoveryPipeline(
+            source=reader.path,
+            known_artifacts=known_electrum_artifacts_from_contexts(contexts),
+        ).run_hits(electrum_hits, range_start=start, range_end=range_end)
+        if detached_contexts.failures:
+            electrum = replace(
+                electrum,
+                failures=tuple(dict.fromkeys((
+                    *electrum.failures,
+                    *detached_contexts.failures,
+                ))),
+            )
+        if electrum.complete_candidates:
+            status = ValidationStatus.STRUCTURAL
+            reasons: tuple[str, ...] = ()
+        elif electrum.fragment_candidates:
+            status = ValidationStatus.FRAGMENT
+            reasons = ("partial_electrum_wallet_evidence",)
+        else:
+            status = ValidationStatus.REJECTED
+            reasons = ("no_confirmed_electrum_wallet_evidence",)
+        source = str(reader.path.resolve())
+        empty = self._empty_bitcoin_results(source)
+        return FullImageRecoveryResult(
+            source=source,
+            start_offset=start,
+            end_offset=range_end,
+            status=status,
+            raw_hit_count=sum(raw_hit_counts.values()),
+            hotspot_count=0,
+            accepted_hotspot_count=0,
+            direct_results=(),
+            reconstructed_databases=(),
+            reconstructed_wallet_results=(),
+            logical_wallet_results=(),
+            metadata_less_fragment_recovery=empty[0],
+            orphan_record_key_diagnostic=empty[1],
+            orphan_private_key_recovery=empty[2],
+            orphan_private_key_fragment_recovery=empty[3],
+            structural_wallet_count=electrum.complete_candidates,
+            fragment_wallet_count=electrum.fragment_candidates,
+            reasons=reasons,
+            evidence={
+                "hotspot_ranges": (),
+                "hotspot_decisions": (),
+                "read_hotspot_ranges": (),
+                "direct_result_ranges": (),
+                "physical_metadata_candidates": (),
+                "physical_page_candidates": (),
+                "errors": (),
+                "raw_hit_counts_by_signature": tuple(
+                    sorted(raw_hit_counts.items())
+                ),
+            },
+            ntfs_bitcoin_artifact_index=ntfs_index,
+            ntfs_detached_volume_discovery=discovery,
+            electrum_raw_recovery=electrum,
+        )
+
+    @staticmethod
+    def _empty_bitcoin_results(source: str):
+        reason = ("disabled_in_electrum_only_mode",)
+        metadata_less = MetadataLessBerkeleyFragmentRecovery(
+            status=ValidationStatus.REJECTED,
+            source=source,
+            candidate_page_count=0,
+            structural_leaf_count=0,
+            fragment_leaf_count=0,
+            record_pair_count=0,
+            valid_plaintext_key_count=0,
+            valid_ckey_count=0,
+            valid_mkey_count=0,
+            recognized_wkey_count=0,
+            recognized_defaultkey_count=0,
+            recognized_keymeta_count=0,
+            page_locations=(),
+            record_locations=(),
+            reasons=reason,
+            evidence={},
+        )
+        record_keys = OrphanBitcoinRecordKeyDiagnostic(
+            source=source,
+            raw_strong_hit_count=0,
+            valid_record_key_count=0,
+            valid_key_count=0,
+            valid_wkey_count=0,
+            valid_ckey_keyside_count=0,
+            valid_mkey_keyside_count=0,
+            valid_defaultkey_count=0,
+            valid_keymeta_count=0,
+            canonical_framing_count=0,
+            noncanonical_framing_count=0,
+            locations=(),
+            evidence={},
+        )
+        private_keys = OrphanHistoricalECPrivateKeyRecovery(
+            source=source,
+            raw_der_anchor_count=0,
+            candidate_der_count=0,
+            valid_secp256k1_der_count=0,
+            canonical_der_count=0,
+            valid_with_embedded_pubkey_count=0,
+            valid_without_embedded_pubkey_count=0,
+            locations=(),
+            reasons=reason,
+            evidence={},
+        )
+        fragments = OrphanHistoricalECPrivateKeyFragmentRecovery(
+            source=source,
+            raw_inner_anchor_count=0,
+            candidate_inner_fragment_count=0,
+            valid_inner_fragment_count=0,
+            locations=(),
+            reasons=reason,
+            evidence={},
+        )
+        return metadata_less, record_keys, private_keys, fragments
 
     def _range_hotspots(
         self,

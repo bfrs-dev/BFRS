@@ -1052,6 +1052,7 @@ def serialize_full_image_result(
             "padding_mib",
             "minimum_hits",
             "minimum_distinct_types",
+            "electrum_only",
             "signature_set",
         )
         if name in configuration

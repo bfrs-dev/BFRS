@@ -1,9 +1,11 @@
+import base64
 import json
 
 import pytest
 
 from bfrs.cli import (
     BITCOIN_CORE_SIGNATURES_V1,
+    ELECTRUM_ONLY_SIGNATURES_V1,
     DEFAULT_CHUNK_MIB,
     DEFAULT_CLUSTER_MIB,
     DEFAULT_MINIMUM_DISTINCT_TYPES,
@@ -14,6 +16,7 @@ from bfrs.cli import (
     main,
 )
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
+import bfrs.recovery.full_image_coordinator as coordinator_module
 
 
 def basic_arguments(source, output) -> list[str]:
@@ -44,6 +47,27 @@ def structural_metadata() -> bytes:
     put(48, 0x20)
     put(88, 1)
     return bytes(result)
+
+
+def encrypted_electrum(magic=b"BIE1") -> bytes:
+    decoded = magic + b"\x02" + b"P" * 32 + b"C" * 32 + b"M" * 32
+    return base64.b64encode(decoded)
+
+
+def plaintext_electrum() -> tuple[bytes, str, str]:
+    seed = "synthetic resident seed must never enter report"
+    xprv = "synthetic-xprv-must-never-enter-report"
+    payload = {
+        "seed_version": 71,
+        "wallet_type": "standard",
+        "keystore": {
+            "type": "bip32",
+            "xpub": "synthetic-public-metadata",
+            "xprv": xprv,
+            "seed": seed,
+        },
+    }
+    return json.dumps(payload, separators=(",", ":")).encode(), seed, xprv
 
 
 def test_cli_dry_scan_writes_json_and_short_progress(tmp_path, capsys):
@@ -246,3 +270,109 @@ def test_cli_help_is_available(capsys):
     help_text = capsys.readouterr().out
     assert "python -m bfrs.cli" in help_text
     assert "--input" in help_text and "--output" in help_text
+    assert "--electrum-only" in help_text
+    assert "BFRS filesystem and wallet recovery scan" in help_text
+
+
+def test_electrum_only_runs_recovery_and_writes_safe_section(tmp_path):
+    source = tmp_path / "electrum.img"
+    source.write_bytes(encrypted_electrum())
+    report = tmp_path / "electrum.json"
+    assert main(basic_arguments(source, report) + ["--electrum-only"]) == 0
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    electrum = payload["electrum_raw_recovery"]
+    assert payload["configuration"]["electrum_only"] is True
+    assert electrum["candidates_total"] == 1
+    assert electrum["complete_candidates"] == 1
+    assert electrum["candidates"][0]["serialization_type"] == (
+        "ELECTRUM_ECIES_BASE64"
+    )
+    assert set(payload["configuration"]["signature_set"]) == {
+        item.name for item in ELECTRUM_ONLY_SIGNATURES_V1
+    }
+
+
+def test_electrum_only_does_not_run_berkeley_recovery(tmp_path, monkeypatch):
+    class Forbidden:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("Berkeley recovery ran in Electrum-only mode")
+
+    for name in (
+        "BerkeleyDatabaseRecoveryPipeline",
+        "FragmentedBerkeleyPageReassembler",
+        "LogicalBerkeleyDatabaseRecoveryPipeline",
+        "ReconstructedBerkeleyWalletPipeline",
+    ):
+        monkeypatch.setattr(coordinator_module, name, Forbidden)
+    source = tmp_path / "electrum.img"
+    source.write_bytes(encrypted_electrum())
+    assert main(basic_arguments(source, tmp_path / "report.json")
+                + ["--electrum-only"]) == 0
+
+
+def test_electrum_only_does_not_run_plaintext_or_orphan_key_recovery(
+    tmp_path, monkeypatch,
+):
+    class Forbidden:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("Bitcoin key recovery ran in Electrum-only mode")
+
+    for name in (
+        "MetadataLessBerkeleyFragmentRecoveryPipeline",
+        "OrphanBitcoinRecordKeyDiagnosticPipeline",
+        "OrphanHistoricalECPrivateKeyRecoveryPipeline",
+        "OrphanHistoricalECPrivateKeyFragmentRecoveryPipeline",
+        "NtfsHistoricalWalletRecoveryPipeline",
+    ):
+        monkeypatch.setattr(coordinator_module, name, Forbidden)
+    source = tmp_path / "electrum.img"
+    source.write_bytes(encrypted_electrum())
+    assert main(basic_arguments(source, tmp_path / "report.json")
+                + ["--electrum-only"]) == 0
+
+
+def test_electrum_only_honors_exact_start_and_end(tmp_path):
+    token = encrypted_electrum()
+    start = 73
+    source = tmp_path / "range.img"
+    source.write_bytes(b"X" * start + token + b"QklFMQ" + b"A" * 40)
+    report = tmp_path / "range.json"
+    arguments = basic_arguments(source, report) + [
+        "--electrum-only", "--start", str(start),
+        "--end", str(start + len(token)), "--chunk-mib", "1",
+        "--overlap-kib", "1",
+    ]
+    assert main(arguments) == 0
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["scan_range"] == {
+        "start_offset": start,
+        "end_offset": start + len(token),
+    }
+    assert payload["electrum_raw_recovery"]["candidates_total"] == 1
+
+
+def test_electrum_only_report_never_contains_wallet_secrets(tmp_path):
+    raw, seed, xprv = plaintext_electrum()
+    source = tmp_path / "plaintext-electrum.img"
+    source.write_bytes(raw)
+    report = tmp_path / "safe.json"
+    assert main(basic_arguments(source, report) + ["--electrum-only"]) == 0
+    encoded = report.read_text(encoding="utf-8")
+    payload = json.loads(encoded)
+    assert payload["electrum_raw_recovery"]["complete_candidates"] == 1
+    assert seed not in encoded
+    assert xprv not in encoded
+
+
+def test_standard_mode_keeps_bitcoin_signatures_and_behavior(tmp_path):
+    source = tmp_path / "metadata-only.img"
+    source.write_bytes(structural_metadata())
+    report = tmp_path / "standard.json"
+    assert main(["--input", str(source), "--output", str(report)]) == 0
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["configuration"]["electrum_only"] is False
+    assert "berkeley_metadata_little_endian" in payload["configuration"][
+        "signature_set"
+    ]
+    assert payload["raw_hit_count"] == 1
+    assert payload["accepted_hotspot_count"] == 1
