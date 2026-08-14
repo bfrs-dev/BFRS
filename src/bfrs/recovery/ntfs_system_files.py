@@ -51,6 +51,7 @@ class NtfsSystemFiles:
     usn_j: NtfsResolvedStream | None
     usn_max: NtfsResolvedStream | None
     failures: tuple[str, ...]
+    logfile: NtfsResolvedStream | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +97,19 @@ class NtfsSystemFileResolver:
         root = self._resolve_root()
         extend = self._resolve_child("$Extend", root, directory=True)
         logfile = self._resolve_child("$LogFile", root, directory=False)
+        logfile_stream = None
+        if logfile is not None:
+            try:
+                logfile_attrs, logfile_extensions = (
+                    self._attributes_with_extensions(logfile)
+                )
+                logfile_stream = self._stream(
+                    logfile, "", logfile_attrs, logfile_extensions
+                )
+                if logfile_stream is None:
+                    self.failures.append("logfile_data_stream_missing")
+            except (OSError, ValueError, NtfsMftRecordError) as exc:
+                self.failures.append(f"logfile_resolve_failure:{exc}")
         usn, resolved_attrs, resolved_extensions = self._resolve_usn(extend)
         j = maximum = None
         if usn is not None:
@@ -110,7 +124,9 @@ class NtfsSystemFileResolver:
                 self.failures.append(f"usn_resolve_failure:{exc}")
         else:
             self.failures.append("usn_journal_not_found")
-        return NtfsSystemFiles(0, logfile, usn, j, maximum, tuple(self.failures))
+        return NtfsSystemFiles(
+            0, logfile, usn, j, maximum, tuple(self.failures), logfile_stream
+        )
 
     def iter_physical(self, stream: NtfsResolvedStream):
         """Yield (logical offset, physical offset, bytes) for allocated runs only."""

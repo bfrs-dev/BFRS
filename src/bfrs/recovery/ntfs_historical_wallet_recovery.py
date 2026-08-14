@@ -9,6 +9,10 @@ from bfrs.recovery.ntfs_bitcoin_artifacts import NTFSStaleRecoveryContext
 from bfrs.recovery.ntfs_system_files import NtfsSystemFileResolver
 from bfrs.recovery.ntfs_wallet_history import HistoricalWalletArtifact, NtfsWalletHistoryAnalyzer
 from bfrs.recovery.usn_journal import UsnJournalReader
+from bfrs.recovery.ntfs_logfile import (
+    LogFileRecoverySummary,
+    NtfsLogFileAnalyzer,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +32,12 @@ class NtfsHistoricalVolumeResult:
     usn_j_stream_found: bool
     physical_bytes_examined: int
     valid_usn_records: int
+    logfile_found: bool
+    logfile_logical_size: int
+    logfile_physical_bytes_examined: int
+    logfile_restart_pages_valid: int
+    logfile_record_pages_valid: int
+    logfile_lfs_records_valid: int
     failures: tuple[str, ...]
 
 
@@ -50,6 +60,7 @@ class NtfsHistoricalWalletRecovery:
     unknown_reference_count: int
     failures: tuple[str, ...]
     volumes: tuple[NtfsHistoricalVolumeResult, ...]
+    logfile: LogFileRecoverySummary
 
 
 class NtfsHistoricalWalletRecoveryPipeline:
@@ -65,16 +76,18 @@ class NtfsHistoricalWalletRecoveryPipeline:
         if not unique:
             return NtfsHistoricalWalletRecovery(
                 True, 0, 0, 0, 0, 0, 0, 0, 0, 0, (), 0, 0, 0, 0,
-                ("ntfs_volume_not_available",), (),
+                ("ntfs_volume_not_available",), (), self._empty_logfile(),
             )
 
         all_artifacts: list[HistoricalWalletArtifact] = []
         volume_results: list[NtfsHistoricalVolumeResult] = []
+        logfile_results: list[LogFileRecoverySummary] = []
         failures: list[str] = []
         for context in unique:
-            artifacts, result = self._run_volume(context)
+            artifacts, result, logfile = self._run_volume(context)
             all_artifacts.extend(artifacts)
             volume_results.append(result)
+            logfile_results.append(logfile)
             failures.extend(
                 f"volume:{result.volume_start}:{item}" for item in result.failures
             )
@@ -98,7 +111,7 @@ class NtfsHistoricalWalletRecoveryPipeline:
             sum(item.valid_usn_records for item in volume_results), artifacts,
             counts["ACTIVE_CURRENT"], counts["HISTORICAL"], counts["DELETED"],
             counts["UNKNOWN_REFERENCE"], tuple(dict.fromkeys(failures)),
-            tuple(volume_results),
+            tuple(volume_results), self._aggregate_logfiles(logfile_results),
         )
 
     def _run_volume(self, context):
@@ -108,6 +121,7 @@ class NtfsHistoricalWalletRecoveryPipeline:
         journal_found = stream_found = False
         selected_usn = None
         extension_records: tuple[int, ...] = ()
+        resolver = system = None
         try:
             resolver = NtfsSystemFileResolver(context)
             system = resolver.resolve()
@@ -136,6 +150,20 @@ class NtfsHistoricalWalletRecoveryPipeline:
         except (ValueError, OSError) as exc:
             failures.append(f"wallet_history_analysis_failure:{type(exc).__name__}:{exc}")
             artifacts = ()
+        logfile = self._empty_logfile()
+        logfile_stream = None if system is None else getattr(system, "logfile", None)
+        if logfile_stream is not None and resolver is not None:
+            try:
+                logfile = NtfsLogFileAnalyzer().analyze(
+                    resolver.iter_stream_chunks(logfile_stream), context=context,
+                    logical_size=logfile_stream.logical_size,
+                    usn_artifacts=artifacts,
+                )
+                failures.extend(logfile.failures)
+                failures.extend(item for item in resolver.failures
+                                if item not in failures)
+            except (OSError, ValueError) as exc:
+                failures.append(f"logfile_volume_failure:{type(exc).__name__}:{exc}")
         boot = getattr(context, "boot", None)
         start = getattr(boot, "volume_offset", None)
         mft_lcn = getattr(boot, "mft_lcn", None)
@@ -149,9 +177,36 @@ class NtfsHistoricalWalletRecoveryPipeline:
             getattr(boot, "record_size", None),
             getattr(context, "provenance", "unknown"), selected_usn,
             extension_records, journal_found,
-            stream_found, byte_count, len(records), tuple(dict.fromkeys(failures)),
+            stream_found, byte_count, len(records), logfile.files_found > 0,
+            0 if logfile_stream is None else logfile_stream.logical_size,
+            logfile.physical_bytes_examined, logfile.restart_pages_valid,
+            logfile.record_pages_valid, logfile.lfs_records_valid,
+            tuple(dict.fromkeys(failures)),
         )
-        return tuple(artifacts), result
+        return tuple(artifacts), result, logfile
+
+    @staticmethod
+    def _empty_logfile() -> LogFileRecoverySummary:
+        return LogFileRecoverySummary(0, 0, 0, 0, 0, 0, 0, 0, 0, (), ())
+
+    @classmethod
+    def _aggregate_logfiles(cls, results):
+        if not results:
+            return cls._empty_logfile()
+        return LogFileRecoverySummary(
+            sum(item.files_found for item in results),
+            sum(item.physical_bytes_examined for item in results),
+            sum(item.restart_pages_valid for item in results),
+            sum(item.record_pages_valid for item in results),
+            sum(item.lfs_records_valid for item in results),
+            sum(item.malformed_pages for item in results),
+            sum(item.malformed_records for item in results),
+            sum(item.wallet_evidence_count for item in results),
+            sum(item.ignored_application_references for item in results),
+            tuple(evidence for item in results for evidence in item.evidences),
+            tuple(dict.fromkeys(failure for item in results
+                                for failure in item.failures)),
+        )
 
     @staticmethod
     def _deduplicate(contexts):

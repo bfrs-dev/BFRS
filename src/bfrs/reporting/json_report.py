@@ -927,7 +927,17 @@ def _ntfs_historical_wallet_recovery(result) -> dict[str, Any]:
                 "historical_count": 0, "deleted_count": 0,
                 "unknown_reference_count": 0,
                 "failures": ["ntfs_historical_wallet_recovery_not_available"],
-                "volumes": []}
+                "volumes": [],
+                "logfile": {"files_found": 0,
+                            "physical_bytes_examined": 0,
+                            "restart_pages_valid": 0,
+                            "record_pages_valid": 0,
+                            "lfs_records_valid": 0,
+                            "malformed_pages": 0,
+                            "malformed_records": 0,
+                            "wallet_evidence_count": 0,
+                            "ignored_application_references": 0,
+                            "evidences": [], "failures": []}}
     fields = ("enabled", "volumes_examined", "detached_volumes_examined",
               "primary_contexts", "detached_contexts", "total_unique_contexts",
               "usn_journals_found", "usn_j_streams_found",
@@ -944,6 +954,21 @@ def _ntfs_historical_wallet_recovery(result) -> dict[str, Any]:
                      "selected_usn_mft_record", "usn_j_extension_records",
                      "usn_journal_found", "usn_j_stream_found",
                      "physical_bytes_examined", "valid_usn_records")
+    volume_fields += ("logfile_found", "logfile_logical_size",
+                      "logfile_physical_bytes_examined",
+                      "logfile_restart_pages_valid",
+                      "logfile_record_pages_valid",
+                      "logfile_lfs_records_valid")
+    logfile = result.logfile
+    logfile_fields = ("files_found", "physical_bytes_examined",
+                      "restart_pages_valid", "record_pages_valid",
+                      "lfs_records_valid", "malformed_pages",
+                      "malformed_records", "wallet_evidence_count",
+                      "ignored_application_references")
+    evidence_fields = ("family", "name", "state", "confidence", "source",
+                       "volume_start", "logical_logfile_offset",
+                       "lsn_if_available", "transaction_id_if_available",
+                       "path_if_reconstructable", "event_count")
     return {
         **{name: getattr(result, name) for name in fields},
         "historical_wallet_artifacts": [
@@ -958,6 +983,17 @@ def _ntfs_historical_wallet_recovery(result) -> dict[str, Any]:
              "failures": list(item.failures)}
             for item in result.volumes
         ],
+        "logfile": {
+            **{name: getattr(logfile, name) for name in logfile_fields},
+            "evidences": [
+                {**{name: getattr(item, name) for name in evidence_fields},
+                 "reason_codes": list(item.reason_codes),
+                 "physical_provenance": list(item.physical_provenance),
+                 "correlated_sources": list(item.correlated_sources)}
+                for item in logfile.evidences
+            ],
+            "failures": list(logfile.failures),
+        },
     }
 
 
