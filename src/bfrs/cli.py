@@ -23,6 +23,7 @@ from bfrs.recovery.ntfs_detached_volume import (
     NTFS_BOOT_SECTOR_PATTERN,
     NTFS_BOOT_SECTOR_SIGNATURE,
 )
+from bfrs.recovery.electrum_raw_recovery import ELECTRUM_SIGNATURE_PATTERNS
 from bfrs.reporting.json_report import write_json_report
 from bfrs.reporting.json_report import serialize_full_image_result
 from bfrs.scanners.fast_scanner import Signature
@@ -73,6 +74,10 @@ BITCOIN_CORE_SIGNATURES_V1 = (
     *(
         Signature(name, pattern, "bitcoin_record")
         for name, pattern in FRAMED_BITCOIN_RECORD_PATTERNS
+    ),
+    *(
+        Signature(name, pattern, "electrum_raw_anchor")
+        for name, pattern in ELECTRUM_SIGNATURE_PATTERNS
     ),
 )
 

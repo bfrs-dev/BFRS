@@ -228,8 +228,15 @@ def test_cli_defaults_and_signature_set_are_explicit():
         "bitcoin_ckey",
         "bitcoin_mkey",
         "bitcoin_keymeta",
-        "historical_ec_private_key_der_anchor",
-    }
+            "historical_ec_private_key_der_anchor",
+            "electrum_bie1_base64_anchor",
+            "electrum_bie2_base64_anchor",
+            "electrum_bie1_raw_anchor",
+            "electrum_bie2_raw_anchor",
+            "electrum_seed_version_anchor",
+            "electrum_wallet_type_anchor",
+            "electrum_keystore_anchor",
+        }
 
 
 def test_cli_help_is_available(capsys):

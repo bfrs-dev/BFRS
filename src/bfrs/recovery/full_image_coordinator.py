@@ -79,6 +79,12 @@ from bfrs.recovery.reconstructed_wallet_pipeline import (
     ReconstructedBerkeleyWalletPipeline,
     ReconstructedBerkeleyWalletRecovery,
 )
+from bfrs.recovery.electrum_raw_recovery import (
+    ELECTRUM_SIGNATURE_NAMES,
+    ElectrumRawRecovery,
+    ElectrumRawRecoveryPipeline,
+    known_electrum_artifacts_from_contexts,
+)
 from bfrs.scanners.fast_scanner import FastScanner, Signature
 from bfrs.scanners.hotspot_builder import (
     DEFAULT_CLUSTER_GAP,
@@ -131,6 +137,7 @@ class FullImageRecoveryResult:
     ntfs_detached_volume_discovery: NTFSDetachedVolumeDiscovery | None = None
     ntfs_detached_metadata_recovery: NTFSDetachedMetadataRecovery | None = None
     ntfs_historical_wallet_recovery: NtfsHistoricalWalletRecovery | None = None
+    electrum_raw_recovery: ElectrumRawRecovery | None = None
 
 
 class _AcceptedContextRangeReader:
@@ -240,6 +247,7 @@ class FullImageRecoveryCoordinator:
             locator=ntfs_locator,
         )
         recovery_hits: list[RawHit] = []
+        electrum_hits: list[RawHit] = []
         detached_file_offsets: list[int] = []
         detached_indx_offsets: list[int] = []
         raw_hit_counts: Counter[str] = Counter()
@@ -254,6 +262,8 @@ class FullImageRecoveryCoordinator:
                     stale_indx_pipeline.process_hit(hit)
                 elif hit.hit_type == NTFS_BOOT_SECTOR_SIGNATURE:
                     detached_pipeline.process_hit(hit)
+                elif hit.hit_type in ELECTRUM_SIGNATURE_NAMES:
+                    electrum_hits.append(hit)
                 else:
                     recovery_hits.append(hit)
         except BaseException:
@@ -281,6 +291,12 @@ class FullImageRecoveryCoordinator:
         ntfs_historical_wallet_recovery = (
             NtfsHistoricalWalletRecoveryPipeline().run(historical_contexts)
         )
+        electrum_raw_recovery = ElectrumRawRecoveryPipeline(
+            source=reader.path,
+            known_artifacts=known_electrum_artifacts_from_contexts(
+                historical_contexts
+            ),
+        ).run_hits(electrum_hits, range_start=start, range_end=range_end)
         hits = tuple(recovery_hits)
         hotspots = self._range_hotspots(hits, start, range_end)
 
@@ -467,6 +483,7 @@ class FullImageRecoveryCoordinator:
             ntfs_detached_volume_discovery=ntfs_detached_volume_discovery,
             ntfs_detached_metadata_recovery=ntfs_detached_metadata_recovery,
             ntfs_historical_wallet_recovery=ntfs_historical_wallet_recovery,
+            electrum_raw_recovery=electrum_raw_recovery,
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,
             reasons=reasons,

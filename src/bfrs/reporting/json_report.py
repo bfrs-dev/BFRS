@@ -997,6 +997,45 @@ def _ntfs_historical_wallet_recovery(result) -> dict[str, Any]:
     }
 
 
+def _electrum_raw_recovery(result) -> dict[str, Any]:
+    if result is None:
+        return {
+            "enabled": True, "anchors_found": 0, "candidates_total": 0,
+            "complete_candidates": 0, "fragment_candidates": 0,
+            "encrypted_candidates": 0, "plaintext_candidates": 0,
+            "known_active_duplicates": 0, "new_unknown_candidates": 0,
+            "failures": ["electrum_raw_recovery_not_available"],
+            "candidates": [],
+        }
+    fields = (
+        "enabled", "anchors_found", "candidates_total",
+        "complete_candidates", "fragment_candidates", "encrypted_candidates",
+        "plaintext_candidates", "known_active_duplicates",
+        "new_unknown_candidates",
+    )
+    candidate_fields = (
+        "candidate_id", "family", "serialization_type", "completeness",
+        "encryption_state", "confidence", "source", "physical_start",
+        "physical_end", "allocation_state", "known_active_duplicate",
+        "state",
+    )
+    return {
+        **{name: getattr(result, name) for name in fields},
+        "failures": list(result.failures),
+        "candidates": [
+            {
+                **{name: getattr(item, name) for name in candidate_fields},
+                "reason_codes": list(item.reason_codes),
+                "correlated_sources": list(item.correlated_sources),
+                "safe_metadata": item.safe_metadata,
+                "provenance": list(item.provenance),
+                "anchor_types": list(item.anchor_types),
+            }
+            for item in result.candidates
+        ],
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -1092,6 +1131,9 @@ def serialize_full_image_result(
         ),
         "ntfs_historical_wallet_recovery": _ntfs_historical_wallet_recovery(
             result.ntfs_historical_wallet_recovery
+        ),
+        "electrum_raw_recovery": _electrum_raw_recovery(
+            result.electrum_raw_recovery
         ),
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())

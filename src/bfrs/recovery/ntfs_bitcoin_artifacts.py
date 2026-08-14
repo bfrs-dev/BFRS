@@ -122,6 +122,19 @@ class _Data:
     initialized_size: int
     extents: tuple[NTFSDataExtent, ...]
     state: str
+    attribute_id: int | None = None
+    resident_value_offset: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NTFSResidentDataValue:
+    """Validated unnamed resident DATA retained only for targeted readers."""
+
+    value: bytes
+    attribute_id: int
+    logical_size: int
+    resident_value_offset: int
+    physical_mft_record_offset: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +214,20 @@ class NTFSStaleRecoveryContext:
                 return extent.physical_start + logical - extent.logical_start
         return None
 
+    def read_resident_unnamed_data(self, number: int) -> NTFSResidentDataValue:
+        """Revalidate one MFT record and return its bounded resident DATA."""
+        raw = self.read_current_record(number)
+        physical = self.physical_offset_for_mft_record(number)
+        if raw is None or physical is None:
+            raise NtfsMftRecordError("resident_mft_record_unavailable")
+        return NTFSBitcoinArtifactLocator().resident_unnamed_data(
+            raw,
+            number=number,
+            boot=self.boot,
+            image_size=Path(self.source).stat().st_size,
+            physical_mft_record_offset=physical,
+        )
+
 
 class _Image:
     def __init__(self, path: Path) -> None:
@@ -266,6 +293,64 @@ class NTFSBitcoinArtifactLocator:
 
     def __init__(self) -> None:
         self._stale_context: NTFSStaleRecoveryContext | None = None
+
+    def resident_unnamed_data(
+        self,
+        raw: bytes,
+        *,
+        number: int,
+        boot: _Boot,
+        image_size: int,
+        physical_mft_record_offset: int,
+    ) -> NTFSResidentDataValue:
+        """Return one strictly bounded resident unnamed DATA value."""
+        record = self._parse_record(raw, number, boot, image_size)
+        if record.data is None:
+            raise NtfsMftRecordError("resident_unnamed_data_missing")
+        if not record.data.resident:
+            raise NtfsMftRecordError("resident_data_expected")
+        fixed, first, used, _, _ = self._validated_record_header(raw, boot)
+        matches: list[NTFSResidentDataValue] = []
+        offset = first
+        while offset <= used:
+            if offset + 4 > used:
+                raise NtfsMftRecordError("attribute_end_marker_missing")
+            type_code = self._u32(fixed, offset)
+            if type_code == ATTRIBUTE_END:
+                break
+            if offset + 24 > used:
+                raise NtfsMftRecordError("attribute_header_truncated")
+            length = self._u32(fixed, offset + 4)
+            nonresident = fixed[offset + 8]
+            name_length = fixed[offset + 9]
+            if (length < 24 or length % 8 or offset + length > used
+                    or nonresident not in (0, 1)):
+                raise NtfsMftRecordError("attribute_record_invalid")
+            if type_code == ATTRIBUTE_DATA and name_length == 0 and not nonresident:
+                value_length = self._u32(fixed, offset + 16)
+                value_offset = self._u16(fixed, offset + 20)
+                if (value_offset < 24 or value_offset > length
+                        or value_length > length - value_offset):
+                    raise NtfsMftRecordError("resident_data_bounds_invalid")
+                resident_offset = offset + value_offset
+                matches.append(NTFSResidentDataValue(
+                    value=bytes(fixed[resident_offset:resident_offset + value_length]),
+                    attribute_id=self._u16(fixed, offset + 14),
+                    logical_size=value_length,
+                    resident_value_offset=resident_offset,
+                    physical_mft_record_offset=physical_mft_record_offset,
+                ))
+            offset += length
+        if len(matches) != 1:
+            reason = ("resident_unnamed_data_missing" if not matches
+                      else "resident_multiple_unnamed_data")
+            raise NtfsMftRecordError(reason)
+        value = matches[0]
+        if (value.logical_size != record.data.logical_size
+                or value.attribute_id != record.data.attribute_id
+                or value.resident_value_offset != record.data.resident_value_offset):
+            raise NtfsMftRecordError("resident_data_metadata_mismatch")
+        return value
 
     @property
     def stale_recovery_context(self) -> NTFSStaleRecoveryContext | None:
@@ -801,6 +886,8 @@ class NTFSBitcoinArtifactLocator:
             data.allocated_size,
             data.extents,
             data.state,
+            data.attribute_id,
+            data.resident_value_offset,
         )
 
     @staticmethod
@@ -1118,7 +1205,12 @@ class NTFSBitcoinArtifactLocator:
             value_offset = self._u16(fixed, offset + 20)
             if value_offset < 24 or value_offset + value_length > length:
                 raise NtfsMftRecordError("resident_data_bounds_invalid")
-            return _Data(True, value_length, value_length, value_length, (), unsupported or "resident_metadata_only")
+            return _Data(
+                True, value_length, value_length, value_length, (),
+                unsupported or "resident_metadata_only",
+                attribute_id=self._u16(fixed, offset + 14),
+                resident_value_offset=offset + value_offset,
+            )
         if length < 64:
             raise NtfsMftRecordError("nonresident_header_truncated")
         lowest = self._u64(fixed, offset + 16)
