@@ -132,6 +132,8 @@ class _Record:
     directory: bool
     aliases: tuple[NTFSFileNameAlias, ...]
     data: _Data | None
+    base_record_number: int = 0
+    base_record_sequence: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +144,8 @@ class NTFSStaleRecoveryContext:
     mft_logical_size: int
     current_records: dict[tuple[int, int], _Record]
     current_records_by_number: dict[int, _Record]
+    provenance: str = "main"
+    initialization_failures: tuple[str, ...] = ()
 
     def current_mft_record_at(self, physical_offset: int) -> int | None:
         for extent in self.mft_extents:
@@ -186,6 +190,16 @@ class NTFSStaleRecoveryContext:
             return stream.read_at(logical_offset, self.boot.record_size)
         except (OSError, ValueError):
             return None
+
+    def physical_offset_for_mft_record(self, number: int) -> int | None:
+        if number < 0:
+            return None
+        logical = number * self.boot.record_size
+        for extent in self.mft_extents:
+            if (extent.logical_start <= logical and
+                    logical + self.boot.record_size <= extent.logical_end):
+                return extent.physical_start + logical - extent.logical_start
+        return None
 
 
 class _Image:
@@ -1065,6 +1079,8 @@ class NTFSBitcoinArtifactLocator:
             bool(flags & FILE_DIRECTORY),
             tuple(unique.values()),
             data,
+            self._u64(fixed, 32) & ((1 << 48) - 1),
+            self._u64(fixed, 32) >> 48,
         )
 
     def _filename(self, fixed: bytes, offset: int, length: int) -> NTFSFileNameAlias:

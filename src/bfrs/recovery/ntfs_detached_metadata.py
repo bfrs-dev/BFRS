@@ -111,6 +111,13 @@ class NTFSDetachedMetadataRecovery:
     logical_wallet_candidate_count: int
     stale_wallet_candidate_count: int
     diagnostics: tuple[str, ...]
+    volume_contexts: tuple[NTFSStaleRecoveryContext, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class NTFSDetachedContextBuild:
+    contexts: tuple[NTFSStaleRecoveryContext, ...]
+    failures: tuple[str, ...]
 
 
 class NTFSDetachedMetadataRecoveryPipeline:
@@ -135,6 +142,7 @@ class NTFSDetachedMetadataRecoveryPipeline:
         self._raw_indx_offsets = tuple(raw_indx_offsets)
         self._range_start = range_start
         self._range_end = self._image.size if range_end is None else range_end
+        self._volume_contexts: list[NTFSStaleRecoveryContext] = []
         if range_start < 0 or self._range_end < range_start or self._range_end > self._image.size:
             raise ValueError("invalid detached metadata recovery range")
 
@@ -165,7 +173,39 @@ class NTFSDetachedMetadataRecoveryPipeline:
                 item.source_layer.startswith("detached_stale_") for item in wallets
             ),
             diagnostics=(),
+            volume_contexts=tuple(self._volume_contexts),
         )
+
+    def build_confirmed_volume_contexts(self) -> NTFSDetachedContextBuild:
+        """Build only MFT contexts, avoiding unrelated recovery layers/scans."""
+        contexts: list[NTFSStaleRecoveryContext] = []
+        failures: list[str] = []
+        seen: set[tuple[int, ...]] = set()
+        for volume in self._discovery.volumes:
+            if (volume.classification != "detached" or
+                    volume.validation_strength != "detached_volume_structural"):
+                continue
+            identity = (volume.volume_start, volume.volume_end,
+                        volume.bytes_per_sector, volume.cluster_size,
+                        volume.mft_lcn, volume.mft_record_size)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            boot = self._boot(volume)
+            try:
+                context, _, _, _ = self._logical_mft(volume, boot)
+            except (OSError, ValueError, NtfsMftRecordError) as error:
+                reason = f"volume:{volume.volume_start}:context_build_failure:{error}"
+                failures.append(reason)
+                context = NTFSStaleRecoveryContext(
+                    source=str(self._path), boot=boot, mft_extents=(),
+                    mft_logical_size=0, current_records={},
+                    current_records_by_number={},
+                    provenance="detached_structural",
+                    initialization_failures=(reason,),
+                )
+            contexts.append(context)
+        return NTFSDetachedContextBuild(tuple(contexts), tuple(failures))
 
     def _recover_volume(
         self, volume: NTFSDetachedVolumeCandidate
@@ -189,6 +229,7 @@ class NTFSDetachedMetadataRecoveryPipeline:
             diagnostics.append(f"detached_logical_mft_unavailable:{error}")
 
         if context is not None:
+            self._volume_contexts.append(context)
             index = NTFSDirectoryIndexArtifactRecoveryPipeline(
                 context=context, locator=self._locator
             ).run()
@@ -247,6 +288,14 @@ class NTFSDetachedMetadataRecoveryPipeline:
             )
             rejections.update(dict(stale_indx_result.rejection_counts))
             candidates.extend(self._stale_indx_candidates(volume, stale_indx_result.candidates))
+
+        if context is None:
+            self._volume_contexts.append(NTFSStaleRecoveryContext(
+                source=str(self._path), boot=boot, mft_extents=(),
+                mft_logical_size=0, current_records={},
+                current_records_by_number={}, provenance="detached_structural",
+                initialization_failures=tuple(diagnostics),
+            ))
 
         ordered = tuple(sorted(candidates, key=self._candidate_key))
         return NTFSDetachedVolumeMetadataResult(
@@ -340,6 +389,7 @@ class NTFSDetachedMetadataRecoveryPipeline:
             mft_logical_size=mapping.file_size,
             current_records=records_by_identity,
             current_records_by_number=records_by_number,
+            provenance="detached_structural",
         )
         candidates: list[NTFSDetachedFileCandidate] = []
         for number, record in sorted(records_by_number.items()):

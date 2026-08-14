@@ -915,6 +915,52 @@ def _ntfs_detached_metadata_recovery(result) -> dict[str, Any]:
     }
 
 
+def _ntfs_historical_wallet_recovery(result) -> dict[str, Any]:
+    if result is None:
+        return {"enabled": True, "volumes_examined": 0,
+                "detached_volumes_examined": 0, "usn_journals_found": 0,
+                "primary_contexts": 0, "detached_contexts": 0,
+                "total_unique_contexts": 0,
+                "usn_j_streams_found": 0,
+                "usn_physical_bytes_examined": 0, "valid_usn_records": 0,
+                "historical_wallet_artifacts": [], "active_current_count": 0,
+                "historical_count": 0, "deleted_count": 0,
+                "unknown_reference_count": 0,
+                "failures": ["ntfs_historical_wallet_recovery_not_available"],
+                "volumes": []}
+    fields = ("enabled", "volumes_examined", "detached_volumes_examined",
+              "primary_contexts", "detached_contexts", "total_unique_contexts",
+              "usn_journals_found", "usn_j_streams_found",
+              "usn_physical_bytes_examined", "valid_usn_records",
+              "active_current_count", "historical_count", "deleted_count",
+              "unknown_reference_count")
+    artifact_fields = ("family", "name", "state", "source", "first_seen",
+                       "last_seen", "event_count", "file_reference",
+                       "parent_reference", "path_if_reconstructable", "confidence",
+                       "volume_start", "volume_end", "volume_provenance")
+    volume_fields = ("volume_start", "volume_end", "bytes_per_sector",
+                     "sectors_per_cluster", "cluster_size", "mft_lcn",
+                     "mft_physical_start", "mft_record_size", "provenance",
+                     "selected_usn_mft_record", "usn_j_extension_records",
+                     "usn_journal_found", "usn_j_stream_found",
+                     "physical_bytes_examined", "valid_usn_records")
+    return {
+        **{name: getattr(result, name) for name in fields},
+        "historical_wallet_artifacts": [
+            {**{name: getattr(item, name) for name in artifact_fields},
+             "reason_codes": list(item.reason_codes),
+             "provenance": list(item.provenance)}
+            for item in result.historical_wallet_artifacts
+        ],
+        "failures": list(result.failures),
+        "volumes": [
+            {**{name: getattr(item, name) for name in volume_fields},
+             "failures": list(item.failures)}
+            for item in result.volumes
+        ],
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -1007,6 +1053,9 @@ def serialize_full_image_result(
         ),
         "ntfs_detached_metadata_recovery": _ntfs_detached_metadata_recovery(
             result.ntfs_detached_metadata_recovery
+        ),
+        "ntfs_historical_wallet_recovery": _ntfs_historical_wallet_recovery(
+            result.ntfs_historical_wallet_recovery
         ),
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())

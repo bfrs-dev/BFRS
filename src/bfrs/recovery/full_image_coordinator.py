@@ -49,6 +49,10 @@ from bfrs.recovery.ntfs_detached_metadata import (
     NTFSDetachedMetadataRecovery,
     NTFSDetachedMetadataRecoveryPipeline,
 )
+from bfrs.recovery.ntfs_historical_wallet_recovery import (
+    NtfsHistoricalWalletRecovery,
+    NtfsHistoricalWalletRecoveryPipeline,
+)
 from bfrs.recovery.ntfs_stale_file import (
     NTFS_FILE_RECORD_SIGNATURE,
     NTFSStaleFileRecordRecovery,
@@ -126,6 +130,7 @@ class FullImageRecoveryResult:
     ntfs_stale_indx_recovery: NTFSStaleINDXRecovery | None = None
     ntfs_detached_volume_discovery: NTFSDetachedVolumeDiscovery | None = None
     ntfs_detached_metadata_recovery: NTFSDetachedMetadataRecovery | None = None
+    ntfs_historical_wallet_recovery: NtfsHistoricalWalletRecovery | None = None
 
 
 class _AcceptedContextRangeReader:
@@ -267,6 +272,15 @@ class FullImageRecoveryCoordinator:
             range_start=start,
             range_end=range_end,
         ).run()
+        historical_contexts = tuple(
+            context for context in (
+                ntfs_locator.stale_recovery_context,
+                *ntfs_detached_metadata_recovery.volume_contexts,
+            ) if context is not None
+        )
+        ntfs_historical_wallet_recovery = (
+            NtfsHistoricalWalletRecoveryPipeline().run(historical_contexts)
+        )
         hits = tuple(recovery_hits)
         hotspots = self._range_hotspots(hits, start, range_end)
 
@@ -452,6 +466,7 @@ class FullImageRecoveryCoordinator:
             ntfs_stale_indx_recovery=ntfs_stale_indx_recovery,
             ntfs_detached_volume_discovery=ntfs_detached_volume_discovery,
             ntfs_detached_metadata_recovery=ntfs_detached_metadata_recovery,
+            ntfs_historical_wallet_recovery=ntfs_historical_wallet_recovery,
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,
             reasons=reasons,
