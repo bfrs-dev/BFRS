@@ -373,12 +373,21 @@ class NTFSBitcoinArtifactLocator:
             require_index_geometry=True,
         )
 
-    def index(self, source: str | Path) -> NTFSBitcoinArtifactIndex:
+    def index(
+        self, source: str | Path, *, volume_offset: int | None = None,
+    ) -> NTFSBitcoinArtifactIndex:
         self._stale_context = None
         path = Path(source).resolve()
         image = _Image(path)
         diagnostics: list[str] = []
-        boot = self._discover(image, diagnostics)
+        if volume_offset is None:
+            boot = self._discover(image, diagnostics)
+        else:
+            try:
+                boot = self._parse_boot(image, volume_offset, image.size)
+            except (OSError, ValueError) as error:
+                diagnostics.append(f"ntfs_boot_rejected:{volume_offset}:{error}")
+                boot = None
         if boot is None:
             return self._empty(path, diagnostics or ["supported_ntfs_volume_not_found"])
 
@@ -941,6 +950,36 @@ class NTFSBitcoinArtifactLocator:
                     offsets.append(
                         (partition_offset, partition_offset + sectors * 512)
                     )
+            # A protective MBR delegates the real partition map to GPT.  Read
+            # only its bounded header and entry array; this is metadata lookup,
+            # not an image scan.
+            if any(sector[446 + index * 16 + 4] == 0xEE for index in range(4)):
+                try:
+                    header = image.read_at(512, 512)
+                    if header[:8] != b"EFI PART":
+                        raise ValueError("gpt_signature_invalid")
+                    header_size = int.from_bytes(header[12:16], "little")
+                    entries_lba = int.from_bytes(header[72:80], "little")
+                    entry_count = int.from_bytes(header[80:84], "little")
+                    entry_size = int.from_bytes(header[84:88], "little")
+                    if (header_size < 92 or header_size > 512
+                            or entry_count < 1 or entry_count > 4096
+                            or entry_size < 128 or entry_size > 4096
+                            or entry_size % 8):
+                        raise ValueError("gpt_geometry_invalid")
+                    entries_size = entry_count * entry_size
+                    entries_offset = entries_lba * 512
+                    entries = image.read_at(entries_offset, entries_size)
+                    for index in range(entry_count):
+                        entry = entries[index * entry_size:(index + 1) * entry_size]
+                        if not any(entry[:16]):
+                            continue
+                        first_lba = int.from_bytes(entry[32:40], "little")
+                        last_lba = int.from_bytes(entry[40:48], "little")
+                        if first_lba and first_lba <= last_lba:
+                            offsets.append((first_lba * 512, (last_lba + 1) * 512))
+                except (OSError, ValueError) as error:
+                    diagnostics.append(f"gpt_rejected:{error}")
         for offset, declared_end in dict.fromkeys(offsets):
             try:
                 boot = self._parse_boot(image, offset, declared_end)
