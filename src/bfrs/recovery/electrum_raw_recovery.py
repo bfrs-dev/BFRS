@@ -13,6 +13,10 @@ from typing import Any, Iterable
 
 from bfrs.core.models import RawHit
 from bfrs.recovery.ntfs_mft_data import NtfsMftRecordError
+from bfrs.recovery.electrum_legacy_recovery import (
+    ElectrumLegacyCandidateAssembler,
+    LEGACY_ELECTRUM_SIGNATURE_PATTERNS,
+)
 
 
 ELECTRUM_BIE1_BASE64_SIGNATURE = "electrum_bie1_base64_anchor"
@@ -31,6 +35,7 @@ ELECTRUM_SIGNATURE_PATTERNS = (
     (ELECTRUM_SEED_VERSION_SIGNATURE, b'"seed_version"'),
     (ELECTRUM_WALLET_TYPE_SIGNATURE, b'"wallet_type"'),
     (ELECTRUM_KEYSTORE_SIGNATURE, b'"keystore"'),
+    *LEGACY_ELECTRUM_SIGNATURE_PATTERNS,
 )
 ELECTRUM_SIGNATURE_NAMES = frozenset(name for name, _ in ELECTRUM_SIGNATURE_PATTERNS)
 
@@ -83,6 +88,8 @@ class ElectrumRawCandidate:
     provenance: tuple[dict[str, Any], ...]
     anchor_types: tuple[str, ...]
     state: str = "UNKNOWN_REFERENCE"
+    legacy_format: str | None = None
+    format_generation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +105,51 @@ class ElectrumRawRecovery:
     new_unknown_candidates: int
     failures: tuple[str, ...]
     candidates: tuple[ElectrumRawCandidate, ...]
+    legacy_anchor_hits: int = 0
+
+    @property
+    def legacy_anchors_found(self) -> int:
+        return self.legacy_anchor_hits
+
+    @property
+    def legacy_candidates_total(self) -> int:
+        return sum(item.legacy_format is not None for item in self.candidates)
+
+    @property
+    def legacy_complete_candidates(self) -> int:
+        return sum(item.legacy_format is not None and item.completeness == "COMPLETE"
+                   for item in self.candidates)
+
+    @property
+    def legacy_fragment_candidates(self) -> int:
+        return sum(item.legacy_format is not None and item.completeness != "COMPLETE"
+                   for item in self.candidates)
+
+    @property
+    def legacy_encrypted_candidates(self) -> int:
+        return sum(item.legacy_format is not None and
+                   item.encryption_state == "FIELD_LEVEL_ENCRYPTED"
+                   for item in self.candidates)
+
+    @property
+    def legacy_plaintext_candidates(self) -> int:
+        return sum(item.legacy_format is not None and
+                   item.encryption_state == "PLAINTEXT_STRUCTURE"
+                   for item in self.candidates)
+
+    @property
+    def legacy_known_duplicates(self) -> int:
+        return sum(item.legacy_format is not None and item.known_active_duplicate
+                   for item in self.candidates)
+
+    @property
+    def legacy_new_unknown_candidates(self) -> int:
+        return sum(item.legacy_format is not None and not item.known_active_duplicate
+                   for item in self.candidates)
+
+    @property
+    def legacy_failures(self) -> tuple[str, ...]:
+        return tuple(item for item in self.failures if "LEGACY" in item.upper())
 
 
 class ElectrumStructuralValidator:
@@ -252,6 +304,7 @@ class ElectrumStructuralValidator:
 class ElectrumCandidateAssembler:
     def __init__(self) -> None:
         self.validator = ElectrumStructuralValidator()
+        self.legacy = ElectrumLegacyCandidateAssembler()
 
     def analyze_bytes(self, data: bytes, *, source: str,
                       physical_start: int = 0,
@@ -260,6 +313,21 @@ class ElectrumCandidateAssembler:
                       provenance=()) -> tuple[ElectrumRawCandidate, ...]:
         candidates: dict[tuple[int, int, str], ElectrumRawCandidate] = {}
         anchors = tuple(anchor_types)
+        for item in self.legacy.analyze_bytes(
+                data, required_anchor_offset=required_anchor_offset):
+            candidate = ElectrumRawCandidate(
+                f"electrum-{item.digest}", "ELECTRUM",
+                f"ELECTRUM_LEGACY_{item.serialization_type}",
+                item.completeness, item.encryption_state, item.confidence,
+                item.reason_codes, source, physical_start + item.start,
+                physical_start + item.end, "UNKNOWN_ALLOCATION", (), False,
+                item.safe_metadata,
+                ({"source": source, "physical_start": physical_start + item.start,
+                  "physical_end": physical_start + item.end},),
+                anchors, "UNKNOWN_REFERENCE", item.legacy_format,
+                item.format_generation,
+            )
+            candidates[(item.start, item.end, item.legacy_format)] = candidate
         for start, end in self._base64_tokens(data):
             if required_anchor_offset is not None and not (
                     start <= required_anchor_offset < end):
@@ -398,6 +466,7 @@ class ElectrumRawRecoveryPipeline:
         end = self.path.stat().st_size if range_end is None else range_end
         found: dict[tuple[int, int, str], ElectrumRawCandidate] = {}
         failures = []
+        legacy_names = {name for name, _ in LEGACY_ELECTRUM_SIGNATURE_PATTERNS}
         with self.path.open("rb") as image:
             for hit in relevant:
                 window_start = max(range_start, hit.start_offset - MAX_BACKWARD_CONTEXT)
@@ -415,6 +484,8 @@ class ElectrumRawRecoveryPipeline:
                         anchor_types=(hit.hit_type,))
                 if not assembled:
                     failures.append(
+                        "ELECTRUM_LEGACY_STRUCTURE_INCONSISTENT"
+                        if hit.hit_type in legacy_names else
                         "ELECTRUM_FRAMING_INVALID"
                         if "bie" in hit.hit_type
                         else "ELECTRUM_STRUCTURE_INCONSISTENT"
@@ -423,7 +494,10 @@ class ElectrumRawRecoveryPipeline:
                     correlated = self._correlate(candidate)
                     found[(correlated.physical_start, correlated.physical_end,
                            correlated.serialization_type)] = correlated
-        return self._result(len(relevant), tuple(found.values()), failures)
+        return self._result(
+            len(relevant), tuple(found.values()), failures,
+            legacy_anchor_hits=sum(hit.hit_type in legacy_names for hit in relevant),
+        )
 
     def analyze_range(self, *, start: int, end: int,
                       allocation_state: str = "UNKNOWN_ALLOCATION",
@@ -578,7 +652,7 @@ class ElectrumRawRecoveryPipeline:
         return candidate
 
     @staticmethod
-    def _result(anchor_count, candidates, failures):
+    def _result(anchor_count, candidates, failures, *, legacy_anchor_hits=0):
         ordered = tuple(sorted(candidates, key=lambda item: (
             item.physical_start, item.physical_end, item.candidate_id)))
         return ElectrumRawRecovery(
@@ -589,7 +663,7 @@ class ElectrumRawRecoveryPipeline:
             sum(item.encryption_state == "PLAINTEXT_STRUCTURE" for item in ordered),
             sum(item.known_active_duplicate for item in ordered),
             sum(not item.known_active_duplicate for item in ordered),
-            tuple(dict.fromkeys(failures)), ordered,
+            tuple(dict.fromkeys(failures)), ordered, legacy_anchor_hits,
         )
 
 
@@ -614,6 +688,8 @@ def replace_candidate(candidate: ElectrumRawCandidate, *,
         candidate.provenance if provenance is None else provenance,
         candidate.anchor_types,
         candidate.state if state is None else state,
+        candidate.legacy_format,
+        candidate.format_generation,
     )
 
 

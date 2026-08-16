@@ -260,6 +260,11 @@ def test_cli_defaults_and_signature_set_are_explicit():
             "electrum_seed_version_anchor",
             "electrum_wallet_type_anchor",
             "electrum_keystore_anchor",
+            "electrum_legacy_seed_version_single_quote",
+            "electrum_legacy_master_public_key_single_quote",
+            "electrum_legacy_master_public_keys_single_quote",
+            "electrum_legacy_accounts_single_quote",
+            "electrum_legacy_use_encryption_single_quote",
         }
 
 

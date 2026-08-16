@@ -1022,6 +1022,15 @@ def _electrum_raw_recovery(result) -> dict[str, Any]:
     return {
         **{name: getattr(result, name) for name in fields},
         "failures": list(result.failures),
+        "legacy": {
+            **{name: getattr(result, name, 0) for name in (
+                "legacy_anchors_found", "legacy_candidates_total",
+                "legacy_complete_candidates", "legacy_fragment_candidates",
+                "legacy_encrypted_candidates", "legacy_plaintext_candidates",
+                "legacy_known_duplicates", "legacy_new_unknown_candidates",
+            )},
+            "legacy_failures": list(getattr(result, "legacy_failures", ())),
+        },
         "candidates": [
             {
                 **{name: getattr(item, name) for name in candidate_fields},
@@ -1030,6 +1039,9 @@ def _electrum_raw_recovery(result) -> dict[str, Any]:
                 "safe_metadata": item.safe_metadata,
                 "provenance": list(item.provenance),
                 "anchor_types": list(item.anchor_types),
+                **({"legacy_format": item.legacy_format,
+                    "format_generation": item.format_generation}
+                   if item.legacy_format is not None else {}),
             }
             for item in result.candidates
         ],
