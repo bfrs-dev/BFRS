@@ -1,11 +1,13 @@
 """Command-line entry point for BFRS filesystem and wallet recovery."""
 
 import argparse
+import json
 from pathlib import Path
 import sys
 from typing import Sequence
 
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
+from bfrs.recovery.mnemonic.mnemonic_recovery_pipeline import MnemonicRecoveryPipeline
 from bfrs.recovery.metadata_less_fragments import FRAMED_BITCOIN_RECORD_PATTERNS
 from bfrs.recovery.orphan_private_key_der import (
     HISTORICAL_EC_PRIVATE_KEY_DER_ANCHOR,
@@ -117,6 +119,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run only Electrum raw recovery and required NTFS correlation",
     )
+    parser.add_argument(
+        "--seed-scan-only", action="store_true",
+        help="run only BIP39/Electrum mnemonic raw and document recovery",
+    )
     parser.add_argument("--cluster-mib", type=_integer, default=DEFAULT_CLUSTER_MIB)
     parser.add_argument("--padding-mib", type=_integer, default=DEFAULT_PADDING_MIB)
     parser.add_argument(
@@ -132,6 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
+    if arguments.electrum_only and arguments.seed_scan_only:
+        parser.error("--electrum-only and --seed-scan-only are mutually exclusive")
     if arguments.start < 0:
         parser.error("--start must be nonnegative")
     if arguments.end is not None and arguments.end <= arguments.start:
@@ -164,6 +172,7 @@ def _configuration(arguments) -> dict[str, object]:
         "minimum_hits": arguments.minimum_hits,
         "minimum_distinct_types": arguments.minimum_distinct_types,
         "electrum_only": arguments.electrum_only,
+        "seed_scan_only": arguments.seed_scan_only,
         "signature_set": [signature.name for signature in signatures],
     }
 
@@ -181,6 +190,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--end must not exceed input size")
     if arguments.start > file_size:
         parser.error("--start must not exceed input size")
+
+    if arguments.seed_scan_only:
+        try:
+            result = MnemonicRecoveryPipeline(
+                chunk_size=arguments.chunk_mib * 1024 * 1024,
+                overlap=arguments.overlap_kib * 1024,
+            ).scan(arguments.input, start=arguments.start, end=arguments.end)
+        except (OSError, ValueError) as error:
+            print(f"input error: {error}", file=sys.stderr)
+            return 3
+        payload = {
+            "application": {"name": APP_NAME, "version": VERSION},
+            "source": result.source,
+            "range": {"start": result.start_offset, "end": result.end_offset},
+            "configuration": _configuration(arguments),
+            "mnemonic_recovery": result.recovery.safe_dict(),
+        }
+        try:
+            arguments.output.parent.mkdir(parents=True, exist_ok=True)
+            arguments.output.write_text(json.dumps(payload, indent=2, sort_keys=True),
+                                        encoding="utf-8")
+        except OSError as error:
+            print(f"report error: {error}", file=sys.stderr)
+            return 4
+        summary = result.recovery
+        print(f"source: {result.source}")
+        print(f"range: {result.start_offset}..{result.end_offset}")
+        print(f"mnemonic candidates: {summary.candidates_total}")
+        print(f"BIP39 valid: {summary.bip39_valid}")
+        print(f"Electrum valid: {summary.electrum_valid}")
+        print(f"duplicate occurrences: {summary.duplicate_occurrences}")
+        print(f"report path: {arguments.output.resolve()}")
+        return 0
 
     policy = CandidatePolicy(
         min_hits=arguments.minimum_hits,
