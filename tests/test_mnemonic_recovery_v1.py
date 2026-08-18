@@ -16,6 +16,10 @@ from bfrs.recovery.mnemonic.document_seed_recovery import DocumentSeedRecovery
 from bfrs.recovery.mnemonic.electrum_seed_validator import ElectrumSeedValidator
 from bfrs.recovery.mnemonic.mnemonic_recovery_pipeline import MnemonicRecoveryPipeline
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import RawMnemonicScanner
+from bfrs.recovery.mnemonic.seed_scan_checkpoint import (
+    CheckpointError,
+    SeedScanCheckpoint,
+)
 from bfrs.tools.export_recovered_mnemonics import main as export_main
 sys.path.insert(0, str(Path(__file__).parent))
 from test_ntfs_bitcoin_artifacts import data_resident, file_record, filename, image_with
@@ -64,6 +68,24 @@ def test_bip39_whitespace_newlines_and_ambiguous_language():
     common = list(validator.wordlists["chinese_simplified"] &
                   validator.wordlists["chinese_traditional"])
     assert validator.validate(" ".join(common[:12])).status == "BIP39_LANGUAGE_AMBIGUOUS"
+
+
+def test_bip39_validate_words_is_total_for_mojibake_and_wrong_language_hint():
+    validator = BIP39Validator()
+    words = tuple(["ç›Ş ŮŽ"] * 12)
+    result = validator.validate_words(words, languages=("english", "missing"))
+    assert result.status == "BIP39_WORD_INVALID"
+    assert result.checksum_valid is None
+
+
+def test_bip39_mixed_wordlists_have_no_common_language():
+    validator = BIP39Validator()
+    english = next(iter(validator.wordlists["english"] - validator.wordlists["czech"]))
+    czech = next(iter(validator.wordlists["czech"] - validator.wordlists["english"]))
+    words = tuple([english, czech] * 6)
+    assert validator.validate_words(words).status == "BIP39_WORD_INVALID"
+    hinted = validator.validate_words(words, languages=("english", "czech"))
+    assert hinted.status == "BIP39_WORD_INVALID"
 
 
 def electrum_phrase() -> str:
@@ -145,6 +167,28 @@ def test_raw_scanner_multiline_and_punctuation_delimiters(delimiter):
                for item in result.occurrences)
 
 
+@pytest.mark.parametrize("payload", [
+    "ç›Ş ŮŽ " * 12,
+    "c\u0327 عربى 目 " * 12,
+    "目 عربى " * 12,
+])
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
+def test_raw_scanner_rejects_malformed_multilingual_unicode(payload, encoding):
+    data = payload.encode(encoding, errors="surrogatepass")
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(data)
+    assert not result.occurrences
+
+
+@pytest.mark.parametrize("payload", [
+    b"\xff\xfe\xfa\x80abandon\xed\xa0\x80",
+    b"\x00\xd8a\x00\xff",
+    b"\xd8\x00\x00a\xff",
+])
+def test_raw_scanner_malformed_encoded_bytes_are_controlled(payload):
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    assert not result.occurrences
+
+
 def test_chunk_boundary_and_overlap_dedup(tmp_path):
     phrase = bip39_phrase("english")
     source = tmp_path / "image.bin"
@@ -213,6 +257,7 @@ def test_seed_cli_workers_one_and_four_have_identical_recovery(tmp_path):
 def test_seed_cli_keyboard_interrupt_is_clean(tmp_path, monkeypatch, capsys):
     source = tmp_path / "interrupt.bin"
     report = tmp_path / "must-not-exist.json"
+    checkpoint = tmp_path / "interrupted.checkpoint.json"
     source.write_bytes(b"synthetic")
 
     def interrupt(*args, **kwargs):
@@ -220,9 +265,158 @@ def test_seed_cli_keyboard_interrupt_is_clean(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr("bfrs.cli.MnemonicRecoveryPipeline.scan", interrupt)
     assert main(["--input", str(source), "--output", str(report),
-                 "--seed-scan-only", "--overlap-kib", "4"]) == 130
+                 "--seed-scan-only", "--overlap-kib", "4",
+                 "--checkpoint", str(checkpoint)]) == 130
     assert "scan interrupted by user" in capsys.readouterr().err
     assert not report.exists()
+    assert checkpoint.exists()
+    assert json.loads(checkpoint.read_text(encoding="utf-8"))["complete"] is False
+
+
+def _raw_semantic(result):
+    return ([(item.candidate.mnemonic_standard, item.candidate.fingerprint,
+              item.candidate.physical_start, item.candidate.physical_end,
+              item.candidate.validation_status)
+             for item in result.occurrences], result.anchors_found,
+            result.checksum_invalid, result.failures)
+
+
+def test_checkpoint_interrupt_resume_workers_one_to_four_matches_clean(tmp_path):
+    phrase = bip39_phrase("english").encode()
+    source = tmp_path / "resume-source.bin"
+    payload = bytearray(b"\x00" * 30_000)
+    for start in (2000, 8100, 16_384, 25_000):
+        payload[start - 1:start] = b":"
+        payload[start:start + len(phrase)] = phrase
+        payload[start + len(phrase):start + len(phrase) + 1] = b":"
+    source.write_bytes(payload)
+    checkpoint_path = tmp_path / "seed.checkpoint.json"
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+    checkpoint = SeedScanCheckpoint.create(
+        checkpoint_path, source, start=0, end=len(payload),
+        chunk_size=8192, overlap=4096)
+    completed_units = 0
+
+    def interrupt_near_thirty_percent(unit, result, completed, total):
+        nonlocal completed_units
+        checkpoint.record(unit, result, completed, total)
+        completed_units += 1
+        if completed_units == 2:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        scanner.scan_path(source, workers=1, unit_complete=interrupt_near_thirty_percent)
+    checkpoint.save(force=True)
+    resumed = SeedScanCheckpoint.resume(
+        checkpoint_path, source, start=0, end=len(payload),
+        chunk_size=8192, overlap=4096)
+    final = scanner.scan_path(source, workers=4,
+                              resume_results=resumed.completed_results,
+                              unit_complete=resumed.record)
+    clean = scanner.scan_path(source, workers=1)
+    assert _raw_semantic(final) == _raw_semantic(clean)
+
+
+def test_checkpoint_out_of_order_ranges_preserve_gap_and_resume_four_to_two(tmp_path):
+    phrase = bip39_phrase("english").encode()
+    source = tmp_path / "out-of-order.bin"
+    payload = bytearray(b"\x00" * 24_000)
+    payload[5000:5000 + len(phrase)] = phrase
+    source.write_bytes(payload)
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+    units = scanner._plan_work_units(source.resolve(), 0, len(payload))
+    checkpoint = SeedScanCheckpoint.create(
+        tmp_path / "ranges.json", source, start=0, end=len(payload),
+        chunk_size=8192, overlap=4096)
+    # Simulate out-of-order completion: first and third are saved, second is a gap.
+    for unit in (units[0], units[2]):
+        result = scanner._scan_local_unit(unit)
+        checkpoint.record(unit, result, 0, len(payload))
+    checkpoint.save(force=True)
+    restored = SeedScanCheckpoint.resume(
+        checkpoint.path, source, start=0, end=len(payload),
+        chunk_size=8192, overlap=4096)
+    scanned = []
+
+    def track(unit, result, completed, total):
+        scanned.append((unit[3], unit[4]))
+        restored.record(unit, result, completed, total)
+
+    final = scanner.scan_path(source, workers=2,
+                              resume_results=restored.completed_results,
+                              unit_complete=track)
+    assert (units[1][3], units[1][4]) in scanned
+    assert _raw_semantic(final) == _raw_semantic(
+        RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_path(source, workers=4))
+
+
+def test_checkpoint_rejects_wrong_source_size_and_corruption(tmp_path):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"a" * 10_000)
+    checkpoint = SeedScanCheckpoint.create(
+        tmp_path / "checkpoint.json", source, start=0, end=10_000,
+        chunk_size=8192, overlap=4096)
+    other = tmp_path / "other.bin"
+    other.write_bytes(b"b" * 10_000)
+    with pytest.raises(CheckpointError, match="source identity"):
+        SeedScanCheckpoint.resume(checkpoint.path, other, start=0, end=10_000,
+                                  chunk_size=8192, overlap=4096)
+    source.write_bytes(b"a" * 10_001)
+    with pytest.raises(CheckpointError, match="source identity"):
+        SeedScanCheckpoint.resume(checkpoint.path, source, start=0, end=10_001,
+                                  chunk_size=8192, overlap=4096)
+    checkpoint.path.write_text("{not-json", encoding="utf-8")
+    with pytest.raises(CheckpointError, match="corrupted"):
+        SeedScanCheckpoint.resume(checkpoint.path, source, start=0, end=10_001,
+                                  chunk_size=8192, overlap=4096)
+
+
+def test_checkpoint_json_is_atomic_and_contains_no_mnemonic_words(tmp_path):
+    phrase = bip39_phrase("english")
+    source = tmp_path / "opaque.bin"
+    source.write_bytes((":" + phrase + ":").encode())
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+    checkpoint = SeedScanCheckpoint.create(
+        tmp_path / "safe.json", source, start=0, end=source.stat().st_size,
+        chunk_size=8192, overlap=4096)
+    scanner.scan_path(source, workers=1, unit_complete=checkpoint.record)
+    checkpoint.mark_complete()
+    serialized = checkpoint.path.read_text(encoding="utf-8")
+    assert phrase not in serialized
+    for word in phrase.split():
+        assert re.search(rf"(?<![\w]){re.escape(word)}(?![\w])", serialized) is None
+    assert not list(tmp_path.glob("safe.json.tmp-*"))
+
+
+def test_cli_resume_progress_starts_from_completed_canonical_bytes(tmp_path, capsys):
+    phrase = bip39_phrase("english").encode()
+    source = tmp_path / "cli-resume.bin"
+    payload = bytearray(b"\x00" * (2 * 1024 * 1024 + 20_000))
+    payload[1_500_000:1_500_000 + len(phrase)] = phrase
+    source.write_bytes(payload)
+    checkpoint = SeedScanCheckpoint.create(
+        tmp_path / "cli-resume.json", source, start=0, end=len(payload),
+        chunk_size=1024 * 1024, overlap=4096)
+    scanner = RawMnemonicScanner(chunk_size=1024 * 1024, overlap=4096)
+    first = scanner._plan_work_units(source.resolve(), 0, len(payload))[0]
+    checkpoint.record(first, scanner._scan_local_unit(first),
+                      first[4] - first[3], len(payload))
+    checkpoint.save(force=True)
+    report = tmp_path / "resumed-report.json"
+    assert main(["--input", str(source), "--output", str(report),
+                 "--seed-scan-only", "--chunk-mib", "1", "--overlap-kib", "4",
+                 "--workers", "4", "--resume-checkpoint", str(checkpoint.path)]) == 0
+    assert "Seed scan RESUMED" in capsys.readouterr().err
+    assert json.loads(report.read_text(encoding="utf-8"))["mnemonic_recovery"][
+        "bip39_valid"] == 1
+
+
+def test_parallel_malformed_unicode_does_not_fail_worker(tmp_path):
+    source = tmp_path / "malformed-workers.bin"
+    source.write_bytes(("ç›Ş ŮŽ عربى 目 " * 2000).encode() + b"\xff\xed\xa0\x80")
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_path(
+        source, workers=4)
+    assert not result.occurrences
 
 
 def test_docx_extraction_and_pdf_isolated_failure(tmp_path):

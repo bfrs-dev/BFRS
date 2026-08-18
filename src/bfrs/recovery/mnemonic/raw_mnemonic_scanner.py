@@ -14,8 +14,6 @@ import signal
 import unicodedata
 from typing import Callable
 
-from bfrs.core.chunk_reader import ChunkReader
-
 from .bip39_validator import BIP39Validator, WORD_COUNTS
 from .electrum_seed_validator import ElectrumSeedValidator
 from .mnemonic_normalizer import electrum_normalize
@@ -81,6 +79,10 @@ def _scan_work_unit(unit: tuple[str, int, int, int, int]) -> RawMnemonicScanResu
         ownership_start=ownership_start, ownership_end=ownership_end)
 
 
+UnitComplete = Callable[[tuple[str, int, int, int, int], RawMnemonicScanResult,
+                         int, int], None]
+
+
 class RawMnemonicScanner:
     """Scan overlapping chunks; retained state is bounded by one chunk and overlap."""
 
@@ -117,35 +119,44 @@ class RawMnemonicScanner:
     def scan_path(self, source: str | Path, *, start: int = 0,
                   end: int | None = None,
                   progress: Callable[[int, int], None] | None = None,
-                  workers: int = 1) -> RawMnemonicScanResult:
-        reader = ChunkReader(source, self.chunk_size, self.overlap)
-        range_end = reader.file_size if end is None else end
+                  workers: int = 1,
+                  resume_results: dict[tuple[int, int], RawMnemonicScanResult] | None = None,
+                  unit_complete: UnitComplete | None = None) -> RawMnemonicScanResult:
+        path = Path(source).resolve()
+        range_end = path.stat().st_size if end is None else end
         worker_count = resolve_worker_count(workers)
+        units = self._plan_work_units(path, start, range_end)
+        planned = {(unit[3], unit[4]): unit for unit in units}
+        resumed = resume_results or {}
+        unexpected = set(resumed) - set(planned)
+        if unexpected:
+            raise ValueError("checkpoint contains incompatible ownership ranges")
+        results = [(end_offset - start_offset, result)
+                   for (start_offset, end_offset), result in resumed.items()]
+        completed = sum(size for size, _ in results)
+        total = range_end - start
+        pending = [unit for unit in units if (unit[3], unit[4]) not in resumed]
+        if progress is not None and completed:
+            progress(completed, total)
         if worker_count == 1:
-            results = []
-            completed = 0
-            step = self.chunk_size - self.overlap
-            for chunk in reader.iter_chunks(start, range_end):
-                ownership_end = (range_end if chunk.end_offset >= range_end else
-                                 min(chunk.offset + step, range_end))
-                results.append((ownership_end - chunk.offset, self.scan_bytes(
-                    chunk.data, source=str(Path(source).resolve()),
-                    base_offset=chunk.offset, ownership_start=chunk.offset,
-                    ownership_end=ownership_end)))
-                completed += ownership_end - chunk.offset
+            for unit in pending:
+                result = self._scan_local_unit(unit)
+                owned = unit[4] - unit[3]
+                results.append((owned, result))
+                completed += owned
+                if unit_complete is not None:
+                    unit_complete(unit, result, completed, total)
                 if progress is not None:
-                    progress(completed, range_end - start)
+                    progress(completed, total)
         else:
-            results = self._scan_path_parallel(
-                source, start, range_end, worker_count, progress)
+            results.extend(self._scan_path_parallel(
+                pending, worker_count, progress, unit_complete, completed, total))
         return self._merge_results(results)
 
-    def _scan_path_parallel(self, source: str | Path, start: int, range_end: int,
-                            workers: int,
-                            progress: Callable[[int, int], None] | None
-                            ) -> list[tuple[int, RawMnemonicScanResult]]:
+    def _plan_work_units(self, source: Path, start: int, range_end: int
+                         ) -> list[tuple[str, int, int, int, int]]:
         step = min(self.chunk_size - self.overlap, _MAX_PARALLEL_OWNERSHIP)
-        path = str(Path(source).resolve())
+        path = str(source)
         units = []
         ownership_start = start
         while ownership_start < range_end:
@@ -156,8 +167,25 @@ class RawMnemonicScanner:
             units.append((path, ownership_start, scan_end,
                           ownership_start, ownership_end))
             ownership_start = ownership_end
-        completed = 0
+        return units
+
+    def _scan_local_unit(self, unit: tuple[str, int, int, int, int]
+                         ) -> RawMnemonicScanResult:
+        path, scan_start, scan_end, ownership_start, ownership_end = unit
+        with Path(path).open("rb") as source:
+            source.seek(scan_start)
+            data = source.read(scan_end - scan_start)
+        return self.scan_bytes(data, source=path, base_offset=scan_start,
+                               ownership_start=ownership_start,
+                               ownership_end=ownership_end)
+
+    def _scan_path_parallel(self, units: list[tuple[str, int, int, int, int]],
+                            workers: int, progress: Callable[[int, int], None] | None,
+                            unit_complete: UnitComplete | None, completed: int, total: int
+                            ) -> list[tuple[int, RawMnemonicScanResult]]:
         results: list[tuple[int, RawMnemonicScanResult]] = []
+        if not units:
+            return results
         executor = ProcessPoolExecutor(
             max_workers=workers, initializer=_initialize_worker,
             initargs=(self.chunk_size, self.overlap))
@@ -168,9 +196,12 @@ class RawMnemonicScanner:
                 unit = futures[future]
                 owned = unit[4] - unit[3]
                 results.append((owned, future.result()))
+                result = results[-1][1]
                 completed += owned
+                if unit_complete is not None:
+                    unit_complete(unit, result, completed, total)
                 if progress is not None:
-                    progress(completed, range_end - start)
+                    progress(completed, total)
         except BaseException:
             for future in futures:
                 future.cancel()
@@ -225,12 +256,8 @@ class RawMnemonicScanner:
                         bip_mask = electrum_mask = 0
                     else:
                         word, electrum_word = self._normalize_token(original)
-                        bip_mask, electrum_mask = self._membership.get(word, (0, 0))
-                        if electrum_word != word:
-                            other_bip, other_electrum = self._membership.get(
-                                electrum_word, (0, 0))
-                            bip_mask |= other_bip
-                            electrum_mask |= other_electrum
+                        bip_mask = self._membership.get(word, (0, 0))[0]
+                        electrum_mask = self._membership.get(electrum_word, (0, 0))[1]
                     known = bool(bip_mask or electrum_mask)
                     separator = "" if previous_end is None else text[previous_end:match.start()]
                     separator_invalid = (len(separator) > 32 or "\x00" in separator or

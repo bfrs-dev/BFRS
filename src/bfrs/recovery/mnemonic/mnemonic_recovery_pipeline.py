@@ -8,7 +8,12 @@ from typing import Callable
 
 from .document_seed_recovery import DOCUMENT_EXTENSIONS, DocumentSeedRecovery
 from .mnemonic_candidate import MnemonicCandidate, MnemonicRecovery
-from .raw_mnemonic_scanner import MnemonicOccurrence, RawMnemonicScanner
+from .raw_mnemonic_scanner import (
+    MnemonicOccurrence,
+    RawMnemonicScanner,
+    RawMnemonicScanResult,
+    UnitComplete,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,11 +33,15 @@ class MnemonicRecoveryPipeline:
     def scan(self, source: str | Path, *, start: int = 0,
              end: int | None = None,
              progress: Callable[[int, int], None] | None = None,
-             workers: int = 1) -> MnemonicPipelineResult:
+             workers: int = 1,
+             resume_results: dict[tuple[int, int], RawMnemonicScanResult] | None = None,
+             unit_complete: UnitComplete | None = None) -> MnemonicPipelineResult:
         path = Path(source).resolve()
         range_end = path.stat().st_size if end is None else end
         raw = self.scanner.scan_path(path, start=start, end=range_end,
-                                     progress=progress, workers=workers)
+                                     progress=progress, workers=workers,
+                                     resume_results=resume_results,
+                                     unit_complete=unit_complete)
         occurrences = list(raw.occurrences)
         failures = list(raw.failures)
         if start == 0 and range_end == path.stat().st_size and path.suffix.lower() in DOCUMENT_EXTENSIONS:

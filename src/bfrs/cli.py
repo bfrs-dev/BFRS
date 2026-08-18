@@ -10,6 +10,10 @@ from typing import Sequence
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
 from bfrs.recovery.mnemonic.mnemonic_recovery_pipeline import MnemonicRecoveryPipeline
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import resolve_worker_count
+from bfrs.recovery.mnemonic.seed_scan_checkpoint import (
+    CheckpointError,
+    SeedScanCheckpoint,
+)
 from bfrs.recovery.metadata_less_fragments import FRAMED_BITCOIN_RECORD_PATTERNS
 from bfrs.recovery.orphan_private_key_der import (
     HISTORICAL_EC_PRIVATE_KEY_DER_ANCHOR,
@@ -127,6 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workers", type=_integer, default=1,
                         help="seed scan worker processes; 0 selects up to 4 automatically")
+    parser.add_argument("--checkpoint", type=Path,
+                        help="atomically save seed-scan ownership progress")
+    parser.add_argument("--resume-checkpoint", type=Path,
+                        help="resume a compatible seed-scan checkpoint")
     parser.add_argument("--cluster-mib", type=_integer, default=DEFAULT_CLUSTER_MIB)
     parser.add_argument("--padding-mib", type=_integer, default=DEFAULT_PADDING_MIB)
     parser.add_argument(
@@ -144,6 +152,10 @@ def build_parser() -> argparse.ArgumentParser:
 def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
     if arguments.electrum_only and arguments.seed_scan_only:
         parser.error("--electrum-only and --seed-scan-only are mutually exclusive")
+    if arguments.checkpoint and arguments.resume_checkpoint:
+        parser.error("--checkpoint and --resume-checkpoint are mutually exclusive")
+    if (arguments.checkpoint or arguments.resume_checkpoint) and not arguments.seed_scan_only:
+        parser.error("checkpoint options require --seed-scan-only")
     if arguments.start < 0:
         parser.error("--start must be nonnegative")
     if arguments.end is not None and arguments.end <= arguments.start:
@@ -204,6 +216,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         range_end = file_size if arguments.end is None else arguments.end
         worker_count = resolve_worker_count(arguments.workers)
         progress_rendered = [False]
+        chunk_size = arguments.chunk_mib * 1024 * 1024
+        overlap = arguments.overlap_kib * 1024
+        checkpoint = None
+        try:
+            if arguments.resume_checkpoint:
+                checkpoint = SeedScanCheckpoint.resume(
+                    arguments.resume_checkpoint, arguments.input,
+                    start=arguments.start, end=range_end,
+                    chunk_size=chunk_size, overlap=overlap)
+            elif arguments.checkpoint:
+                checkpoint = SeedScanCheckpoint.create(
+                    arguments.checkpoint, arguments.input,
+                    start=arguments.start, end=range_end,
+                    chunk_size=chunk_size, overlap=overlap)
+        except (OSError, CheckpointError) as error:
+            print(f"checkpoint error: {error}", file=sys.stderr)
+            return 3
+        resumed_bytes = checkpoint.completed_bytes if arguments.resume_checkpoint else 0
 
         def report_progress(processed: int, total: int) -> None:
             now = time.monotonic()
@@ -212,7 +242,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             last_progress[0] = now
             elapsed = max(now - started, 1e-9)
             percent = 100.0 if not total else processed * 100.0 / total
-            rate = processed / 2**20 / elapsed
+            newly_processed = max(0, processed - resumed_bytes)
+            rate = newly_processed / 2**20 / elapsed
             filled = min(20, int(percent / 5))
             if elapsed < 2.0 or processed == 0 or rate <= 0:
                 eta = "calculating..."
@@ -221,7 +252,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 hours, remainder = divmod(int(remaining), 3600)
                 minutes, seconds = divmod(remainder, 60)
                 eta = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            print(f"\rSeed scan [{'#' * filled}{'-' * (20 - filled)}] {percent:5.1f}%  "
+            label = "Seed scan RESUMED" if arguments.resume_checkpoint else "Seed scan"
+            print(f"\r{label} [{'#' * filled}{'-' * (20 - filled)}] {percent:5.1f}%  "
                   f"{processed / 2**30:.1f}/{total / 2**30:.1f} GiB  {rate:.1f} MiB/s  "
                   f"ETA {eta}  workers={worker_count}", end="", file=sys.stderr,
                   flush=True)
@@ -229,11 +261,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         try:
             result = MnemonicRecoveryPipeline(
-                chunk_size=arguments.chunk_mib * 1024 * 1024,
-                overlap=arguments.overlap_kib * 1024,
+                chunk_size=chunk_size,
+                overlap=overlap,
             ).scan(arguments.input, start=arguments.start, end=arguments.end,
-                   progress=report_progress, workers=arguments.workers)
+                   progress=report_progress, workers=arguments.workers,
+                   resume_results=(checkpoint.completed_results if checkpoint else None),
+                   unit_complete=(checkpoint.record if checkpoint else None))
         except KeyboardInterrupt:
+            if checkpoint is not None:
+                checkpoint.save(force=True)
             if progress_rendered[0]:
                 print(file=sys.stderr)
             print("scan interrupted by user", file=sys.stderr)
@@ -241,6 +277,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, ValueError) as error:
             print(f"input error: {error}", file=sys.stderr)
             return 3
+        if checkpoint is not None:
+            checkpoint.mark_complete()
         if progress_rendered[0]:
             print(file=sys.stderr)
         payload = {

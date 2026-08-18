@@ -51,8 +51,10 @@ class BIP39Validator:
         if len(words) not in WORD_COUNTS:
             return BIP39Validation("BIP39_WORD_COUNT_INVALID", None, len(words),
                                    None, normalized, ("BIP39_WORD_COUNT_INVALID",))
-        languages = tuple(language for language, wordlist in self.wordlists.items()
-                          if all(word in wordlist for word in words)) if languages is None else languages
+        requested = self.indices if languages is None else (
+            language for language in languages if language in self.indices)
+        languages = tuple(language for language in requested
+                          if all(word in self.indices[language] for word in words))
         if not languages:
             return BIP39Validation("BIP39_WORD_INVALID", None, len(words), None,
                                    normalized, ("BIP39_WORD_INVALID",))
@@ -60,12 +62,16 @@ class BIP39Validator:
             return BIP39Validation("BIP39_LANGUAGE_AMBIGUOUS", None, len(words),
                                    None, normalized, ("BIP39_LANGUAGE_AMBIGUOUS",))
         language = languages[0]
-        bits = "".join(f"{self.indices[language][word]:011b}" for word in words)
-        entropy_length = len(bits) * 32 // 33
+        combined = 0
+        for word in words:
+            combined = (combined << 11) | self.indices[language][word]
+        bit_length = len(words) * 11
+        entropy_length = bit_length * 32 // 33
         checksum_length = entropy_length // 32
-        entropy_bits, checksum = bits[:entropy_length], bits[entropy_length:]
-        entropy = int(entropy_bits, 2).to_bytes(entropy_length // 8, "big")
-        expected = f"{hashlib.sha256(entropy).digest()[0]:08b}"[:checksum_length]
+        checksum_mask = (1 << checksum_length) - 1
+        checksum = combined & checksum_mask
+        entropy = (combined >> checksum_length).to_bytes(entropy_length // 8, "big")
+        expected = hashlib.sha256(entropy).digest()[0] >> (8 - checksum_length)
         valid = checksum == expected
         return BIP39Validation(
             "BIP39_VALID" if valid else "BIP39_CHECKSUM_INVALID",
