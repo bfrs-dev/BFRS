@@ -4,10 +4,12 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Sequence
 
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
 from bfrs.recovery.mnemonic.mnemonic_recovery_pipeline import MnemonicRecoveryPipeline
+from bfrs.recovery.mnemonic.raw_mnemonic_scanner import resolve_worker_count
 from bfrs.recovery.metadata_less_fragments import FRAMED_BITCOIN_RECORD_PATTERNS
 from bfrs.recovery.orphan_private_key_der import (
     HISTORICAL_EC_PRIVATE_KEY_DER_ANCHOR,
@@ -123,6 +125,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--seed-scan-only", action="store_true",
         help="run only BIP39/Electrum mnemonic raw and document recovery",
     )
+    parser.add_argument("--workers", type=_integer, default=1,
+                        help="seed scan worker processes; 0 selects up to 4 automatically")
     parser.add_argument("--cluster-mib", type=_integer, default=DEFAULT_CLUSTER_MIB)
     parser.add_argument("--padding-mib", type=_integer, default=DEFAULT_PADDING_MIB)
     parser.add_argument(
@@ -150,6 +154,8 @@ def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
             parser.error(f"--{name.replace('_', '-')} must be at least {minimum}")
     if arguments.overlap_kib < 0:
         parser.error("--overlap-kib must be nonnegative")
+    if arguments.workers < 0:
+        parser.error("--workers must be nonnegative")
     if arguments.minimum_hits < 1:
         parser.error("--minimum-hits must be at least 1")
     if arguments.minimum_distinct_types < 1:
@@ -173,6 +179,7 @@ def _configuration(arguments) -> dict[str, object]:
         "minimum_distinct_types": arguments.minimum_distinct_types,
         "electrum_only": arguments.electrum_only,
         "seed_scan_only": arguments.seed_scan_only,
+        "workers": arguments.workers,
         "signature_set": [signature.name for signature in signatures],
     }
 
@@ -192,14 +199,50 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--start must not exceed input size")
 
     if arguments.seed_scan_only:
+        started = time.monotonic()
+        last_progress = [0.0]
+        range_end = file_size if arguments.end is None else arguments.end
+        worker_count = resolve_worker_count(arguments.workers)
+        progress_rendered = [False]
+
+        def report_progress(processed: int, total: int) -> None:
+            now = time.monotonic()
+            if processed < total and now - last_progress[0] < 0.5:
+                return
+            last_progress[0] = now
+            elapsed = max(now - started, 1e-9)
+            percent = 100.0 if not total else processed * 100.0 / total
+            rate = processed / 2**20 / elapsed
+            filled = min(20, int(percent / 5))
+            if elapsed < 2.0 or processed == 0 or rate <= 0:
+                eta = "calculating..."
+            else:
+                remaining = max(0.0, (total - processed) / 2**20 / rate)
+                hours, remainder = divmod(int(remaining), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                eta = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            print(f"\rSeed scan [{'#' * filled}{'-' * (20 - filled)}] {percent:5.1f}%  "
+                  f"{processed / 2**30:.1f}/{total / 2**30:.1f} GiB  {rate:.1f} MiB/s  "
+                  f"ETA {eta}  workers={worker_count}", end="", file=sys.stderr,
+                  flush=True)
+            progress_rendered[0] = True
+
         try:
             result = MnemonicRecoveryPipeline(
                 chunk_size=arguments.chunk_mib * 1024 * 1024,
                 overlap=arguments.overlap_kib * 1024,
-            ).scan(arguments.input, start=arguments.start, end=arguments.end)
+            ).scan(arguments.input, start=arguments.start, end=arguments.end,
+                   progress=report_progress, workers=arguments.workers)
+        except KeyboardInterrupt:
+            if progress_rendered[0]:
+                print(file=sys.stderr)
+            print("scan interrupted by user", file=sys.stderr)
+            return 130
         except (OSError, ValueError) as error:
             print(f"input error: {error}", file=sys.stderr)
             return 3
+        if progress_rendered[0]:
+            print(file=sys.stderr)
         payload = {
             "application": {"name": APP_NAME, "version": VERSION},
             "source": result.source,

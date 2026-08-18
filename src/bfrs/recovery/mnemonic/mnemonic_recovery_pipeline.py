@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Callable
 
 from .document_seed_recovery import DOCUMENT_EXTENSIONS, DocumentSeedRecovery
 from .mnemonic_candidate import MnemonicCandidate, MnemonicRecovery
@@ -25,10 +26,13 @@ class MnemonicRecoveryPipeline:
         self.documents = DocumentSeedRecovery(self.scanner)
 
     def scan(self, source: str | Path, *, start: int = 0,
-             end: int | None = None) -> MnemonicPipelineResult:
+             end: int | None = None,
+             progress: Callable[[int, int], None] | None = None,
+             workers: int = 1) -> MnemonicPipelineResult:
         path = Path(source).resolve()
         range_end = path.stat().st_size if end is None else end
-        raw = self.scanner.scan_path(path, start=start, end=range_end)
+        raw = self.scanner.scan_path(path, start=start, end=range_end,
+                                     progress=progress, workers=workers)
         occurrences = list(raw.occurrences)
         failures = list(raw.failures)
         if start == 0 and range_end == path.stat().st_size and path.suffix.lower() in DOCUMENT_EXTENSIONS:

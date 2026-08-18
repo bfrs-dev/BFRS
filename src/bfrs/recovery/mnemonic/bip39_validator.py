@@ -43,12 +43,16 @@ class BIP39Validator:
 
     def validate(self, phrase: str) -> BIP39Validation:
         normalized = bip39_normalize(phrase)
-        words = normalized.split()
+        return self.validate_words(tuple(normalized.split()), normalized=normalized)
+
+    def validate_words(self, words: tuple[str, ...], *, normalized: str | None = None,
+                       languages: tuple[str, ...] | None = None) -> BIP39Validation:
+        normalized = " ".join(words) if normalized is None else normalized
         if len(words) not in WORD_COUNTS:
             return BIP39Validation("BIP39_WORD_COUNT_INVALID", None, len(words),
                                    None, normalized, ("BIP39_WORD_COUNT_INVALID",))
-        languages = [language for language, wordlist in self.wordlists.items()
-                     if all(word in wordlist for word in words)]
+        languages = tuple(language for language, wordlist in self.wordlists.items()
+                          if all(word in wordlist for word in words)) if languages is None else languages
         if not languages:
             return BIP39Validation("BIP39_WORD_INVALID", None, len(words), None,
                                    normalized, ("BIP39_WORD_INVALID",))

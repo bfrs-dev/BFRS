@@ -99,6 +99,43 @@ def test_raw_scanner_offsets_encodings_and_no_repr_leak(encoding):
     assert phrase not in json.dumps(candidate.safe_dict())
 
 
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
+@pytest.mark.parametrize("placement", [17, 4096, 7900])
+def test_raw_scanner_exact_offsets_at_chunk_positions(encoding, placement):
+    phrase = bip39_phrase("english")
+    prefix_text = "żółć/" if encoding == "utf-8" else "𝄞/"
+    marker = prefix_text.encode(encoding)
+    target = placement if encoding == "utf-8" else placement + placement % 2
+    target = max(target, len(marker))
+    prefix = b"\x00" * (target - len(marker)) + marker
+    payload = prefix + phrase.encode(encoding) + ":tail".encode(encoding)
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    candidate = next(item.candidate for item in result.occurrences
+                     if item.candidate.mnemonic_standard == "BIP39"
+                     and item.candidate.encoding == encoding)
+    assert candidate.physical_start == len(prefix)
+    assert candidate.physical_end == len(prefix) + len(phrase.encode(encoding))
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
+def test_raw_scanner_boundary_offsets_all_encodings(tmp_path, encoding):
+    phrase = bip39_phrase("english")
+    encoded = phrase.encode(encoding)
+    start = 8192 - len(encoded) // 2
+    if encoding != "utf-8":
+        start -= start % 2
+    separator = ":".encode(encoding)
+    prefix = b"\x00" * (start - len(separator)) + separator
+    source = tmp_path / f"boundary-{encoding}.bin"
+    source.write_bytes(prefix + encoded + ":tail".encode(encoding))
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_path(source)
+    candidate = next(item.candidate for item in result.occurrences
+                     if item.candidate.mnemonic_standard == "BIP39"
+                     and item.candidate.encoding == encoding)
+    assert candidate.physical_start == start
+    assert candidate.physical_end == start + len(encoded)
+
+
 @pytest.mark.parametrize("delimiter", [" \r\n\t ", ", ; ", " / "])
 def test_raw_scanner_multiline_and_punctuation_delimiters(delimiter):
     phrase = bip39_phrase("english")
@@ -117,6 +154,75 @@ def test_chunk_boundary_and_overlap_dedup(tmp_path):
                if item.candidate.mnemonic_standard == "BIP39"]
     assert len(matches) == 1
     assert matches[0].candidate.physical_start == 8000
+
+
+def test_scan_path_progress_is_monotonic_and_reaches_end(tmp_path):
+    source = tmp_path / "progress.bin"
+    source.write_bytes(b"ordinary deterministic prose " * 1000)
+    updates = []
+    RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_path(
+        source, progress=lambda processed, total: updates.append((processed, total)))
+    assert updates
+    assert [item[0] for item in updates] == sorted(item[0] for item in updates)
+    assert updates[-1] == (source.stat().st_size, source.stat().st_size)
+
+
+def test_parallel_scanner_matches_single_worker_at_ownership_boundaries(tmp_path):
+    phrase = bip39_phrase("english").encode()
+    payload = bytearray(b"\x00" * 20_000)
+    # Before a boundary, crossing a boundary, exactly on a boundary, and later.
+    starts = (3000, 4050, 8192, 12_500)
+    for start in starts:
+        payload[start - 1:start] = b":"
+        payload[start:start + len(phrase)] = phrase
+        payload[start + len(phrase):start + len(phrase) + 1] = b":"
+    source = tmp_path / "parallel-boundaries.bin"
+    source.write_bytes(payload)
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+    single = scanner.scan_path(source, workers=1)
+    parallel = scanner.scan_path(source, workers=4)
+
+    def semantic(result):
+        return ([(item.candidate.mnemonic_standard, item.candidate.fingerprint,
+                  item.candidate.physical_start, item.candidate.physical_end,
+                  item.candidate.validation_status)
+                 for item in result.occurrences], result.anchors_found,
+                result.checksum_invalid, result.failures)
+
+    assert semantic(parallel) == semantic(single)
+    bip39_starts = {item.candidate.physical_start for item in parallel.occurrences
+                    if item.candidate.mnemonic_standard == "BIP39"
+                    and item.candidate.encoding == "utf-8"}
+    assert bip39_starts == set(starts)
+
+
+def test_seed_cli_workers_one_and_four_have_identical_recovery(tmp_path):
+    phrase = bip39_phrase("english")
+    source = tmp_path / "parallel-cli.bin"
+    source.write_bytes((":" + phrase + ":").encode())
+    reports = []
+    for workers in (1, 4):
+        report = tmp_path / f"workers-{workers}.json"
+        assert main(["--input", str(source), "--output", str(report),
+                     "--seed-scan-only", "--chunk-mib", "1",
+                     "--overlap-kib", "4", "--workers", str(workers)]) == 0
+        reports.append(json.loads(report.read_text(encoding="utf-8")))
+    assert reports[0]["mnemonic_recovery"] == reports[1]["mnemonic_recovery"]
+
+
+def test_seed_cli_keyboard_interrupt_is_clean(tmp_path, monkeypatch, capsys):
+    source = tmp_path / "interrupt.bin"
+    report = tmp_path / "must-not-exist.json"
+    source.write_bytes(b"synthetic")
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("bfrs.cli.MnemonicRecoveryPipeline.scan", interrupt)
+    assert main(["--input", str(source), "--output", str(report),
+                 "--seed-scan-only", "--overlap-kib", "4"]) == 130
+    assert "scan interrupted by user" in capsys.readouterr().err
+    assert not report.exists()
 
 
 def test_docx_extraction_and_pdf_isolated_failure(tmp_path):

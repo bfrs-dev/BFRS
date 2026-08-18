@@ -41,9 +41,13 @@ class ElectrumSeedValidator:
 
     def validate(self, phrase: str) -> ElectrumSeedValidation:
         normalized = electrum_normalize(phrase)
-        words = normalized.split()
-        languages = [name for name, values in self.wordlists.items()
-                     if all(word in values for word in words)]
+        return self.validate_words(tuple(normalized.split()), normalized=normalized)
+
+    def validate_words(self, words: tuple[str, ...], *, normalized: str | None = None,
+                       languages: tuple[str, ...] | None = None) -> ElectrumSeedValidation:
+        normalized = " ".join(words) if normalized is None else normalized
+        languages = tuple(name for name, values in self.wordlists.items()
+                          if all(word in values for word in words)) if languages is None else languages
         if not languages or not 12 <= len(words) <= 24:
             return ElectrumSeedValidation("REJECTED", None, None, len(words),
                                           normalized, ("ELECTRUM_WORD_STRUCTURE_INVALID",))
