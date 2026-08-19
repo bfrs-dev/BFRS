@@ -70,12 +70,16 @@ class MnemonicRecoveryPipeline:
                 "path": item.candidate.path,
                 "allocation_state": item.candidate.allocation_state,
             } for item in items)
-            candidates.append(replace(first, duplicate_count=len(items), provenance=provenance,
+            candidates.append(replace(first,
+                                      confidence=("HIGH" if any(
+                                          item.candidate.confidence == "HIGH" for item in items)
+                                          else first.confidence),
+                                      duplicate_count=len(items), provenance=provenance,
                                       correlated_sources=tuple(sorted({
                                           item.candidate.source_kind for item in items}))))
         recovery = MnemonicRecovery(
             anchors_found=raw.anchors_found, candidates_total=len(candidates),
-            high_confidence_candidates=len(candidates),
+            high_confidence_candidates=sum(item.confidence == "HIGH" for item in candidates),
             bip39_valid=sum(item.mnemonic_standard == "BIP39" for item in candidates),
             electrum_valid=sum(item.mnemonic_standard == "ELECTRUM" for item in candidates),
             structural_fragments=0, checksum_invalid=raw.checksum_invalid,

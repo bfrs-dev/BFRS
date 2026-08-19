@@ -246,7 +246,7 @@ class RawMnemonicScanner:
                 # Token boundaries are mapped in one monotonic pass.  Each span is
                 # encoded at most once, preserving the decoder's exact error policy
                 # without a per-character offset table.
-                window: deque[tuple[str, str, int, int, int, int, int]] = deque(maxlen=24)
+                window: deque[tuple[str, str, int, int, int, int, int, str]] = deque(maxlen=24)
                 previous_end: int | None = None
                 char_cursor = byte_cursor = 0
                 for match in _TOKEN.finditer(text):
@@ -273,7 +273,7 @@ class RawMnemonicScanner:
                     if not known:
                         continue
                     window.append((original, word, electrum_word, bip_mask, electrum_mask,
-                                   raw_start, raw_end))
+                                   raw_start, raw_end, separator))
                     available = tuple(window)
                     for count in range(12, min(24, len(available)) + 1):
                         selected = available[-count:]
@@ -288,7 +288,24 @@ class RawMnemonicScanner:
                             bip_languages &= item[3]
                             electrum_languages &= item[4]
                         validations = []
-                        if count in WORD_COUNTS and bip_languages:
+                        # BIP39 words must be adjacent text tokens separated only by
+                        # reasonable whitespace.  Punctuation and markup remain
+                        # available to the legacy Electrum path, but may never be
+                        # filtered out to manufacture a BIP39 phrase.
+                        bip39_contiguous = all(
+                            item[7] and len(item[7]) <= 32 and item[7].isspace()
+                            for item in selected[1:])
+                        span_start, span_end = selected[0][5], selected[-1][6]
+                        span_bytes = encoded_data[span_start:span_end]
+                        span_text = span_bytes.decode(encoding, errors=error_mode)
+                        span_parts = span_text.split()
+                        span_integrity = (
+                            len(span_parts) == count and
+                            tuple(self._normalize_token(part)[0] for part in span_parts) ==
+                            tuple(item[1] for item in selected)
+                        )
+                        if (count in WORD_COUNTS and bip_languages and
+                                bip39_contiguous and span_integrity):
                             words = tuple(item[1] for item in selected)
                             normalized = " ".join(words)
                             languages = tuple(name for bit, name in enumerate(self.bip39.wordlists)
@@ -322,7 +339,9 @@ class RawMnemonicScanner:
                                 language=validation.language,
                                 word_count=validation.word_count,
                                 checksum_valid=getattr(validation, "checksum_valid", None),
-                                completeness="COMPLETE", confidence="HIGH",
+                                completeness="COMPLETE",
+                                confidence="MEDIUM" if (standard == "BIP39" and
+                                                         source_kind == "RAW_BYTES") else "HIGH",
                                 reason_codes=validation.reason_codes,
                                 fingerprint=fingerprint, source_kind=source_kind,
                                 source=source, physical_start=physical_start,

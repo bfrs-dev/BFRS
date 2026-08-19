@@ -158,13 +158,86 @@ def test_raw_scanner_boundary_offsets_all_encodings(tmp_path, encoding):
     assert candidate.physical_end == start + len(encoded)
 
 
-@pytest.mark.parametrize("delimiter", [" \r\n\t ", ", ; ", " / "])
-def test_raw_scanner_multiline_and_punctuation_delimiters(delimiter):
+@pytest.mark.parametrize("delimiter", ["    ", "\t", "\r\n", "\n", " \r\n\t "])
+def test_raw_scanner_accepts_whitespace_delimiters(delimiter):
     phrase = bip39_phrase("english")
     decorated = delimiter.join(phrase.split()).encode()
     result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(decorated)
     assert any(item.candidate.mnemonic_standard == "BIP39"
                for item in result.occurrences)
+
+
+@pytest.mark.parametrize("delimiter", [",", " ; ", " / ", "-", "<b>"])
+def test_raw_scanner_rejects_non_whitespace_bip39_delimiters(delimiter):
+    phrase = bip39_phrase("english")
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(
+        delimiter.join(phrase.split()).encode())
+    assert not [item for item in result.occurrences
+                if item.candidate.mnemonic_standard == "BIP39"]
+
+
+def test_raw_scanner_rejects_false_true_csv_false_positive():
+    payload = b"False,False,False,False,False,False,True,False,False,False,True,False"
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    assert not [item for item in result.occurrences
+                if item.candidate.mnemonic_standard == "BIP39"]
+
+
+@pytest.mark.parametrize("payload", [
+    b"similar term lizard-like lobster-like mammal-like abstract ability able about above absent absorb",
+    b"ill-used put-upon used similar term abandon ability able about above absent absorb abstract absurd abuse access",
+    b'<PUBLIC:PROPERTY NAME="text"> abandon ability able about above absent absorb abstract absurd abuse access accident',
+])
+def test_raw_scanner_rejects_dictionary_and_markup_false_positives(payload):
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    assert not [item for item in result.occurrences
+                if item.candidate.mnemonic_standard == "BIP39"]
+
+
+def test_raw_scanner_rejects_valid_words_separated_by_foreign_words():
+    phrase = bip39_phrase("english")
+    payload = " intruder ".join(phrase.split()).encode()
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    assert not [item for item in result.occurrences
+                if item.candidate.mnemonic_standard == "BIP39"]
+
+
+@pytest.mark.parametrize("entropy_bits", [128, 160, 192, 224, 256])
+def test_raw_scanner_accepts_all_bip39_word_counts(entropy_bits):
+    phrase = bip39_phrase("english", entropy_bits)
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(phrase.encode())
+    assert any(item.candidate.mnemonic_standard == "BIP39" and
+               item.candidate.word_count == len(phrase.split())
+               for item in result.occurrences)
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
+def test_raw_scanner_source_span_round_trip_and_encoding_negative(encoding):
+    phrase = bip39_phrase("english")
+    prefix = "noise:"
+    payload = (prefix + phrase + ":tail").encode(encoding)
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    occurrence = next(item for item in result.occurrences
+                      if item.candidate.mnemonic_standard == "BIP39" and
+                      item.candidate.encoding == encoding)
+    candidate = occurrence.candidate
+    raw_span = payload[candidate.physical_start:candidate.physical_end]
+    assert raw_span.decode(encoding) == phrase
+    broken = " intruder ".join(phrase.split()).encode(encoding)
+    rejected = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(broken)
+    assert not [item for item in rejected.occurrences
+                if item.candidate.mnemonic_standard == "BIP39" and
+                item.candidate.encoding == encoding]
+
+
+def test_raw_bip39_checksum_alone_is_not_high_confidence():
+    phrase = bip39_phrase("english")
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(phrase.encode())
+    candidate = next(item.candidate for item in result.occurrences
+                     if item.candidate.mnemonic_standard == "BIP39" and
+                     item.candidate.encoding == "utf-8")
+    assert candidate.checksum_valid is True
+    assert candidate.confidence == "MEDIUM"
 
 
 @pytest.mark.parametrize("payload", [
@@ -368,6 +441,20 @@ def test_checkpoint_rejects_wrong_source_size_and_corruption(tmp_path):
     checkpoint.path.write_text("{not-json", encoding="utf-8")
     with pytest.raises(CheckpointError, match="corrupted"):
         SeedScanCheckpoint.resume(checkpoint.path, source, start=0, end=10_001,
+                                  chunk_size=8192, overlap=4096)
+
+
+def test_checkpoint_rejects_pre_contiguous_scanner_results(tmp_path):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"a" * 10_000)
+    checkpoint = SeedScanCheckpoint.create(
+        tmp_path / "checkpoint.json", source, start=0, end=10_000,
+        chunk_size=8192, overlap=4096)
+    payload = json.loads(checkpoint.path.read_text(encoding="utf-8"))
+    payload["format"] = "BFRS_SEED_SCAN_CHECKPOINT_V1"
+    checkpoint.path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(CheckpointError, match="unsupported checkpoint format"):
+        SeedScanCheckpoint.resume(checkpoint.path, source, start=0, end=10_000,
                                   chunk_size=8192, overlap=4096)
 
 

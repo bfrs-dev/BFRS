@@ -16,7 +16,10 @@ from .raw_mnemonic_scanner import (
 )
 
 
-FORMAT = "BFRS_SEED_SCAN_CHECKPOINT_V1"
+# Serialized occurrences produced before V2 may contain candidates assembled
+# across punctuation/markup.  They must not be resumed after the contiguous
+# BIP39 rule changed because completed units bypass tokenization.
+FORMAT = "BFRS_SEED_SCAN_CHECKPOINT_V2"
 IDENTITY_BYTES = 64 * 1024
 
 
