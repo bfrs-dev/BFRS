@@ -15,12 +15,13 @@ from bfrs.tools.analyze_electrum_candidate_context import (
 )
 
 
-@lru_cache(maxsize=1)
-def electrum_phrase() -> str:
+@lru_cache(maxsize=None)
+def electrum_phrase(word_count: int = 12) -> str:
     validator = ElectrumSeedValidator()
     words = sorted(validator.wordlists["english"])
     for number in range(100_000):
-        phrase = " ".join([words[0]] * 11 + [words[number % len(words)]])
+        phrase = " ".join([words[0]] * (word_count - 1) +
+                          [words[number % len(words)]])
         if validator.validate(phrase).status == "ELECTRUM_SEED_VALID":
             return phrase
     raise AssertionError("deterministic Electrum fixture not found")
@@ -85,30 +86,112 @@ def test_wallet_structure_confirms_context_and_all_encodings(tmp_path, encoding)
     result = analyze(tmp_path, image, payload, context_bytes=512)
     item = result["candidates"][0]["occurrences"][0]
     assert result["format"] == FORMAT
-    assert item["classification"] == "ELECTRUM_CONTEXT_CONFIRMED"
+    assert item["classification"] == "ELECTRUM_WALLET_CONTEXT_CONFIRMED"
+    assert item["review_ranking"] == "VERY_HIGH_REVIEW"
     assert {"ELECTRUM_KEYSTORE_SIGNAL", "ELECTRUM_WALLET_TYPE_SIGNAL",
             "ELECTRUM_MASTER_PUBLIC_KEY_SIGNAL",
             "ELECTRUM_SEED_METADATA_SIGNAL"} <= set(item["reason_codes"])
     assert item["encoding"] == encoding
 
 
-def test_valid_mnemonic_without_context_is_inconclusive(tmp_path):
+def test_valid_mnemonic_without_context_is_plaintext_candidate(tmp_path):
     phrase = electrum_phrase().encode()
     payload = report(candidate("bare", "b" * 64,
                                [occurrence(0, len(phrase))]))
     result = analyze(tmp_path, phrase, payload, context_bytes=0)
     item = result["candidates"][0]["occurrences"][0]
-    assert item["classification"] == "INCONCLUSIVE"
-    assert "NO_ELECTRUM_CONTEXT" in item["reason_codes"]
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    assert item["left_boundary_type"] == "BEGINNING_OF_IMAGE"
+    assert item["right_boundary_type"] == "END_OF_IMAGE"
+    assert item["standalone_phrase"] is True
+    assert "STANDALONE_MNEMONIC_PHRASE" in item["reason_codes"]
+
+
+@pytest.mark.parametrize("word_count", [12, 13])
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
+def test_isolated_plaintext_line_is_candidate_for_12_13_words_and_encodings(
+        tmp_path, word_count, encoding):
+    phrase = electrum_phrase(word_count)
+    prefix = "zzzzzz\r\n"
+    suffix = "\r\nyyyyyy"
+    image = (prefix + phrase + suffix).encode(encoding)
+    start = len(prefix.encode(encoding))
+    payload = report(candidate(f"plain-{encoding}-{word_count}", "a1" * 32, [
+        occurrence(start, start + len(phrase.encode(encoding)),
+                   encoding=encoding, word_count=word_count)]))
+    result = analyze(tmp_path, image, payload)
+    item = result["candidates"][0]["occurrences"][0]
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    assert item["review_ranking"] == "HIGH_REVIEW"
+    assert item["left_boundary_type"] == "NEWLINE"
+    assert item["right_boundary_type"] == "NEWLINE"
+    assert item["line_isolation"] is True
+    assert item["total_contiguous_dictionary_run_length"] == word_count
+
+
+def test_seed_label_is_plaintext_candidate(tmp_path):
+    phrase = electrum_phrase()
+    prefix = "seed: "
+    image = (prefix + phrase + "\n").encode()
+    start = len(prefix)
+    payload = report(candidate("label", "a2" * 32,
+                               [occurrence(start, start + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload)["candidates"][0]["occurrences"][0]
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    assert item["left_boundary_type"] == "DELIMITER"
+    assert item["line_isolation"] is True
+
+
+def test_distant_html_css_javascript_do_not_reject_isolated_seed(tmp_path):
+    phrase = electrum_phrase()
+    suffix = ("\n" + "x" * (40 * 1024) +
+              "<html><script>const page = window.document;</script>"
+              "<style>.x { color:red; }</style></html>")
+    image = (phrase + suffix).encode()
+    payload = report(candidate("distant-code", "a3" * 32,
+                               [occurrence(0, len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload, context_bytes=64 * 1024)[
+        "candidates"][0]["occurrences"][0]
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    assert item["near_html_signal"] is False
+    assert item["near_css_signal"] is False
+    assert item["near_javascript_signal"] is False
+    assert item["signal_distance"]["html"] > 40 * 1024
+
+
+def test_example_seed_context_is_textual_false_positive(tmp_path):
+    phrase = electrum_phrase()
+    prefix = "documentation example seed: "
+    image = (prefix + phrase + "\n").encode()
+    start = len(prefix)
+    payload = report(candidate("example", "a4" * 32,
+                               [occurrence(start, start + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload)["candidates"][0]["occurrences"][0]
+    assert item["classification"] == "TEXTUAL_FALSE_POSITIVE"
+    assert "EXAMPLE_OR_TEST_CONTEXT" in item["reason_codes"]
+
+
+def test_nearby_css_does_not_reject_seed_on_its_own_line(tmp_path):
+    phrase = electrum_phrase()
+    prefix = ".page { color:red; border-width:1px; }\n"
+    image = (prefix + phrase + "\n").encode()
+    start = len(prefix)
+    payload = report(candidate("css-note", "a5" * 32,
+                               [occurrence(start, start + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload)["candidates"][0]["occurrences"][0]
+    assert item["near_css_signal"] is True
+    assert "LOCAL_CSS_CONTEXT" in item["reason_codes"]
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
 
 
 @pytest.mark.parametrize("wrapper,reason", [
-    (("<!DOCTYPE html><html><body>", "</body></html>"), "HTML_CONTEXT"),
-    (("<script>const wallet = window.document;</script>", ""), "JAVASCRIPT_CONTEXT"),
-    (("<style>.wallet { color:red; border-width:1px; margin:0; padding:0; }</style>", ""),
-     "CSS_CONTEXT"),
+    (("<script>const test_vector = {example_seed: \"", "\"};</script>"),
+     "LOCAL_JAVASCRIPT_CONTEXT"),
+    (("<style>.fixture { color:red; content:\"", "\"; }</style>"),
+     "LOCAL_CSS_CONTEXT"),
 ])
-def test_html_javascript_and_css_are_textual_false_positives(tmp_path, wrapper, reason):
+def test_locally_embedded_javascript_and_css_are_textual_false_positives(
+        tmp_path, wrapper, reason):
     phrase = electrum_phrase()
     text = wrapper[0] + phrase + wrapper[1]
     start = len(wrapper[0].encode())
@@ -118,14 +201,15 @@ def test_html_javascript_and_css_are_textual_false_positives(tmp_path, wrapper, 
     item = result["candidates"][0]["occurrences"][0]
     assert item["classification"] == "TEXTUAL_FALSE_POSITIVE"
     assert reason in item["reason_codes"]
+    assert "MNEMONIC_EMBEDDED_IN_CODE" in item["reason_codes"]
 
 
 def test_long_mnemonic_wordlist_is_textual_false_positive(tmp_path):
     validator = ElectrumSeedValidator()
     words = sorted(validator.wordlists["english"])
     phrase = electrum_phrase()
-    prefix = " ".join(words[:30]) + " "
-    suffix = " " + " ".join(words[30:60])
+    prefix = " ".join(words[:44]) + " "
+    suffix = " " + " ".join(words[44:88])
     text = prefix + phrase + suffix
     start = len(prefix.encode())
     payload = report(candidate("wordlist", "c" * 64,
@@ -133,23 +217,52 @@ def test_long_mnemonic_wordlist_is_textual_false_positive(tmp_path):
     result = analyze(tmp_path, text.encode(), payload)
     item = result["candidates"][0]["occurrences"][0]
     assert item["classification"] == "TEXTUAL_FALSE_POSITIVE"
-    assert "WORDLIST_CONTEXT" in item["reason_codes"]
+    assert "LONG_WORDLIST_RUN" in item["reason_codes"]
+    assert "MNEMONIC_EMBEDDED_IN_WORDLIST" in item["reason_codes"]
 
 
 def test_dense_overlapping_candidates_are_false_positive(tmp_path):
-    phrase = electrum_phrase().encode()
-    image = b"\x00" * 32 + phrase + b"\x00" * 32
-    candidates = [candidate(
-        f"dense-{number}", f"{number + 1:064x}",
-        [occurrence(32 + number, 32 + len(phrase) - number)])
-        for number in range(5)]
+    words = sorted(ElectrumSeedValidator().wordlists["english"])[:30]
+    text = " ".join(words)
+    starts = []
+    cursor = 0
+    for word in words:
+        starts.append(cursor)
+        cursor += len(word) + 1
+    image = text.encode()
+    candidates = []
+    for number in range(5):
+        start = starts[number]
+        end = starts[number + 11] + len(words[number + 11])
+        candidates.append(candidate(
+            f"dense-{number}", f"{number + 1:064x}",
+            [occurrence(start, end)]))
     result = analyze(tmp_path, image, report(*candidates))
     for item in result["candidates"]:
         analyzed = item["occurrences"][0]
         assert analyzed["classification"] == "TEXTUAL_FALSE_POSITIVE"
         assert "HIGH_LOCAL_MNEMONIC_DENSITY" in analyzed["reason_codes"]
-        assert "OVERLAPPING_MNEMONIC_CANDIDATES" in analyzed["reason_codes"]
+        assert "SLIDING_WINDOW_PATTERN" in analyzed["reason_codes"]
         assert analyzed["overlapping_candidate_count"] == 4
+
+
+def test_dense_but_separate_seed_lines_are_not_automatically_rejected(tmp_path):
+    phrase = electrum_phrase()
+    lines = [phrase for _ in range(5)]
+    text = "\n".join(lines)
+    candidates = []
+    cursor = 0
+    for number, line in enumerate(lines):
+        candidates.append(candidate(
+            f"separate-{number}", f"{number + 20:064x}",
+            [occurrence(cursor, cursor + len(line.encode()))]))
+        cursor += len(line.encode()) + 1
+    result = analyze(tmp_path, text.encode(), report(*candidates))
+    for output in result["candidates"]:
+        item = output["occurrences"][0]
+        assert "HIGH_LOCAL_MNEMONIC_DENSITY" in item["reason_codes"]
+        assert item["overlapping_candidate_count"] == 0
+        assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
 
 
 def test_selection_is_exactly_high_review_survived_electrum_12_or_13(tmp_path):
@@ -191,6 +304,9 @@ def test_context_is_clipped_at_image_start_and_end_and_windows_merge(tmp_path):
     contexts = [item["context_bytes_requested"]
                 for item in result["candidates"][0]["occurrences"]]
     assert contexts == [min(len(image), len(phrase) + 64)] * 2
+    assert {item["classification"] for item in
+            result["candidates"][0]["occurrences"]} == {
+                "PLAINTEXT_SEED_CANDIDATE"}
 
 
 def test_read_failure_is_controlled_and_image_is_opened_once(tmp_path):
@@ -231,7 +347,7 @@ def test_candidate_aggregate_does_not_hide_mixed_physical_contexts(tmp_path):
     output = result["candidates"][0]
     assert output["classification"] == "INCONCLUSIVE"
     assert {item["classification"] for item in output["occurrences"]} == {
-        "ELECTRUM_CONTEXT_CONFIRMED", "TEXTUAL_FALSE_POSITIVE"}
+        "ELECTRUM_WALLET_CONTEXT_CONFIRMED", "PLAINTEXT_SEED_CANDIDATE"}
 
 
 def test_report_is_secret_free_deterministic_and_cli_writes_json(tmp_path):

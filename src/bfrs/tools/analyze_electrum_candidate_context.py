@@ -17,11 +17,13 @@ from bfrs.recovery.mnemonic.electrum_seed_validator import ElectrumSeedValidator
 from bfrs.recovery.mnemonic.mnemonic_normalizer import electrum_normalize
 
 
-FORMAT = "BFRS_ELECTRUM_CONTEXT_ANALYSIS_V1"
+FORMAT = "BFRS_ELECTRUM_CONTEXT_ANALYSIS_V2"
 DEFAULT_CONTEXT_BYTES = 64 * 1024
 DEFAULT_MAX_WINDOW_BYTES = 1024 * 1024
 MAX_OCCURRENCE_SPAN = 64 * 1024
 DENSITY_RADIUS = 8 * 1024
+LOCAL_SIGNAL_RADIUS = 2 * 1024
+WALLET_SIGNAL_RADIUS = 4 * 1024
 _TOKEN = re.compile(r"[^\W\d_]+", re.UNICODE)
 _ENCODINGS = ("utf-8", "utf-16-le", "utf-16-be")
 
@@ -37,17 +39,21 @@ _CSS_PROPERTY_PATTERN = re.compile(
     r"(?:-[a-z]+)*\s*:")
 _CSS_SELECTOR_PATTERN = re.compile(r"(?:^|[}\s])(?:\.[a-z_-][\w-]*|#[a-z_-][\w-]*)\s*{")
 _DOCUMENTATION_MARKERS = (
-    "documentation", "example seed", "mnemonic example", "sample seed",
-    "technical reference", "tutorial", "word list", "wordlist", "thesaurus",
+    "documentation", "example", "example seed", "test seed", "sample",
+    "sample seed", "mnemonic example", "technical reference", "test vector",
+    "fixture", "unit test", "tutorial", "word list", "wordlist", "thesaurus",
 )
 _CORE_ELECTRUM_REASONS = {
     "ELECTRUM_KEYSTORE_SIGNAL", "ELECTRUM_WALLET_TYPE_SIGNAL",
     "ELECTRUM_MASTER_PUBLIC_KEY_SIGNAL", "ELECTRUM_SEED_METADATA_SIGNAL",
 }
-_FALSE_POSITIVE_REASONS = {
-    "HTML_CONTEXT", "CSS_CONTEXT", "JAVASCRIPT_CONTEXT",
-    "DOCUMENTATION_CONTEXT", "WORDLIST_CONTEXT",
-    "HIGH_LOCAL_MNEMONIC_DENSITY", "OVERLAPPING_MNEMONIC_CANDIDATES",
+_STRONG_BOUNDARIES = {
+    "BEGINNING_OF_IMAGE", "END_OF_IMAGE", "NEWLINE", "NUL",
+    "QUOTE", "DELIMITER", "PUNCTUATION",
+}
+_RANKING_ORDER = {
+    "REJECTED": 0, "LOW_REVIEW": 1, "MEDIUM_REVIEW": 2,
+    "HIGH_REVIEW": 3, "VERY_HIGH_REVIEW": 4,
 }
 
 
@@ -69,6 +75,23 @@ class _Occurrence:
     nearest_distance: int | None = None
     overlapping_count: int = 0
     local_density: float = 0.0
+    at_image_start: bool = False
+    at_image_end: bool = False
+    preceding_dictionary_word_count: int = 0
+    following_dictionary_word_count: int = 0
+    contiguous_dictionary_words_before: int = 0
+    contiguous_dictionary_words_after: int = 0
+    total_contiguous_dictionary_run_length: int = 0
+    left_boundary_type: str = "UNKNOWN"
+    right_boundary_type: str = "UNKNOWN"
+    standalone_phrase: bool = False
+    line_isolation: bool = False
+    surrounding_text_length: int = 0
+    near_html_signal: bool = False
+    near_css_signal: bool = False
+    near_javascript_signal: bool = False
+    signal_distance: dict[str, int] = field(default_factory=dict)
+    review_ranking: str = "LOW_REVIEW"
 
     @property
     def identity(self) -> tuple[str, str, int | None, int | None]:
@@ -157,6 +180,7 @@ def _prepare_occurrences(candidates: list[_Candidate], image_size: int,
                     end > image_size or end - start > MAX_OCCURRENCE_SPAN):
                 occurrence.classification = "READ_FAILED"
                 occurrence.reason_codes.add("READ_FAILURE")
+                occurrence.review_ranking = "REJECTED"
                 continue
             context_start = max(0, start - context_bytes)
             context_start -= context_start % 2
@@ -165,6 +189,8 @@ def _prepare_occurrences(candidates: list[_Candidate], image_size: int,
                 context_end += 1
             occurrence.context_start = context_start
             occurrence.context_end = context_end
+            occurrence.at_image_start = start == 0
+            occurrence.at_image_end = end == image_size
             valid.append(occurrence)
     return valid
 
@@ -206,82 +232,243 @@ def _density(occurrences: list[_Occurrence]) -> None:
         occurrence.overlapping_count = sum(distance == 0 for distance in distances)
         occurrence.local_density = round(
             (occurrence.nearby_count + 1) / (2 * DENSITY_RADIUS / 1024), 6)
-        if occurrence.overlapping_count:
-            occurrence.reason_codes.add("OVERLAPPING_MNEMONIC_CANDIDATES")
-        if occurrence.nearby_count >= 4 or occurrence.overlapping_count:
+        if occurrence.nearby_count >= 4:
             occurrence.reason_codes.add("HIGH_LOCAL_MNEMONIC_DENSITY")
 
 
-def _wordlist_metrics(text: str, words: frozenset[str]) -> tuple[int, int, int]:
+def _dictionary_count(text: str, words: frozenset[str]) -> int:
+    return sum(electrum_normalize(match.group(0)) in words
+               for match in _TOKEN.finditer(text))
+
+
+def _contiguous_before(text: str, words: frozenset[str]) -> int:
     matches = list(_TOKEN.finditer(text))
-    total_members = longest_run = run = 0
-    previous_end: int | None = None
+    cursor = len(text)
+    count = 0
+    for match in reversed(matches):
+        separator = text[match.end():cursor]
+        if not separator or any(character not in " \t" for character in separator):
+            break
+        if electrum_normalize(match.group(0)) not in words:
+            break
+        count += 1
+        cursor = match.start()
+    return count
+
+
+def _contiguous_after(text: str, words: frozenset[str]) -> int:
+    cursor = 0
+    count = 0
+    for match in _TOKEN.finditer(text):
+        separator = text[cursor:match.start()]
+        if not separator or any(character not in " \t" for character in separator):
+            break
+        if electrum_normalize(match.group(0)) not in words:
+            break
+        count += 1
+        cursor = match.end()
+    return count
+
+
+def _left_boundary(text: str, at_image_start: bool) -> str:
+    if not text:
+        return "BEGINNING_OF_IMAGE" if at_image_start else "CONTEXT_LIMIT"
+    stripped = text.rstrip(" \t")
+    if not stripped:
+        return "BEGINNING_OF_IMAGE" if at_image_start else "WHITESPACE"
+    character = stripped[-1]
+    if character in "\r\n":
+        return "NEWLINE"
+    if character == "\x00":
+        return "NUL"
+    if character in "\"'":
+        return "QUOTE"
+    if character in ":;,=()[]{}<>":
+        return "DELIMITER"
+    if character in ".!?":
+        return "PUNCTUATION"
+    return "TEXT"
+
+
+def _right_boundary(text: str, at_image_end: bool) -> str:
+    if not text:
+        return "END_OF_IMAGE" if at_image_end else "CONTEXT_LIMIT"
+    stripped = text.lstrip(" \t")
+    if not stripped:
+        return "END_OF_IMAGE" if at_image_end else "WHITESPACE"
+    character = stripped[0]
+    if character in "\r\n":
+        return "NEWLINE"
+    if character == "\x00":
+        return "NUL"
+    if character in "\"'":
+        return "QUOTE"
+    if character in ":;,=()[]{}<>":
+        return "DELIMITER"
+    if character in ".!?":
+        return "PUNCTUATION"
+    return "TEXT"
+
+
+def _line_isolation(before: str, after: str) -> bool:
+    left = re.split(r"[\r\n\x00]", before)[-1].strip(" \t")
+    right = re.split(r"[\r\n\x00]", after)[0].strip(" \t")
+    left_ok = not left or bool(re.fullmatch(
+        r"(?i)(?:electrum\s+)?(?:seed|mnemonic)\s*[:=]?\s*[\"']?", left))
+    right_ok = not right or bool(re.fullmatch(r"[\"'.,;:)}\]>]*", right))
+    return left_ok and right_ok
+
+
+def _match_distance(patterns: Sequence[str] | re.Pattern[str], text: str,
+                    seed_start: int, seed_end: int, byte_width: int) -> int | None:
+    if isinstance(patterns, re.Pattern):
+        matches = patterns.finditer(text)
+    else:
+        expression = re.compile("|".join(re.escape(item) for item in patterns))
+        matches = expression.finditer(text)
+    distances = []
     for match in matches:
-        normalized = electrum_normalize(match.group(0))
-        member = normalized in words
-        separator = "" if previous_end is None else text[previous_end:match.start()]
-        if member:
-            total_members += 1
-            run = run + 1 if previous_end is not None and separator.isspace() else 1
-            longest_run = max(longest_run, run)
+        if match.end() <= seed_start:
+            distance = seed_start - match.end()
+        elif match.start() >= seed_end:
+            distance = match.start() - seed_end
         else:
-            run = 0
-        previous_end = match.end()
-    return total_members, longest_run, len(matches)
+            distance = 0
+        distances.append(distance * byte_width)
+    return min(distances) if distances else None
 
 
 def _analyze_context(data: bytes, occurrence: _Occurrence,
                      wordlist: frozenset[str]) -> None:
-    reasons = set(occurrence.reason_codes)
-    artifacts: set[str] = set()
-    max_wordlist_members = max_wordlist_run = max_tokens = 0
-    for encoding in _ENCODINGS:
-        text = data.decode(encoding, errors="ignore").casefold()
-        for keyword in _KEYWORDS:
-            if re.search(rf"(?<![\w]){re.escape(keyword)}(?![\w])", text):
-                artifacts.add(keyword)
-        if any(marker in text for marker in _HTML_MARKERS):
-            reasons.add("HTML_CONTEXT")
-        if _JAVASCRIPT_PATTERN.search(text):
-            reasons.add("JAVASCRIPT_CONTEXT")
-        css_property = bool(_CSS_PROPERTY_PATTERN.search(text))
-        css_selector = bool(_CSS_SELECTOR_PATTERN.search(text))
-        if css_property or css_selector or (
-                text.count(";") >= 4 and text.count("{") + text.count("}") >= 2):
-            reasons.add("CSS_CONTEXT")
-        if any(marker in text for marker in _DOCUMENTATION_MARKERS):
-            reasons.add("DOCUMENTATION_CONTEXT")
-        members, longest, tokens = _wordlist_metrics(text, wordlist)
-        max_wordlist_members = max(max_wordlist_members, members)
-        max_wordlist_run = max(max_wordlist_run, longest)
-        max_tokens = max(max_tokens, tokens)
+    assert occurrence.context_start is not None
+    assert occurrence.physical_start is not None and occurrence.physical_end is not None
+    encoding = occurrence.encoding if occurrence.encoding in _ENCODINGS else "utf-8"
+    seed_start_bytes = occurrence.physical_start - occurrence.context_start
+    seed_end_bytes = occurrence.physical_end - occurrence.context_start
+    before = data[:seed_start_bytes].decode(encoding, errors="ignore").casefold()
+    seed = data[seed_start_bytes:seed_end_bytes].decode(
+        encoding, errors="ignore").casefold()
+    after = data[seed_end_bytes:].decode(encoding, errors="ignore").casefold()
+    text = before + seed + after
+    seed_start = len(before)
+    seed_end = seed_start + len(seed)
+    byte_width = 2 if encoding.startswith("utf-16") else 1
 
-    if max_wordlist_run >= 24 or (
-            max_wordlist_members >= 48 and max_tokens and
-            max_wordlist_members / max_tokens >= 0.75):
-        reasons.add("WORDLIST_CONTEXT")
-    if "wallet_type" in artifacts:
+    occurrence.preceding_dictionary_word_count = _dictionary_count(before, wordlist)
+    occurrence.following_dictionary_word_count = _dictionary_count(after, wordlist)
+    occurrence.contiguous_dictionary_words_before = _contiguous_before(before, wordlist)
+    occurrence.contiguous_dictionary_words_after = _contiguous_after(after, wordlist)
+    occurrence.total_contiguous_dictionary_run_length = (
+        occurrence.contiguous_dictionary_words_before + occurrence.word_count +
+        occurrence.contiguous_dictionary_words_after)
+    occurrence.left_boundary_type = _left_boundary(before, occurrence.at_image_start)
+    occurrence.right_boundary_type = _right_boundary(after, occurrence.at_image_end)
+    left_strong = occurrence.left_boundary_type in _STRONG_BOUNDARIES
+    right_strong = occurrence.right_boundary_type in _STRONG_BOUNDARIES
+    occurrence.line_isolation = _line_isolation(before, after)
+    occurrence.standalone_phrase = (
+        left_strong and right_strong and
+        occurrence.total_contiguous_dictionary_run_length == occurrence.word_count)
+    occurrence.surrounding_text_length = len(before) + len(after)
+
+    reasons = set(occurrence.reason_codes)
+    if occurrence.standalone_phrase:
+        reasons.add("STANDALONE_MNEMONIC_PHRASE")
+    if left_strong:
+        reasons.add("STRONG_LEFT_BOUNDARY")
+    if right_strong:
+        reasons.add("STRONG_RIGHT_BOUNDARY")
+    if occurrence.line_isolation:
+        reasons.add("ISOLATED_TEXT_LINE")
+    artifacts: set[str] = set()
+    keyword_distances: dict[str, int] = {}
+    for keyword in _KEYWORDS:
+        pattern = re.compile(rf"(?<![\w]){re.escape(keyword)}(?![\w])")
+        distance = _match_distance(pattern, text, seed_start, seed_end, byte_width)
+        if distance is not None:
+            artifacts.add(keyword)
+            keyword_distances[keyword] = distance
+
+    category_patterns: tuple[tuple[str, Sequence[str] | re.Pattern[str]], ...] = (
+        ("html", _HTML_MARKERS), ("css", re.compile(
+            rf"{_CSS_PROPERTY_PATTERN.pattern}|{_CSS_SELECTOR_PATTERN.pattern}")),
+        ("javascript", _JAVASCRIPT_PATTERN),
+        ("example_or_test", _DOCUMENTATION_MARKERS),
+    )
+    for name, patterns in category_patterns:
+        distance = _match_distance(patterns, text, seed_start, seed_end, byte_width)
+        if distance is not None:
+            occurrence.signal_distance[name] = distance
+    occurrence.near_html_signal = occurrence.signal_distance.get(
+        "html", LOCAL_SIGNAL_RADIUS + 1) <= LOCAL_SIGNAL_RADIUS
+    occurrence.near_css_signal = occurrence.signal_distance.get(
+        "css", LOCAL_SIGNAL_RADIUS + 1) <= LOCAL_SIGNAL_RADIUS
+    occurrence.near_javascript_signal = occurrence.signal_distance.get(
+        "javascript", LOCAL_SIGNAL_RADIUS + 1) <= LOCAL_SIGNAL_RADIUS
+    local_example = occurrence.signal_distance.get(
+        "example_or_test", LOCAL_SIGNAL_RADIUS + 1) <= LOCAL_SIGNAL_RADIUS
+    if occurrence.near_html_signal:
+        reasons.add("LOCAL_HTML_CONTEXT")
+    if occurrence.near_css_signal:
+        reasons.add("LOCAL_CSS_CONTEXT")
+    if occurrence.near_javascript_signal:
+        reasons.add("LOCAL_JAVASCRIPT_CONTEXT")
+    if local_example:
+        reasons.add("EXAMPLE_OR_TEST_CONTEXT")
+
+    local_artifacts = {name for name, distance in keyword_distances.items()
+                       if distance <= WALLET_SIGNAL_RADIUS}
+    if "wallet_type" in local_artifacts:
         reasons.add("ELECTRUM_WALLET_TYPE_SIGNAL")
-    if "keystore" in artifacts:
+    if "keystore" in local_artifacts:
         reasons.add("ELECTRUM_KEYSTORE_SIGNAL")
-    if {"master_public_key", "master_public_keys", "xpub", "xprv"} & artifacts:
+    if {"master_public_key", "master_public_keys", "xpub", "xprv"} & local_artifacts:
         reasons.add("ELECTRUM_MASTER_PUBLIC_KEY_SIGNAL")
-    if {"seed_version", "seed_type"} & artifacts:
+    if {"seed_version", "seed_type"} & local_artifacts:
         reasons.add("ELECTRUM_SEED_METADATA_SIGNAL")
-    if ({"accounts", "receiving", "change"} & artifacts and
-            ("electrum" in artifacts or reasons & _CORE_ELECTRUM_REASONS)):
+    if ({"accounts", "receiving", "change"} & local_artifacts and
+            ("electrum" in local_artifacts or reasons & _CORE_ELECTRUM_REASONS)):
         reasons.add("ELECTRUM_WALLET_STRUCTURE_SIGNAL")
 
-    false_positive = bool(reasons & _FALSE_POSITIVE_REASONS)
+    adjacent_dictionary_words = (
+        occurrence.contiguous_dictionary_words_before +
+        occurrence.contiguous_dictionary_words_after)
+    long_wordlist = (occurrence.total_contiguous_dictionary_run_length >= 24 and
+                     adjacent_dictionary_words >= 8)
+    if long_wordlist:
+        reasons.update({"LONG_WORDLIST_RUN", "MNEMONIC_EMBEDDED_IN_WORDLIST"})
+    sliding_windows = occurrence.overlapping_count > 0 and adjacent_dictionary_words > 0
+    if sliding_windows:
+        reasons.add("SLIDING_WINDOW_PATTERN")
+
+    before_seed = text[:seed_start]
+    inside_script = before_seed.rfind("<script") > before_seed.rfind("</script>")
+    inside_style = before_seed.rfind("<style") > before_seed.rfind("</style>")
+    near_code = occurrence.near_javascript_signal or occurrence.near_css_signal
+    code_embedded = inside_script or inside_style or (
+        near_code and min((occurrence.signal_distance.get("javascript", 10**9),
+                           occurrence.signal_distance.get("css", 10**9))) <= 512 and
+        not occurrence.line_isolation)
+    if code_embedded:
+        reasons.add("MNEMONIC_EMBEDDED_IN_CODE")
+
     core_count = len(reasons & _CORE_ELECTRUM_REASONS)
-    if false_positive:
+    strong_false_positive = long_wordlist or sliding_windows or local_example or code_embedded
+    if strong_false_positive:
         occurrence.classification = "TEXTUAL_FALSE_POSITIVE"
+        occurrence.review_ranking = "REJECTED"
     elif core_count >= 2:
-        occurrence.classification = "ELECTRUM_CONTEXT_CONFIRMED"
+        occurrence.classification = "ELECTRUM_WALLET_CONTEXT_CONFIRMED"
+        occurrence.review_ranking = "VERY_HIGH_REVIEW"
+    elif occurrence.standalone_phrase or (
+            left_strong and right_strong and occurrence.line_isolation):
+        occurrence.classification = "PLAINTEXT_SEED_CANDIDATE"
+        occurrence.review_ranking = "HIGH_REVIEW" if left_strong and right_strong else (
+            "MEDIUM_REVIEW")
     else:
         occurrence.classification = "INCONCLUSIVE"
-        reasons.add("NO_ELECTRUM_CONTEXT" if core_count == 0 else
-                    "INSUFFICIENT_ELECTRUM_CONTEXT")
+        occurrence.review_ranking = "LOW_REVIEW"
+        reasons.add("NO_STRONG_CONTEXT")
     occurrence.reason_codes = reasons
     occurrence.artifacts = artifacts
 
@@ -299,6 +486,7 @@ def _read_windows(stream: BinaryIO, windows: list[_Window],
             for occurrence in window.occurrences:
                 occurrence.classification = "READ_FAILED"
                 occurrence.reason_codes.add("READ_FAILURE")
+                occurrence.review_ranking = "REJECTED"
             continue
         windows_read += 1
         bytes_read += len(data)
@@ -319,6 +507,7 @@ def _occurrence_dict(occurrence: _Occurrence) -> dict[str, object]:
         "encoding": occurrence.encoding,
         "word_count": occurrence.word_count,
         "classification": occurrence.classification,
+        "review_ranking": occurrence.review_ranking,
         "reason_codes": sorted(occurrence.reason_codes),
         "detected_artifacts": sorted(occurrence.artifacts),
         "context_bytes_requested": (
@@ -328,6 +517,21 @@ def _occurrence_dict(occurrence: _Occurrence) -> dict[str, object]:
         "nearest_candidate_distance": occurrence.nearest_distance,
         "overlapping_candidate_count": occurrence.overlapping_count,
         "local_candidate_density": occurrence.local_density,
+        "preceding_dictionary_word_count": occurrence.preceding_dictionary_word_count,
+        "following_dictionary_word_count": occurrence.following_dictionary_word_count,
+        "contiguous_dictionary_words_before": occurrence.contiguous_dictionary_words_before,
+        "contiguous_dictionary_words_after": occurrence.contiguous_dictionary_words_after,
+        "total_contiguous_dictionary_run_length": (
+            occurrence.total_contiguous_dictionary_run_length),
+        "left_boundary_type": occurrence.left_boundary_type,
+        "right_boundary_type": occurrence.right_boundary_type,
+        "standalone_phrase": occurrence.standalone_phrase,
+        "line_isolation": occurrence.line_isolation,
+        "surrounding_text_length": occurrence.surrounding_text_length,
+        "near_html_signal": occurrence.near_html_signal,
+        "near_css_signal": occurrence.near_css_signal,
+        "near_javascript_signal": occurrence.near_javascript_signal,
+        "signal_distance": dict(sorted(occurrence.signal_distance.items())),
     }
 
 
@@ -335,14 +539,18 @@ def _candidate_dict(candidate: _Candidate) -> dict[str, object]:
     classes = Counter(item.classification for item in candidate.occurrences)
     if len(classes) == 1:
         classification = next(iter(classes))
+        ranking = min((item.review_ranking for item in candidate.occurrences),
+                      key=_RANKING_ORDER.__getitem__)
     else:
         classification = "INCONCLUSIVE"
+        ranking = "LOW_REVIEW"
     return {
         "candidate_id": candidate.candidate_id,
         "fingerprint": candidate.fingerprint,
         "mnemonic_standard": "ELECTRUM",
         "revalidation_priority": "HIGH_REVIEW",
         "classification": classification,
+        "review_ranking": ranking,
         "occurrence_classification_distribution": dict(sorted(classes.items())),
         "occurrences": [_occurrence_dict(item) for item in candidate.occurrences],
     }
@@ -376,17 +584,24 @@ def analyze_report(report: dict[str, object], image: str | Path, *,
     results = [_candidate_dict(candidate) for candidate in candidates]
     occurrence_classes = Counter(item.classification for item in occurrences)
     candidate_classes = Counter(item["classification"] for item in results)
+    rankings = Counter(item.review_ranking for item in occurrences)
+    candidate_rankings = Counter(item["review_ranking"] for item in results)
     reasons = Counter(reason for item in occurrences for reason in item.reason_codes)
     summary = {
         "input_candidates": input_candidates,
         "selected_candidates": len(candidates),
         "selected_occurrences": len(occurrences),
-        "confirmed_candidates": candidate_classes["ELECTRUM_CONTEXT_CONFIRMED"],
-        "false_positive_candidates": candidate_classes["TEXTUAL_FALSE_POSITIVE"],
+        "wallet_confirmed_candidates": candidate_classes[
+            "ELECTRUM_WALLET_CONTEXT_CONFIRMED"],
+        "plaintext_seed_candidates": candidate_classes["PLAINTEXT_SEED_CANDIDATE"],
+        "textual_false_positive_candidates": candidate_classes["TEXTUAL_FALSE_POSITIVE"],
         "inconclusive_candidates": candidate_classes["INCONCLUSIVE"],
         "read_failed_candidates": candidate_classes["READ_FAILED"],
-        "confirmed_occurrences": occurrence_classes["ELECTRUM_CONTEXT_CONFIRMED"],
-        "false_positive_occurrences": occurrence_classes["TEXTUAL_FALSE_POSITIVE"],
+        "wallet_confirmed_occurrences": occurrence_classes[
+            "ELECTRUM_WALLET_CONTEXT_CONFIRMED"],
+        "plaintext_seed_occurrences": occurrence_classes["PLAINTEXT_SEED_CANDIDATE"],
+        "textual_false_positive_occurrences": occurrence_classes[
+            "TEXTUAL_FALSE_POSITIVE"],
         "inconclusive_occurrences": occurrence_classes["INCONCLUSIVE"],
         "read_failures": occurrence_classes["READ_FAILED"],
         "io_windows_planned": len(windows),
@@ -394,6 +609,8 @@ def analyze_report(report: dict[str, object], image: str | Path, *,
         "image_bytes_read": bytes_read,
         "candidate_classification_distribution": dict(sorted(candidate_classes.items())),
         "occurrence_classification_distribution": dict(sorted(occurrence_classes.items())),
+        "ranking_distribution": dict(sorted(rankings.items())),
+        "candidate_ranking_distribution": dict(sorted(candidate_rankings.items())),
         "reason_code_distribution": dict(sorted(reasons.items())),
     }
     return {
@@ -405,6 +622,8 @@ def analyze_report(report: dict[str, object], image: str | Path, *,
             "context_bytes": context_bytes,
             "max_window_bytes": max_window_bytes,
             "density_radius_bytes": DENSITY_RADIUS,
+            "local_signal_radius_bytes": LOCAL_SIGNAL_RADIUS,
+            "wallet_signal_radius_bytes": WALLET_SIGNAL_RADIUS,
         },
         "source": {"image": str(image_path), "size": image_size},
         "summary": summary,
@@ -461,8 +680,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary = result["summary"]
     print(f"selected candidates/occurrences: "
           f"{summary['selected_candidates']}/{summary['selected_occurrences']}")
-    print(f"confirmed/false-positive/inconclusive occurrences: "
-          f"{summary['confirmed_occurrences']}/{summary['false_positive_occurrences']}/"
+    print(f"wallet/plaintext/false-positive/inconclusive occurrences: "
+          f"{summary['wallet_confirmed_occurrences']}/"
+          f"{summary['plaintext_seed_occurrences']}/"
+          f"{summary['textual_false_positive_occurrences']}/"
           f"{summary['inconclusive_occurrences']}")
     print(f"image bytes read: {summary['image_bytes_read']}")
     print(f"safe report: {arguments.output.resolve()}")
