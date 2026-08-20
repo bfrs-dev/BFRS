@@ -17,13 +17,14 @@ from bfrs.recovery.mnemonic.electrum_seed_validator import ElectrumSeedValidator
 from bfrs.recovery.mnemonic.mnemonic_normalizer import electrum_normalize
 
 
-FORMAT = "BFRS_ELECTRUM_CONTEXT_ANALYSIS_V2"
+FORMAT = "BFRS_ELECTRUM_CONTEXT_ANALYSIS_V2_1"
 DEFAULT_CONTEXT_BYTES = 64 * 1024
 DEFAULT_MAX_WINDOW_BYTES = 1024 * 1024
 MAX_OCCURRENCE_SPAN = 64 * 1024
 DENSITY_RADIUS = 8 * 1024
 LOCAL_SIGNAL_RADIUS = 2 * 1024
 WALLET_SIGNAL_RADIUS = 4 * 1024
+NEARBY_LABEL_RADIUS = 512
 _TOKEN = re.compile(r"[^\W\d_]+", re.UNICODE)
 _ENCODINGS = ("utf-8", "utf-16-le", "utf-16-be")
 
@@ -32,6 +33,15 @@ _KEYWORDS = (
     "master_public_keys", "xpub", "xprv", "accounts", "receiving", "change",
     "electrum", "seed_type",
 )
+_NEARBY_LABELS = (
+    "seed", "mnemonic", "recovery", "recovery phrase", "wallet", "bitcoin",
+    "electrum", "backup", "password", "passphrase", "private", "key",
+    "restore", "words",
+)
+_POSITIVE_LABELS = {
+    "seed", "mnemonic", "recovery", "recovery phrase", "wallet", "electrum",
+    "backup", "restore",
+}
 _HTML_MARKERS = ("<!doctype", "<html", "<script", "<style", "</body>", "</html>")
 _JAVASCRIPT_PATTERN = re.compile(r"\b(?:function|var|const|let)\b|document\.|window\.")
 _CSS_PROPERTY_PATTERN = re.compile(
@@ -92,6 +102,22 @@ class _Occurrence:
     near_javascript_signal: bool = False
     signal_distance: dict[str, int] = field(default_factory=dict)
     review_ranking: str = "LOW_REVIEW"
+    left_immediate_char_class: str = "BINARY"
+    right_immediate_char_class: str = "BINARY"
+    bytes_to_previous_newline: int | None = None
+    bytes_to_next_newline: int | None = None
+    bytes_to_previous_nul: int | None = None
+    bytes_to_next_nul: int | None = None
+    line_length_bytes: int = 0
+    phrase_starts_line: bool = False
+    phrase_ends_line: bool = False
+    phrase_is_whole_line: bool = False
+    nul_delimited: bool = False
+    quote_delimited: bool = False
+    key_value_like_boundary: bool = False
+    nearby_labels: list[dict[str, object]] = field(default_factory=list)
+    local_cluster_id: str | None = None
+    nearby_selected_occurrence_count: int = 0
 
     @property
     def identity(self) -> tuple[str, str, int | None, int | None]:
@@ -236,6 +262,51 @@ def _density(occurrences: list[_Occurrence]) -> None:
             occurrence.reason_codes.add("HIGH_LOCAL_MNEMONIC_DENSITY")
 
 
+def _assign_clusters(occurrences: list[_Occurrence]) -> list[dict[str, object]]:
+    ordered = sorted(occurrences, key=lambda item: (
+        item.physical_start, item.physical_end, item.fingerprint, item.candidate_id))
+    groups: list[list[_Occurrence]] = []
+    for occurrence in ordered:
+        assert occurrence.physical_start is not None and occurrence.physical_end is not None
+        group_end = (max(int(item.physical_end) for item in groups[-1])
+                     if groups else None)
+        if (group_end is not None and
+                occurrence.physical_start - group_end <= DENSITY_RADIUS):
+            groups[-1].append(occurrence)
+        else:
+            groups.append([occurrence])
+    clusters = []
+    for number, group in enumerate(groups, start=1):
+        cluster_id = f"cluster-{number:04d}"
+        for occurrence in group:
+            occurrence.local_cluster_id = cluster_id
+            occurrence.nearby_selected_occurrence_count = len(group) - 1
+        starts = [item.physical_start for item in group]
+        ends = [item.physical_end for item in group]
+        assert all(value is not None for value in starts + ends)
+        distances = [abs(int(right) - int(left))
+                     for index, left in enumerate(starts)
+                     for right in starts[index + 1:]]
+        distance_summary = {
+            "pair_count": len(distances),
+            "minimum_bytes": min(distances) if distances else None,
+            "maximum_bytes": max(distances) if distances else None,
+            "mean_bytes": (round(sum(distances) / len(distances), 3)
+                           if distances else None),
+        }
+        cluster_start = min(int(value) for value in starts)
+        cluster_end = max(int(value) for value in ends)
+        clusters.append({
+            "cluster_id": cluster_id,
+            "cluster_start": cluster_start,
+            "cluster_end": cluster_end,
+            "cluster_span_bytes": cluster_end - cluster_start,
+            "cluster_occurrence_count": len(group),
+            "pairwise_distance_summary": distance_summary,
+        })
+    return clusters
+
+
 def _dictionary_count(text: str, words: frozenset[str]) -> int:
     return sum(electrum_normalize(match.group(0)) in words
                for match in _TOKEN.finditer(text))
@@ -319,6 +390,120 @@ def _line_isolation(before: str, after: str) -> bool:
     return left_ok and right_ok
 
 
+def _immediate_char_class(text: str, *, left: bool, at_image_edge: bool) -> str:
+    if not text:
+        if at_image_edge:
+            return "BOF" if left else "EOF"
+        return "BINARY"
+    if (left and text.endswith("\r\n")) or (not left and text.startswith("\r\n")):
+        return "CRLF"
+    character = text[-1] if left else text[0]
+    if character in "\r\n":
+        return "NEWLINE"
+    if character == "\x00":
+        return "NUL"
+    if character in " \t":
+        return "WHITESPACE"
+    if character == ":":
+        return "COLON"
+    if character == "=":
+        return "EQUALS"
+    if character == '"':
+        return "QUOTE"
+    if character == "'":
+        return "APOSTROPHE"
+    if character == ",":
+        return "COMMA"
+    if character == ";":
+        return "SEMICOLON"
+    if character in "[]{}<>":
+        return "BRACKET"
+    if character in "()":
+        return "PAREN"
+    if character.isalnum():
+        return "ALPHANUMERIC"
+    if character.isprintable():
+        return "OTHER_PRINTABLE"
+    return "BINARY"
+
+
+def _previous_distance(text: str, characters: str, byte_width: int) -> int | None:
+    index = max((text.rfind(character) for character in characters), default=-1)
+    return (len(text) - index - 1) * byte_width if index >= 0 else None
+
+
+def _next_distance(text: str, characters: str, byte_width: int) -> int | None:
+    indexes = [index for character in characters
+               if (index := text.find(character)) >= 0]
+    return min(indexes) * byte_width if indexes else None
+
+
+def _nearby_labels(before: str, after: str, byte_width: int
+                   ) -> list[dict[str, object]]:
+    radius_chars = max(1, NEARBY_LABEL_RADIUS // byte_width)
+    nearby_before = before[-radius_chars:]
+    nearby_after = after[:radius_chars]
+    found = []
+    for label in _NEARBY_LABELS:
+        pattern = re.compile(rf"(?<![\w]){re.escape(label)}(?![\w])")
+        choices = []
+        for match in pattern.finditer(nearby_before):
+            choices.append(((len(nearby_before) - match.end()) * byte_width, "BEFORE"))
+        for match in pattern.finditer(nearby_after):
+            choices.append((match.start() * byte_width, "AFTER"))
+        if choices:
+            distance, direction = min(choices, key=lambda item: (item[0], item[1]))
+            found.append({"label": label, "distance": distance, "direction": direction})
+    return sorted(found, key=lambda item: (
+        item["distance"], item["label"], item["direction"]))
+
+
+def _boundary_details(before: str, seed: str, after: str,
+                      occurrence: _Occurrence, byte_width: int) -> tuple[bool, bool]:
+    occurrence.left_immediate_char_class = _immediate_char_class(
+        before, left=True, at_image_edge=occurrence.at_image_start)
+    occurrence.right_immediate_char_class = _immediate_char_class(
+        after, left=False, at_image_edge=occurrence.at_image_end)
+    occurrence.bytes_to_previous_newline = _previous_distance(before, "\r\n", byte_width)
+    occurrence.bytes_to_next_newline = _next_distance(after, "\r\n", byte_width)
+    occurrence.bytes_to_previous_nul = _previous_distance(before, "\x00", byte_width)
+    occurrence.bytes_to_next_nul = _next_distance(after, "\x00", byte_width)
+
+    previous_newline = max(before.rfind("\r"), before.rfind("\n"))
+    next_newlines = [index for marker in "\r\n"
+                     if (index := after.find(marker)) >= 0]
+    next_newline = min(next_newlines) if next_newlines else len(after)
+    left_line = before[previous_newline + 1:]
+    right_line = after[:next_newline]
+    occurrence.line_length_bytes = (
+        len(left_line) + len(seed) + len(right_line)) * byte_width
+    occurrence.phrase_starts_line = not left_line.strip(" \t")
+    occurrence.phrase_ends_line = not right_line.strip(" \t")
+    occurrence.phrase_is_whole_line = (
+        occurrence.phrase_starts_line and occurrence.phrase_ends_line)
+    occurrence.nul_delimited = (
+        occurrence.left_immediate_char_class == "NUL" and
+        occurrence.right_immediate_char_class == "NUL")
+    occurrence.quote_delimited = (
+        occurrence.left_immediate_char_class in {"QUOTE", "APOSTROPHE"} and
+        occurrence.right_immediate_char_class in {"QUOTE", "APOSTROPHE"})
+    occurrence.key_value_like_boundary = bool(re.search(
+        r"(?i)[a-z_][\w -]{0,63}\s*[:=]\s*[\"']?\s*$", left_line))
+    occurrence.nearby_labels = _nearby_labels(before, after, byte_width)
+    positive_before = any(
+        item["label"] in _POSITIVE_LABELS and item["direction"] == "BEFORE"
+        for item in occurrence.nearby_labels)
+    label_value = positive_before and occurrence.key_value_like_boundary
+
+    left_words = len(_TOKEN.findall(left_line))
+    right_words = len(_TOKEN.findall(right_line))
+    prose_embedded = (
+        left_words >= 3 and right_words >= 3 and not occurrence.phrase_is_whole_line and
+        not occurrence.nul_delimited and not occurrence.quote_delimited and
+        not occurrence.key_value_like_boundary)
+    return label_value, prose_embedded
+
+
 def _match_distance(patterns: Sequence[str] | re.Pattern[str], text: str,
                     seed_start: int, seed_end: int, byte_width: int) -> int | None:
     if isinstance(patterns, re.Pattern):
@@ -353,6 +538,8 @@ def _analyze_context(data: bytes, occurrence: _Occurrence,
     seed_start = len(before)
     seed_end = seed_start + len(seed)
     byte_width = 2 if encoding.startswith("utf-16") else 1
+    label_value, prose_embedded = _boundary_details(
+        before, seed, after, occurrence, byte_width)
 
     occurrence.preceding_dictionary_word_count = _dictionary_count(before, wordlist)
     occurrence.following_dictionary_word_count = _dictionary_count(after, wordlist)
@@ -380,6 +567,27 @@ def _analyze_context(data: bytes, occurrence: _Occurrence,
         reasons.add("STRONG_RIGHT_BOUNDARY")
     if occurrence.line_isolation:
         reasons.add("ISOLATED_TEXT_LINE")
+    if occurrence.phrase_is_whole_line:
+        reasons.add("WHOLE_LINE_PHRASE")
+    if occurrence.nul_delimited:
+        reasons.add("NUL_DELIMITED_STRING")
+    if occurrence.quote_delimited:
+        reasons.add("QUOTED_VALUE_PATTERN")
+    if occurrence.key_value_like_boundary:
+        reasons.add("KEY_VALUE_PATTERN")
+    if label_value:
+        reasons.add("LABEL_VALUE_PATTERN")
+    label_reason_codes = {
+        "seed": "NEARBY_SEED_LABEL",
+        "mnemonic": "NEARBY_MNEMONIC_LABEL",
+        "wallet": "NEARBY_WALLET_LABEL",
+        "electrum": "NEARBY_ELECTRUM_LABEL",
+        "backup": "NEARBY_BACKUP_LABEL",
+    }
+    for item in occurrence.nearby_labels:
+        reason = label_reason_codes.get(str(item["label"]))
+        if reason is not None:
+            reasons.add(reason)
     artifacts: set[str] = set()
     keyword_distances: dict[str, int] = {}
     for keyword in _KEYWORDS:
@@ -453,22 +661,35 @@ def _analyze_context(data: bytes, occurrence: _Occurrence,
         reasons.add("MNEMONIC_EMBEDDED_IN_CODE")
 
     core_count = len(reasons & _CORE_ELECTRUM_REASONS)
-    strong_false_positive = long_wordlist or sliding_windows or local_example or code_embedded
+    if prose_embedded:
+        reasons.add("PROSE_EMBEDDED_PHRASE")
+    strong_false_positive = (
+        long_wordlist or sliding_windows or local_example or code_embedded or
+        prose_embedded)
+    exact_dictionary_run = (
+        occurrence.total_contiguous_dictionary_run_length == occurrence.word_count and
+        adjacent_dictionary_words == 0)
+    positive_nearby_label = any(
+        item["label"] in _POSITIVE_LABELS for item in occurrence.nearby_labels)
+    plaintext_boundary = (
+        occurrence.phrase_is_whole_line or occurrence.nul_delimited or
+        occurrence.quote_delimited or occurrence.key_value_like_boundary or
+        label_value or occurrence.standalone_phrase or
+        (positive_nearby_label and (left_strong or right_strong)))
     if strong_false_positive:
         occurrence.classification = "TEXTUAL_FALSE_POSITIVE"
         occurrence.review_ranking = "REJECTED"
     elif core_count >= 2:
         occurrence.classification = "ELECTRUM_WALLET_CONTEXT_CONFIRMED"
         occurrence.review_ranking = "VERY_HIGH_REVIEW"
-    elif occurrence.standalone_phrase or (
-            left_strong and right_strong and occurrence.line_isolation):
+    elif exact_dictionary_run and plaintext_boundary:
         occurrence.classification = "PLAINTEXT_SEED_CANDIDATE"
         occurrence.review_ranking = "HIGH_REVIEW" if left_strong and right_strong else (
             "MEDIUM_REVIEW")
     else:
         occurrence.classification = "INCONCLUSIVE"
         occurrence.review_ranking = "LOW_REVIEW"
-        reasons.add("NO_STRONG_CONTEXT")
+        reasons.update({"NO_STRONG_CONTEXT", "WEAK_TEXT_BOUNDARIES"})
     occurrence.reason_codes = reasons
     occurrence.artifacts = artifacts
 
@@ -532,6 +753,23 @@ def _occurrence_dict(occurrence: _Occurrence) -> dict[str, object]:
         "near_css_signal": occurrence.near_css_signal,
         "near_javascript_signal": occurrence.near_javascript_signal,
         "signal_distance": dict(sorted(occurrence.signal_distance.items())),
+        "left_immediate_char_class": occurrence.left_immediate_char_class,
+        "right_immediate_char_class": occurrence.right_immediate_char_class,
+        "bytes_to_previous_newline": occurrence.bytes_to_previous_newline,
+        "bytes_to_next_newline": occurrence.bytes_to_next_newline,
+        "bytes_to_previous_nul": occurrence.bytes_to_previous_nul,
+        "bytes_to_next_nul": occurrence.bytes_to_next_nul,
+        "line_length_bytes": occurrence.line_length_bytes,
+        "phrase_starts_line": occurrence.phrase_starts_line,
+        "phrase_ends_line": occurrence.phrase_ends_line,
+        "phrase_is_whole_line": occurrence.phrase_is_whole_line,
+        "nul_delimited": occurrence.nul_delimited,
+        "quote_delimited": occurrence.quote_delimited,
+        "key_value_like_boundary": occurrence.key_value_like_boundary,
+        "nearby_labels": occurrence.nearby_labels,
+        "local_cluster_id": occurrence.local_cluster_id,
+        "nearby_selected_occurrence_count": (
+            occurrence.nearby_selected_occurrence_count),
     }
 
 
@@ -577,6 +815,7 @@ def analyze_report(report: dict[str, object], image: str | Path, *,
     occurrences = [item for candidate in candidates for item in candidate.occurrences]
     readable = _prepare_occurrences(candidates, image_size, context_bytes)
     _density(readable)
+    clusters = _assign_clusters(readable)
     windows = _plan_windows(readable, max_window_bytes)
     factory = stream_factory or (lambda path: path.open("rb"))
     with factory(image_path) as stream:
@@ -607,6 +846,7 @@ def analyze_report(report: dict[str, object], image: str | Path, *,
         "io_windows_planned": len(windows),
         "io_windows_read": windows_read,
         "image_bytes_read": bytes_read,
+        "cluster_count": len(clusters),
         "candidate_classification_distribution": dict(sorted(candidate_classes.items())),
         "occurrence_classification_distribution": dict(sorted(occurrence_classes.items())),
         "ranking_distribution": dict(sorted(rankings.items())),
@@ -624,9 +864,11 @@ def analyze_report(report: dict[str, object], image: str | Path, *,
             "density_radius_bytes": DENSITY_RADIUS,
             "local_signal_radius_bytes": LOCAL_SIGNAL_RADIUS,
             "wallet_signal_radius_bytes": WALLET_SIGNAL_RADIUS,
+            "nearby_label_radius_bytes": NEARBY_LABEL_RADIUS,
         },
         "source": {"image": str(image_path), "size": image_size},
         "summary": summary,
+        "clusters": clusters,
         "candidates": results,
     }
 

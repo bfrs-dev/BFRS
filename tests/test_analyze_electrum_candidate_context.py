@@ -103,6 +103,8 @@ def test_valid_mnemonic_without_context_is_plaintext_candidate(tmp_path):
     assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
     assert item["left_boundary_type"] == "BEGINNING_OF_IMAGE"
     assert item["right_boundary_type"] == "END_OF_IMAGE"
+    assert item["left_immediate_char_class"] == "BOF"
+    assert item["right_immediate_char_class"] == "EOF"
     assert item["standalone_phrase"] is True
     assert "STANDALONE_MNEMONIC_PHRASE" in item["reason_codes"]
 
@@ -140,6 +142,134 @@ def test_seed_label_is_plaintext_candidate(tmp_path):
     assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
     assert item["left_boundary_type"] == "DELIMITER"
     assert item["line_isolation"] is True
+
+
+@pytest.mark.parametrize("encoding,label,word_count", [
+    ("utf-8", "seed: ", 12),
+    ("utf-16-le", "seed: ", 12),
+    ("utf-16-be", "Electrum seed: ", 13),
+])
+def test_nearby_labels_are_safe_directional_and_support_all_encodings(
+        tmp_path, encoding, label, word_count):
+    phrase = electrum_phrase(word_count)
+    image = (label + phrase + "\n").encode(encoding)
+    start = len(label.encode(encoding))
+    payload = report(candidate(f"label-{encoding}", "ab" * 32, [
+        occurrence(start, start + len(phrase.encode(encoding)),
+                   encoding=encoding, word_count=word_count)]))
+    item = analyze(tmp_path, image, payload)["candidates"][0]["occurrences"][0]
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    labels = {entry["label"]: entry for entry in item["nearby_labels"]}
+    assert labels["seed"]["direction"] == "BEFORE"
+    assert labels["seed"]["distance"] == len(": ".encode(encoding))
+    assert "NEARBY_SEED_LABEL" in item["reason_codes"]
+    if "Electrum" in label:
+        assert labels["electrum"]["direction"] == "BEFORE"
+        assert "NEARBY_ELECTRUM_LABEL" in item["reason_codes"]
+
+
+@pytest.mark.parametrize("wrapper,reason,metric", [
+    (("\x00", "\x00"), "NUL_DELIMITED_STRING", "nul_delimited"),
+    (('"', '"'), "QUOTED_VALUE_PATTERN", "quote_delimited"),
+])
+def test_nul_and_quoted_plaintext_boundaries(tmp_path, wrapper, reason, metric):
+    phrase = electrum_phrase()
+    image = (wrapper[0] + phrase + wrapper[1]).encode("utf-16-le")
+    start = len(wrapper[0].encode("utf-16-le"))
+    payload = report(candidate(reason, "ac" * 32, [occurrence(
+        start, start + len(phrase.encode("utf-16-le")), encoding="utf-16-le")]))
+    item = analyze(tmp_path, image, payload)["candidates"][0]["occurrences"][0]
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    assert item[metric] is True
+    assert reason in item["reason_codes"]
+
+
+def test_key_value_boundary_is_plaintext_candidate(tmp_path):
+    phrase = electrum_phrase()
+    prefix = "backup = "
+    image = (prefix + phrase + "\n").encode()
+    start = len(prefix)
+    payload = report(candidate("key-value", "ad" * 32,
+                               [occurrence(start, start + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload)["candidates"][0]["occurrences"][0]
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    assert item["key_value_like_boundary"] is True
+    assert {"KEY_VALUE_PATTERN", "LABEL_VALUE_PATTERN", "NEARBY_BACKUP_LABEL"} <= set(
+        item["reason_codes"])
+
+
+def test_unclear_short_text_boundaries_remain_inconclusive(tmp_path):
+    phrase = electrum_phrase()
+    prefix = "prefix "
+    suffix = " suffix"
+    image = (prefix + phrase + suffix).encode()
+    start = len(prefix)
+    payload = report(candidate("unclear", "ae" * 32,
+                               [occurrence(start, start + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload)["candidates"][0]["occurrences"][0]
+    assert item["classification"] == "INCONCLUSIVE"
+    assert "WEAK_TEXT_BOUNDARIES" in item["reason_codes"]
+    assert item["total_contiguous_dictionary_run_length"] == 12
+
+
+def test_phrase_clearly_embedded_in_prose_is_false_positive(tmp_path):
+    phrase = electrum_phrase()
+    prefix = "this ordinary sentence clearly contains the phrase "
+    suffix = " among several unrelated words in continuous prose"
+    image = (prefix + phrase + suffix).encode()
+    start = len(prefix)
+    payload = report(candidate("prose", "af" * 32,
+                               [occurrence(start, start + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload)["candidates"][0]["occurrences"][0]
+    assert item["classification"] == "TEXTUAL_FALSE_POSITIVE"
+    assert "PROSE_EMBEDDED_PHRASE" in item["reason_codes"]
+
+
+@pytest.mark.parametrize("left,right,left_class,right_class", [
+    (" ", "\t", "WHITESPACE", "WHITESPACE"),
+    ("\n", "\n", "NEWLINE", "NEWLINE"),
+    ("\r\n", "\r\n", "CRLF", "CRLF"),
+    ("\x00", "\x00", "NUL", "NUL"),
+    (":", "=", "COLON", "EQUALS"),
+    ('"', '"', "QUOTE", "QUOTE"),
+    ("'", "'", "APOSTROPHE", "APOSTROPHE"),
+    (",", ",", "COMMA", "COMMA"),
+    (";", ";", "SEMICOLON", "SEMICOLON"),
+    ("[", "]", "BRACKET", "BRACKET"),
+    ("(", ")", "PAREN", "PAREN"),
+    ("A", "9", "ALPHANUMERIC", "ALPHANUMERIC"),
+    ("@", "@", "OTHER_PRINTABLE", "OTHER_PRINTABLE"),
+    ("\x01", "\x01", "BINARY", "BINARY"),
+])
+def test_immediate_boundary_character_classes(
+        tmp_path, left, right, left_class, right_class):
+    phrase = electrum_phrase()
+    image = (left + phrase + right).encode()
+    start = len(left.encode())
+    payload = report(candidate(f"classes-{left_class}", "b0" * 32, [
+        occurrence(start, start + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload)["candidates"][0]["occurrences"][0]
+    assert item["left_immediate_char_class"] == left_class
+    assert item["right_immediate_char_class"] == right_class
+
+
+def test_whole_line_distance_and_length_metrics_are_encoding_aware(tmp_path):
+    phrase = electrum_phrase()
+    prefix = "header\r\n"
+    suffix = "\r\nfooter"
+    encoding = "utf-16-le"
+    image = (prefix + phrase + suffix).encode(encoding)
+    start = len(prefix.encode(encoding))
+    payload = report(candidate("line-metrics", "b1" * 32, [occurrence(
+        start, start + len(phrase.encode(encoding)), encoding=encoding)]))
+    item = analyze(tmp_path, image, payload)["candidates"][0]["occurrences"][0]
+    assert item["phrase_starts_line"] is True
+    assert item["phrase_ends_line"] is True
+    assert item["phrase_is_whole_line"] is True
+    assert item["bytes_to_previous_newline"] == 0
+    assert item["bytes_to_next_newline"] == 0
+    assert item["line_length_bytes"] == len(phrase.encode(encoding))
+    assert "WHOLE_LINE_PHRASE" in item["reason_codes"]
 
 
 def test_distant_html_css_javascript_do_not_reject_isolated_seed(tmp_path):
@@ -258,10 +388,16 @@ def test_dense_but_separate_seed_lines_are_not_automatically_rejected(tmp_path):
             [occurrence(cursor, cursor + len(line.encode()))]))
         cursor += len(line.encode()) + 1
     result = analyze(tmp_path, text.encode(), report(*candidates))
+    assert result["summary"]["cluster_count"] == 1
+    cluster = result["clusters"][0]
+    assert cluster["cluster_occurrence_count"] == 5
+    assert cluster["pairwise_distance_summary"]["pair_count"] == 10
     for output in result["candidates"]:
         item = output["occurrences"][0]
         assert "HIGH_LOCAL_MNEMONIC_DENSITY" in item["reason_codes"]
         assert item["overlapping_candidate_count"] == 0
+        assert item["local_cluster_id"] == cluster["cluster_id"]
+        assert item["nearby_selected_occurrence_count"] == 4
         assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
 
 

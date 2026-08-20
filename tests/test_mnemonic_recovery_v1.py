@@ -90,13 +90,14 @@ def test_bip39_mixed_wordlists_have_no_common_language():
 
 
 @lru_cache(maxsize=None)
-def electrum_phrase(word_count: int = 12) -> str:
+def electrum_phrase(word_count: int = 12, language: str = "english") -> str:
     validator = ElectrumSeedValidator()
-    words = sorted(validator.wordlists["english"])
+    words = sorted(validator.wordlists[language])
     for number in range(100_000):
-        phrase = " ".join([words[0]] * (word_count - 1) +
+        phrase = " ".join([words[(number // len(words)) % len(words)]] * (word_count - 1) +
                           [words[number % len(words)]])
-        if validator.validate(phrase).status == "ELECTRUM_SEED_VALID":
+        if validator.validate_words(tuple(phrase.split()), normalized=phrase,
+                                    languages=(language,)).status == "ELECTRUM_SEED_VALID":
             return phrase
     raise AssertionError("deterministic Electrum fixture not found")
 
@@ -340,6 +341,143 @@ def test_raw_electrum_v2_encoding_source_span_and_negative(encoding):
     assert not [item for item in rejected.occurrences
                 if item.candidate.mnemonic_standard == "ELECTRUM" and
                 item.candidate.encoding == encoding]
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
+@pytest.mark.parametrize("prefix_text,suffix_text", [
+    ("", ":\x00suffix"),
+    ("\x00binary-marker:", ":\x00suffix"),
+    ("\x00binary-marker:", ""),
+])
+def test_raw_electrum_physical_span_is_exact_and_end_exclusive(
+        encoding, prefix_text, suffix_text):
+    phrase = electrum_phrase()
+    encoded_phrase = phrase.encode(encoding)
+    prefix = prefix_text.encode(encoding)
+    payload = prefix + encoded_phrase + suffix_text.encode(encoding)
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+    result = scanner.scan_bytes(payload)
+    occurrence = next(item for item in result.occurrences
+                      if item.candidate.mnemonic_standard == "ELECTRUM" and
+                      item.candidate.encoding == encoding and
+                      item.secret.reveal() == phrase)
+    candidate = occurrence.candidate
+    assert candidate.physical_start == len(prefix)
+    assert candidate.physical_end == len(prefix) + len(encoded_phrase)
+    assert candidate.physical_end - candidate.physical_start == len(encoded_phrase)
+    slice_bytes = payload[candidate.physical_start:candidate.physical_end]
+    assert slice_bytes == encoded_phrase
+    decoded = slice_bytes.decode(encoding)
+    validation = ElectrumSeedValidator().validate(decoded)
+    assert validation.normalized == occurrence.secret.reveal()
+    assert candidate.fingerprint == scanner._fingerprint(
+        "ELECTRUM", validation.normalized)
+    safe_metrics = {
+        "word_count": candidate.word_count,
+        "encoding": candidate.encoding,
+        "encoded_phrase_length": len(encoded_phrase),
+        "reported_span_length": candidate.physical_end - candidate.physical_start,
+        "lengths_equal": len(encoded_phrase) == (
+            candidate.physical_end - candidate.physical_start),
+    }
+    assert safe_metrics == {
+        "word_count": 12,
+        "encoding": encoding,
+        "encoded_phrase_length": len(encoded_phrase),
+        "reported_span_length": len(encoded_phrase),
+        "lengths_equal": True,
+    }
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+@pytest.mark.parametrize("word_count,expected_length", [(12, 46), (13, 50)])
+def test_compact_chinese_electrum_span_explains_46_and_50_bytes(
+        encoding, word_count, expected_length):
+    phrase = electrum_phrase(word_count, "chinese_simplified")
+    assert all(len(word) == 1 for word in phrase.split())
+    encoded_phrase = phrase.encode(encoding)
+    assert len(encoded_phrase) == expected_length
+    prefix = "\x00marker:".encode(encoding)
+    payload = prefix + encoded_phrase + ":tail".encode(encoding)
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+    result = scanner.scan_bytes(payload)
+    occurrence = next(item for item in result.occurrences
+                      if item.candidate.mnemonic_standard == "ELECTRUM" and
+                      item.candidate.encoding == encoding and
+                      item.candidate.word_count == word_count and
+                      item.secret.reveal() == phrase)
+    candidate = occurrence.candidate
+    assert candidate.language == "chinese_simplified"
+    assert candidate.physical_start == len(prefix)
+    assert candidate.physical_end - candidate.physical_start == expected_length
+    assert payload[candidate.physical_start:candidate.physical_end] == encoded_phrase
+    assert payload[candidate.physical_start:candidate.physical_end].decode(encoding) == phrase
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
+@pytest.mark.parametrize("start", [4050, 8150])
+def test_raw_electrum_span_crosses_ownership_and_overlap_boundaries(
+        tmp_path, encoding, start):
+    phrase = electrum_phrase()
+    encoded_phrase = phrase.encode(encoding)
+    if encoding != "utf-8":
+        start -= start % 2
+    source = tmp_path / f"electrum-boundary-{encoding}-{start}.bin"
+    source.write_bytes(b"\x00" * start + encoded_phrase + "\x00".encode(encoding))
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_path(source)
+    matches = [item for item in result.occurrences
+               if item.candidate.mnemonic_standard == "ELECTRUM" and
+               item.candidate.encoding == encoding and
+               item.secret.reveal() == phrase]
+    assert len(matches) == 1
+    candidate = matches[0].candidate
+    assert candidate.physical_start == start
+    assert candidate.physical_end == start + len(encoded_phrase)
+    raw = source.read_bytes()
+    assert raw[candidate.physical_start:candidate.physical_end] == encoded_phrase
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+def test_raw_electrum_odd_physical_base_is_mapped_in_bytes(tmp_path, encoding):
+    phrase = electrum_phrase()
+    encoded_phrase = phrase.encode(encoding)
+    source = tmp_path / f"odd-base-{encoding}.bin"
+    source.write_bytes(b"\xff" + encoded_phrase)
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_path(
+        source, start=1)
+    occurrence = next(item for item in result.occurrences
+                      if item.candidate.mnemonic_standard == "ELECTRUM" and
+                      item.candidate.encoding == encoding and
+                      item.secret.reveal() == phrase)
+    candidate = occurrence.candidate
+    assert candidate.physical_start == 1
+    assert candidate.physical_end == 1 + len(encoded_phrase)
+    assert source.read_bytes()[candidate.physical_start:candidate.physical_end] == encoded_phrase
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
+def test_two_electrum_candidates_have_distinct_reconstructable_spans(encoding):
+    first_phrase = electrum_phrase(12)
+    second_phrase = electrum_phrase(13)
+    prefix = "\x00first:".encode(encoding)
+    separator = "\x00second:".encode(encoding)
+    suffix = "\x00".encode(encoding)
+    first_encoded = first_phrase.encode(encoding)
+    second_encoded = second_phrase.encode(encoding)
+    payload = prefix + first_encoded + separator + second_encoded + suffix
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    selected = {item.secret.reveal(): item.candidate for item in result.occurrences
+                if item.candidate.mnemonic_standard == "ELECTRUM" and
+                item.candidate.encoding == encoding and
+                item.secret.reveal() in {first_phrase, second_phrase}}
+    assert set(selected) == {first_phrase, second_phrase}
+    first = selected[first_phrase]
+    second = selected[second_phrase]
+    assert first.physical_end <= second.physical_start
+    assert payload[first.physical_start:first.physical_end] == first_encoded
+    assert payload[second.physical_start:second.physical_end] == second_encoded
+    assert first.physical_end - first.physical_start == len(first_encoded)
+    assert second.physical_end - second.physical_start == len(second_encoded)
 
 
 @pytest.mark.parametrize("payload", [
