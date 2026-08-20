@@ -132,9 +132,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=_integer, default=1,
                         help="seed scan worker processes; 0 selects up to 4 automatically")
     parser.add_argument("--checkpoint", type=Path,
-                        help="atomically save seed-scan ownership progress")
+                        help="create a new seed-scan checkpoint (must not exist)")
     parser.add_argument("--resume-checkpoint", type=Path,
-                        help="resume a compatible seed-scan checkpoint")
+                        help="load and continue a compatible seed-scan checkpoint")
     parser.add_argument("--cluster-mib", type=_integer, default=DEFAULT_CLUSTER_MIB)
     parser.add_argument("--padding-mib", type=_integer, default=DEFAULT_PADDING_MIB)
     parser.add_argument(

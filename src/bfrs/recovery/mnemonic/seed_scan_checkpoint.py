@@ -86,6 +86,11 @@ class SeedScanCheckpoint:
     @classmethod
     def create(cls, checkpoint: str | Path, source: str | Path, *, start: int,
                end: int, chunk_size: int, overlap: int) -> SeedScanCheckpoint:
+        path = Path(checkpoint).resolve()
+        if path.exists():
+            raise CheckpointError(
+                "checkpoint already exists; use --resume-checkpoint to continue it"
+            )
         payload: dict[str, object] = {
             "format": FORMAT,
             "source": source_identity(source),
@@ -94,8 +99,8 @@ class SeedScanCheckpoint:
             "completed_units": [],
             "complete": False,
         }
-        manager = cls(checkpoint, payload)
-        manager.save(force=True)
+        manager = cls(path, payload)
+        manager.save(force=True, create_only=True)
         return manager
 
     @classmethod
@@ -167,7 +172,7 @@ class SeedScanCheckpoint:
         self._dirty = True
         self.save(force=True)
 
-    def save(self, *, force: bool = False) -> None:
+    def save(self, *, force: bool = False, create_only: bool = False) -> None:
         if not self._dirty and not force:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -178,7 +183,15 @@ class SeedScanCheckpoint:
                 stream.write(serialized)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
+            if create_only:
+                try:
+                    os.link(temporary, self.path)
+                except FileExistsError as error:
+                    raise CheckpointError(
+                        "checkpoint already exists; use --resume-checkpoint to continue it"
+                    ) from error
+            else:
+                os.replace(temporary, self.path)
         finally:
             if temporary.exists():
                 temporary.unlink()

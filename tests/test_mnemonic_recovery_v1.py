@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from concurrent.futures import Future
 from functools import lru_cache
 from pathlib import Path
 import re
@@ -17,6 +18,7 @@ from bfrs.recovery.mnemonic.document_seed_recovery import DocumentSeedRecovery
 from bfrs.recovery.mnemonic.electrum_seed_validator import ElectrumSeedValidator
 from bfrs.recovery.mnemonic.mnemonic_recovery_pipeline import MnemonicRecoveryPipeline
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import RawMnemonicScanner
+import bfrs.recovery.mnemonic.raw_mnemonic_scanner as raw_scanner_module
 from bfrs.recovery.mnemonic.seed_scan_checkpoint import (
     CheckpointError,
     SeedScanCheckpoint,
@@ -743,6 +745,77 @@ def test_checkpoint_interrupt_resume_workers_one_to_four_matches_clean(tmp_path)
                               unit_complete=resumed.record)
     clean = scanner.scan_path(source, workers=1)
     assert _raw_semantic(final) == _raw_semantic(clean)
+
+
+def test_checkpoint_resume_workers_six_to_four_never_rescans_completed_units(
+        tmp_path, monkeypatch):
+    source = tmp_path / "synthetic-resume.bin"
+    source.write_bytes(b"\x00" * 30_000)
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+    checkpoint = SeedScanCheckpoint.create(
+        tmp_path / "synthetic-resume.json", source, start=0, end=30_000,
+        chunk_size=8192, overlap=4096)
+    submitted: dict[int, list[tuple[int, int]]] = {6: [], 4: []}
+
+    class RecordingExecutor:
+        def __init__(self, *, max_workers, initializer, initargs):
+            self.max_workers = max_workers
+            self._processes = {}
+
+        def submit(self, function, unit):
+            submitted[self.max_workers].append((unit[3], unit[4]))
+            future = Future()
+            future.set_result(scanner._scan_local_unit(unit))
+            return future
+
+        def shutdown(self, *, wait, cancel_futures=False):
+            return None
+
+    monkeypatch.setattr(raw_scanner_module, "ProcessPoolExecutor", RecordingExecutor)
+    acknowledged = 0
+
+    def interrupt_after_three(unit, result, completed, total):
+        nonlocal acknowledged
+        checkpoint.record(unit, result, completed, total)
+        acknowledged += 1
+        if acknowledged == 3:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        scanner.scan_path(source, workers=6, unit_complete=interrupt_after_three)
+    checkpoint.save(force=True)
+    resumed = SeedScanCheckpoint.resume(
+        checkpoint.path, source, start=0, end=30_000,
+        chunk_size=8192, overlap=4096)
+    saved = set(resumed.completed_results)
+    progress = []
+    scanner.scan_path(source, workers=4, resume_results=resumed.completed_results,
+                      unit_complete=resumed.record,
+                      progress=lambda completed, total: progress.append((completed, total)))
+
+    all_units = {(unit[3], unit[4]) for unit in scanner._plan_work_units(
+        source.resolve(), 0, 30_000)}
+    assert len(saved) == 3
+    assert set(submitted[4]) == all_units - saved
+    assert set(submitted[4]).isdisjoint(saved)
+    assert progress[0] == (sum(end - start for start, end in saved), 30_000)
+    assert progress[-1] == (30_000, 30_000)
+
+
+def test_checkpoint_create_refuses_to_overwrite_existing_state(tmp_path):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"x" * 10_000)
+    path = tmp_path / "existing.json"
+    checkpoint = SeedScanCheckpoint.create(
+        path, source, start=0, end=10_000, chunk_size=8192, overlap=4096)
+    original = path.read_bytes()
+
+    with pytest.raises(CheckpointError, match="already exists.*resume-checkpoint"):
+        SeedScanCheckpoint.create(
+            path, source, start=0, end=10_000, chunk_size=8192, overlap=4096)
+
+    assert path.read_bytes() == original
+    assert checkpoint.completed_results == {}
 
 
 def test_checkpoint_out_of_order_ranges_preserve_gap_and_resume_four_to_two(tmp_path):
