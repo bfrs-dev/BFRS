@@ -16,10 +16,11 @@ from .raw_mnemonic_scanner import (
 )
 
 
-# Serialized occurrences produced before V2 may contain candidates assembled
-# across punctuation/markup.  They must not be resumed after the contiguous
-# BIP39 rule changed because completed units bypass tokenization.
-FORMAT = "BFRS_SEED_SCAN_CHECKPOINT_V2"
+# Completed units bypass validation during resume, so every scanner-semantic
+# change must use a new format.  V2 introduced contiguous BIP39, V3 added the
+# separately identified strict Electrum V1 standard, and V4 makes Electrum 2+
+# tokenization contiguous.  Older completed units can contain now-invalid hits.
+FORMAT = "BFRS_SEED_SCAN_CHECKPOINT_V4"
 IDENTITY_BYTES = 64 * 1024
 
 

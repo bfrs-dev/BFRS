@@ -69,6 +69,8 @@ class MnemonicRecoveryPipeline:
                 "encoding": item.candidate.encoding,
                 "path": item.candidate.path,
                 "allocation_state": item.candidate.allocation_state,
+                "document_page": item.candidate.safe_metadata.get("page_number"),
+                "extraction_method": item.candidate.safe_metadata.get("extractor"),
             } for item in items)
             candidates.append(replace(first,
                                       confidence=("HIGH" if any(
@@ -81,7 +83,8 @@ class MnemonicRecoveryPipeline:
             anchors_found=raw.anchors_found, candidates_total=len(candidates),
             high_confidence_candidates=sum(item.confidence == "HIGH" for item in candidates),
             bip39_valid=sum(item.mnemonic_standard == "BIP39" for item in candidates),
-            electrum_valid=sum(item.mnemonic_standard == "ELECTRUM" for item in candidates),
+            electrum_valid=sum(item.mnemonic_standard in {"ELECTRUM", "ELECTRUM_V1"}
+                               for item in candidates),
             structural_fragments=0, checksum_invalid=raw.checksum_invalid,
             known_file_candidates=sum(any(provenance["source_kind"] == "KNOWN_FILE_CONTENT"
                                           for provenance in item.provenance) for item in candidates),
@@ -89,7 +92,8 @@ class MnemonicRecoveryPipeline:
                                             for provenance in item.provenance) for item in candidates),
             raw_candidates=sum(any(provenance["source_kind"] == "RAW_BYTES"
                                    for provenance in item.provenance) for item in candidates),
-            document_candidates=sum(any(provenance["source_kind"] == "DOCUMENT_EXTRACTED_TEXT"
+            document_candidates=sum(any(provenance["source_kind"] in {
+                                            "DOCUMENT_EXTRACTED_TEXT", "PDF_TEXT"}
                                         for provenance in item.provenance) for item in candidates),
             unique_secret_fingerprints=len({item.fingerprint for item in candidates}),
             duplicate_occurrences=duplicate_occurrences,

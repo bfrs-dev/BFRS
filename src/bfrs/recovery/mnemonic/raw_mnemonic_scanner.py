@@ -16,6 +16,7 @@ from typing import Callable
 
 from .bip39_validator import BIP39Validator, WORD_COUNTS
 from .electrum_seed_validator import ElectrumSeedValidator
+from .electrum_v1_validator import ElectrumV1Validator
 from .mnemonic_normalizer import electrum_normalize
 from .mnemonic_candidate import MnemonicCandidate
 
@@ -94,14 +95,17 @@ class RawMnemonicScanner:
         self.overlap = overlap
         self.bip39 = BIP39Validator()
         self.electrum = ElectrumSeedValidator()
+        self.electrum_v1 = ElectrumV1Validator()
         membership: dict[str, list[int]] = {}
         for bit, words in enumerate(self.bip39.wordlists.values()):
             for word in words:
-                membership.setdefault(word, [0, 0])[0] |= 1 << bit
+                membership.setdefault(word, [0, 0, 0])[0] |= 1 << bit
         for bit, words in enumerate(self.electrum.wordlists.values()):
             for word in words:
-                membership.setdefault(word, [0, 0])[1] |= 1 << bit
-        self._membership = {word: (masks[0], masks[1])
+                membership.setdefault(word, [0, 0, 0])[1] |= 1 << bit
+        for word in self.electrum_v1.wordlist:
+            membership.setdefault(word, [0, 0, 0])[2] = 1
+        self._membership = {word: (masks[0], masks[1], masks[2])
                             for word, masks in membership.items()}
         self._max_token_chars = max(map(len, self._membership))
         self._normalize_token = lru_cache(maxsize=8192)(self._normalize_token_uncached)
@@ -248,17 +252,23 @@ class RawMnemonicScanner:
                 # without a per-character offset table.
                 window: deque[tuple[str, str, int, int, int, int, int, str]] = deque(maxlen=24)
                 previous_end: int | None = None
+                previous_v1_member = False
+                previous_raw_end: int | None = None
+                v1_run_length = 0
                 char_cursor = byte_cursor = 0
                 for match in _TOKEN.finditer(text):
                     original = match.group(0)
                     if len(original) > self._max_token_chars:
                         word = electrum_word = ""
-                        bip_mask = electrum_mask = 0
+                        bip_mask = electrum_mask = electrum_v1_member = 0
                     else:
                         word, electrum_word = self._normalize_token(original)
-                        bip_mask = self._membership.get(word, (0, 0))[0]
-                        electrum_mask = self._membership.get(electrum_word, (0, 0))[1]
-                    known = bool(bip_mask or electrum_mask)
+                        membership = self._membership.get(word, (0, 0, 0))
+                        bip_mask = membership[0]
+                        electrum_mask = self._membership.get(
+                            electrum_word, (0, 0, 0))[1]
+                        electrum_v1_member = membership[2]
+                    known = bool(bip_mask or electrum_mask or electrum_v1_member)
                     separator = "" if previous_end is None else text[previous_end:match.start()]
                     separator_invalid = (len(separator) > 32 or "\x00" in separator or
                                          any(character.isalnum() or character == "_"
@@ -270,6 +280,24 @@ class RawMnemonicScanner:
                         encoding, errors=error_mode))
                     raw_end = raw_start + len(original.encode(encoding, errors=error_mode))
                     char_cursor, byte_cursor = match.end(), raw_end
+                    v1_extends_run = (bool(electrum_v1_member) and previous_v1_member and
+                                      bool(separator) and len(separator) <= 32 and
+                                      separator.isspace())
+                    if v1_extends_run and previous_raw_end is not None:
+                        # A V1 candidate is valid only when the entire maximal old-word
+                        # run has exactly 12 or 24 words.  Invalidate a candidate that
+                        # was tentatively emitted before a following word was observed.
+                        previous_physical_end = base_offset + previous_raw_end
+                        for key in tuple(found):
+                            if (key[0] == encoding and key[2] == previous_physical_end and
+                                    key[3] == "ELECTRUM_V1"):
+                                del found[key]
+                                anchors -= 1
+                        v1_run_length += 1
+                    else:
+                        v1_run_length = 1 if electrum_v1_member else 0
+                    previous_v1_member = bool(electrum_v1_member)
+                    previous_raw_end = raw_end
                     if not known:
                         continue
                     window.append((original, word, electrum_word, bip_mask, electrum_mask,
@@ -288,31 +316,44 @@ class RawMnemonicScanner:
                             bip_languages &= item[3]
                             electrum_languages &= item[4]
                         validations = []
-                        # BIP39 words must be adjacent text tokens separated only by
-                        # reasonable whitespace.  Punctuation and markup remain
-                        # available to the legacy Electrum path, but may never be
-                        # filtered out to manufacture a BIP39 phrase.
-                        bip39_contiguous = all(
+                        # Mnemonic words must be adjacent source tokens separated only
+                        # by reasonable whitespace.  Punctuation, markup, and foreign
+                        # tokens may never be filtered out to manufacture a phrase.
+                        contiguous_source = all(
                             item[7] and len(item[7]) <= 32 and item[7].isspace()
                             for item in selected[1:])
                         span_start, span_end = selected[0][5], selected[-1][6]
                         span_bytes = encoded_data[span_start:span_end]
                         span_text = span_bytes.decode(encoding, errors=error_mode)
                         span_parts = span_text.split()
-                        span_integrity = (
+                        bip39_span_integrity = (
                             len(span_parts) == count and
                             tuple(self._normalize_token(part)[0] for part in span_parts) ==
                             tuple(item[1] for item in selected)
                         )
+                        electrum_span_integrity = (
+                            len(span_parts) == count and
+                            tuple(self._normalize_token(part)[1] for part in span_parts) ==
+                            tuple(item[2] for item in selected)
+                        )
                         if (count in WORD_COUNTS and bip_languages and
-                                bip39_contiguous and span_integrity):
+                                contiguous_source and bip39_span_integrity):
                             words = tuple(item[1] for item in selected)
                             normalized = " ".join(words)
                             languages = tuple(name for bit, name in enumerate(self.bip39.wordlists)
                                               if bip_languages & (1 << bit))
                             validations.append(("BIP39", self.bip39.validate_words(
                                 words, normalized=normalized, languages=languages)))
-                        if electrum_languages:
+                        if (count in {12, 24} and v1_run_length == count and
+                                contiguous_source and bip39_span_integrity and
+                                all(item[1] in self.electrum_v1.indices for item in selected)):
+                            words = tuple(item[1] for item in selected)
+                            normalized = " ".join(words)
+                            validations.append(("ELECTRUM_V1",
+                                                self.electrum_v1.validate_words(
+                                                    words, normalized=normalized)))
+                        if (electrum_languages and contiguous_source and
+                                electrum_span_integrity):
                             words = tuple(item[2] for item in selected)
                             normalized = " ".join(words)
                             languages = tuple(name for bit, name in enumerate(self.electrum.wordlists)
@@ -320,7 +361,9 @@ class RawMnemonicScanner:
                             validations.append(("ELECTRUM", self.electrum.validate_words(
                                 words, normalized=normalized, languages=languages)))
                         for standard, validation in validations:
-                            valid = validation.status in {"BIP39_VALID", "ELECTRUM_SEED_VALID"}
+                            valid = validation.status in {
+                                "BIP39_VALID", "ELECTRUM_SEED_VALID",
+                                "ELECTRUM_V1_STRICT_VALID", "ELECTRUM_V1_COMPAT_VALID"}
                             if validation.status == "BIP39_CHECKSUM_INVALID":
                                 invalid += 1
                             if not valid:
@@ -331,6 +374,11 @@ class RawMnemonicScanner:
                             candidate_id = hashlib.sha256(
                                 f"{source}|{physical_start}|{physical_end}|{standard}|{fingerprint}"
                                 .encode("utf-8")).hexdigest()[:24]
+                            reason_codes = validation.reason_codes
+                            if standard == "ELECTRUM_V1":
+                                reason_codes += ("ELECTRUM_V1_SOURCE_SPAN_VALID",)
+                            elif standard == "ELECTRUM":
+                                reason_codes += ("ELECTRUM_SOURCE_SPAN_VALID",)
                             candidate = MnemonicCandidate(
                                 candidate_id=candidate_id, family="MNEMONIC",
                                 mnemonic_standard=standard,
@@ -340,9 +388,9 @@ class RawMnemonicScanner:
                                 word_count=validation.word_count,
                                 checksum_valid=getattr(validation, "checksum_valid", None),
                                 completeness="COMPLETE",
-                                confidence="MEDIUM" if (standard == "BIP39" and
-                                                         source_kind == "RAW_BYTES") else "HIGH",
-                                reason_codes=validation.reason_codes,
+                                confidence=("MEDIUM" if standard == "ELECTRUM_V1" or
+                                            source_kind == "RAW_BYTES" else "HIGH"),
+                                reason_codes=reason_codes,
                                 fingerprint=fingerprint, source_kind=source_kind,
                                 source=source, physical_start=physical_start,
                                 physical_end=physical_end, encoding=encoding,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from functools import lru_cache
 from pathlib import Path
 import re
 import sys
@@ -88,11 +89,13 @@ def test_bip39_mixed_wordlists_have_no_common_language():
     assert hinted.status == "BIP39_WORD_INVALID"
 
 
-def electrum_phrase() -> str:
+@lru_cache(maxsize=None)
+def electrum_phrase(word_count: int = 12) -> str:
     validator = ElectrumSeedValidator()
     words = sorted(validator.wordlists["english"])
     for number in range(100_000):
-        phrase = " ".join([words[0]] * 11 + [words[number % len(words)]])
+        phrase = " ".join([words[0]] * (word_count - 1) +
+                          [words[number % len(words)]])
         if validator.validate(phrase).status == "ELECTRUM_SEED_VALID":
             return phrase
     raise AssertionError("deterministic Electrum fixture not found")
@@ -238,6 +241,105 @@ def test_raw_bip39_checksum_alone_is_not_high_confidence():
                      item.candidate.encoding == "utf-8")
     assert candidate.checksum_valid is True
     assert candidate.confidence == "MEDIUM"
+
+
+@pytest.mark.parametrize("delimiter", [" ", "    ", "\t", "\n", "\r\n"])
+def test_raw_electrum_v2_accepts_contiguous_whitespace(delimiter):
+    phrase = delimiter.join(electrum_phrase().split())
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(phrase.encode())
+    matches = [item for item in result.occurrences
+               if item.candidate.mnemonic_standard == "ELECTRUM" and
+               item.candidate.encoding == "utf-8"]
+    assert len(matches) == 1
+    assert matches[0].candidate.word_count == 12
+
+
+def test_raw_electrum_v2_preserves_non_bip39_word_count():
+    phrase = electrum_phrase(13)
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(phrase.encode())
+    assert any(item.candidate.mnemonic_standard == "ELECTRUM" and
+               item.candidate.word_count == 13 for item in result.occurrences)
+
+
+@pytest.mark.parametrize("delimiter", [
+    ",", ".", ";", ":", '"', "'", "/", "\\", "-", "_", "=", "<", ">",
+    "(", ")", "[", "]", "{", "}",
+])
+def test_raw_electrum_v2_rejects_punctuation_separators(delimiter):
+    payload = delimiter.join(electrum_phrase().split()).encode()
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    assert not [item for item in result.occurrences
+                if item.candidate.mnemonic_standard == "ELECTRUM"]
+
+
+def test_raw_electrum_v2_rejects_foreign_word_inside_phrase():
+    words = electrum_phrase().split()
+    payload = " ".join(words[:6] + ["intruder"] + words[6:]).encode()
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    assert not [item for item in result.occurrences
+                if item.candidate.mnemonic_standard == "ELECTRUM"]
+
+
+@pytest.mark.parametrize("syntax", ["json", "html", "css", "javascript"])
+def test_raw_electrum_v2_rejects_phrase_manufactured_from_structured_text(syntax):
+    words = electrum_phrase().split()
+    payloads = {
+        "json": '{"values":["' + '\",\"'.join(words) + '"]}',
+        "html": "<ul><li>" + "</li><li>".join(words) + "</li></ul>",
+        "css": ".fixture{" + "-".join(words) + ":inherit}",
+        "javascript": "const config = " + " = next; ".join(words) + ";",
+    }
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(
+        payloads[syntax].encode())
+    assert not [item for item in result.occurrences
+                if item.candidate.mnemonic_standard == "ELECTRUM"]
+
+
+@pytest.mark.parametrize("payload", [
+    b'left-color\",\"border-left-style\",\"border-left-width\",\"border-image-source\",\"border-image-slice\",\"border',
+    (b'{"background-repeat":"repeat","background-position":"left","border-color":"red",'
+     b'"border-left-color":"black","border-left-style":"solid","border-left-width":"thin",'
+     b'"border-image-source":"none","border-image-slice":"fill","border-radius":"medium"}'),
+])
+def test_raw_electrum_v2_rejects_real_css_json_false_positive(payload):
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    assert not [item for item in result.occurrences
+                if item.candidate.mnemonic_standard == "ELECTRUM"]
+
+
+def test_raw_electrum_v2_rejects_dictionary_thesaurus_and_wordlist_prose():
+    words = electrum_phrase().split()
+    payload = ("dictionary " + " definition ".join(words[:11]) +
+               " thesaurus " + " synonym ".join(words[1:12])).encode()
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    assert not [item for item in result.occurrences
+                if item.candidate.mnemonic_standard == "ELECTRUM"]
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
+def test_raw_electrum_v2_encoding_source_span_and_negative(encoding):
+    phrase = " \t\r\n ".join(electrum_phrase().split())
+    prefix = "noise:"
+    payload = (prefix + phrase + ":tail").encode(encoding)
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(payload)
+    occurrence = next(item for item in result.occurrences
+                      if item.candidate.mnemonic_standard == "ELECTRUM" and
+                      item.candidate.encoding == encoding)
+    candidate = occurrence.candidate
+    assert candidate.physical_start == len(prefix.encode(encoding))
+    assert candidate.physical_end == len((prefix + phrase).encode(encoding))
+    decoded_span = payload[candidate.physical_start:candidate.physical_end].decode(encoding)
+    validation = ElectrumSeedValidator().validate(decoded_span)
+    assert validation.status == "ELECTRUM_SEED_VALID"
+    assert validation.normalized == occurrence.secret.reveal()
+    assert "ELECTRUM_SOURCE_SPAN_VALID" in candidate.reason_codes
+    assert candidate.confidence == "MEDIUM"
+
+    broken = ",".join(electrum_phrase().split()).encode(encoding)
+    rejected = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(broken)
+    assert not [item for item in rejected.occurrences
+                if item.candidate.mnemonic_standard == "ELECTRUM" and
+                item.candidate.encoding == encoding]
 
 
 @pytest.mark.parametrize("payload", [
@@ -444,14 +546,17 @@ def test_checkpoint_rejects_wrong_source_size_and_corruption(tmp_path):
                                   chunk_size=8192, overlap=4096)
 
 
-def test_checkpoint_rejects_pre_contiguous_scanner_results(tmp_path):
+@pytest.mark.parametrize("old_format", ["BFRS_SEED_SCAN_CHECKPOINT_V1",
+                                         "BFRS_SEED_SCAN_CHECKPOINT_V2",
+                                         "BFRS_SEED_SCAN_CHECKPOINT_V3"])
+def test_checkpoint_rejects_pre_current_scanner_results(tmp_path, old_format):
     source = tmp_path / "source.bin"
     source.write_bytes(b"a" * 10_000)
     checkpoint = SeedScanCheckpoint.create(
         tmp_path / "checkpoint.json", source, start=0, end=10_000,
         chunk_size=8192, overlap=4096)
     payload = json.loads(checkpoint.path.read_text(encoding="utf-8"))
-    payload["format"] = "BFRS_SEED_SCAN_CHECKPOINT_V1"
+    payload["format"] = old_format
     checkpoint.path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(CheckpointError, match="unsupported checkpoint format"):
         SeedScanCheckpoint.resume(checkpoint.path, source, start=0, end=10_000,
@@ -506,7 +611,7 @@ def test_parallel_malformed_unicode_does_not_fail_worker(tmp_path):
     assert not result.occurrences
 
 
-def test_docx_extraction_and_pdf_isolated_failure(tmp_path):
+def test_docx_extraction_and_malformed_pdf_isolated_failure(tmp_path):
     phrase = bip39_phrase("english")
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w") as archive:
@@ -520,7 +625,7 @@ def test_docx_extraction_and_pdf_isolated_failure(tmp_path):
                for item in result.occurrences)
     assert all(item.candidate.physical_start is None for item in result.occurrences)
     assert recovery.scan_bytes(b"%PDF", source="x.pdf", suffix=".pdf").failures == (
-        "PDF_TEXT_EXTRACTOR_UNAVAILABLE",)
+        "PDF_PARSE_FAILED",)
 
 
 def test_seed_only_cli_safe_report_and_explicit_export(tmp_path, capsys):

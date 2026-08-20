@@ -1,7 +1,7 @@
 # Seed Phrase Document & Raw Recovery V1
 
-This implementation performs offline, read-only discovery of complete BIP39 and
-modern Electrum mnemonic phrases. Normal JSON reports never contain mnemonic
+This implementation performs offline, read-only discovery of complete BIP39,
+modern Electrum, and historical Electrum V1 mnemonic phrases. Normal JSON reports never contain mnemonic
 words, entropy, derived seeds, private keys, or surrounding source text. They
 contain only validation metadata, physical provenance, and a domain-separated
 SHA-256 fingerprint used for deduplication.
@@ -15,8 +15,9 @@ SHA-256 fingerprint used for deduplication.
   `Seed version` prefixes (`01`, `100`, `101`, `102`). The five upstream
   Electrum wordlists are bundled unchanged. A phrase must also consist of words
   from one supported Electrum list.
-- Historical Electrum hexadecimal seeds and the legacy pre-2.0 old mnemonic
-  codec are not classified as word phrases in V1.
+- Historical Electrum V1 uses the exact upstream 1626-word list and old
+  `mn_encode`/`mn_decode` codec. Twelve-word seeds require a strict 32-hex
+  round-trip; 24-word compatibility seeds require a strict 64-hex round-trip.
 
 Primary sources: Bitcoin BIPs `bip-0039.mediawiki` and its wordlists; Electrum
 `electrum/mnemonic.py`, `electrum/version.py`, and `electrum/wordlist/` in the
@@ -32,10 +33,12 @@ wordlist indexes); it does not grow with image size.
 
 Known `.txt`, `.log`, `.csv`, `.json`, `.xml`, `.html`, `.htm`, and `.rtf`
 content uses the same byte scanner. DOCX extraction opens the ZIP container and
-reads only bounded WordprocessingML text parts. Extracted-text positions are not
-claimed as physical offsets. PDF text-layer extraction is deliberately reported
-as unavailable in V1 because the project has no vetted PDF dependency; no OCR,
-JavaScript, macros, embedded programs, or external processes are executed.
+reads only bounded WordprocessingML text parts. PDF text-layer extraction uses
+the required `pypdf>=5.0,<7` dependency and processes each page independently.
+PDF candidates record the one-based page number and extraction method, use
+`PDF_TEXT` provenance, and never claim physical byte offsets. Documents and
+extracted text are each limited to 64 MiB, and PDFs are limited to 10,000 pages.
+No OCR, JavaScript, macros, embedded programs, or external processes are executed.
 
 `--seed-scan-only` bypasses Bitcoin Core and Electrum wallet recovery paths.
 Normal reports are safe to handle. Secret export is a separate rescan command
@@ -46,7 +49,7 @@ to overwrite either the secret file or its safe manifest.
 
 V1 retains complete checksum/version-valid phrases only. It counts invalid
 BIP39 checksum windows diagnostically but does not put their words in reports.
-It does not reconstruct missing words, derive wallet keys, perform OCR, parse
-PDFs, or carve compressed DOCX containers from arbitrary raw bytes. Raw offsets
-are exact for the decoded byte representation; DOCX results identify only the
-container and extracted-text offset space.
+It does not reconstruct missing words, derive wallet keys, perform OCR, bypass
+PDF encryption, repair severely damaged PDFs, or carve compressed document
+containers from arbitrary raw bytes. Raw offsets are exact for decoded byte
+representations; DOCX/PDF results identify only logical extracted-text spaces.

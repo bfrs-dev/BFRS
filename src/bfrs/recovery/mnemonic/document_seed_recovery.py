@@ -16,12 +16,23 @@ from .raw_mnemonic_scanner import MnemonicOccurrence, RawMnemonicScanner
 
 PLAIN_EXTENSIONS = frozenset({".txt", ".log", ".csv", ".json", ".xml", ".html", ".htm", ".rtf"})
 DOCUMENT_EXTENSIONS = PLAIN_EXTENSIONS | {".docx", ".pdf"}
+MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
+MAX_EXTRACTED_TEXT_BYTES = 64 * 1024 * 1024
+MAX_PDF_PAGES = 10_000
 
 
 @dataclass(frozen=True, slots=True)
 class DocumentScanResult:
     occurrences: tuple[MnemonicOccurrence, ...]
     failures: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedTextUnit:
+    text: str
+    source_kind: str
+    extractor: str
+    page_number: int | None = None
 
 
 def _docx_text(data: bytes) -> str:
@@ -51,11 +62,39 @@ def extract_document_text(data: bytes, suffix: str) -> tuple[str | None, str | N
             return _docx_text(data), None
         except (OSError, ValueError, UnicodeError, zipfile.BadZipFile, KeyError):
             return None, "DOCX_EXTRACTION_FAILED"
-    if suffix == ".pdf":
-        return None, "PDF_TEXT_EXTRACTOR_UNAVAILABLE"
     if suffix in PLAIN_EXTENSIONS:
         return None, None  # raw scanner preserves exact byte offsets and encodings
     return None, "DOCUMENT_TYPE_UNSUPPORTED"
+
+
+def _pdf_text_units(data: bytes) -> tuple[tuple[ExtractedTextUnit, ...], str | None]:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return (), "PDF_DEPENDENCY_UNAVAILABLE"
+    try:
+        reader = PdfReader(BytesIO(data), strict=False)
+        if reader.is_encrypted:
+            return (), "PDF_ENCRYPTED"
+        if len(reader.pages) > MAX_PDF_PAGES:
+            return (), "PDF_PAGE_LIMIT"
+        units: list[ExtractedTextUnit] = []
+        extracted_bytes = 0
+        for page_number, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            if not text.strip():
+                continue
+            extracted_bytes += len(text.encode("utf-8"))
+            if extracted_bytes > MAX_EXTRACTED_TEXT_BYTES:
+                return (), "PDF_TEXT_LIMIT"
+            units.append(ExtractedTextUnit(
+                text=text, source_kind="PDF_TEXT", extractor="pypdf_page_extract_text",
+                page_number=page_number))
+        if not units:
+            return (), "PDF_NO_TEXT"
+        return tuple(units), None
+    except Exception:  # pypdf exposes filter/font-specific exception subclasses
+        return (), "PDF_PARSE_FAILED"
 
 
 class DocumentSeedRecovery:
@@ -65,11 +104,35 @@ class DocumentSeedRecovery:
     def scan_bytes(self, data: bytes, *, source: str, suffix: str,
                    base_offset: int = 0, mft_record_number: int | None = None,
                    path: str | None = None, allocation_state: str = "UNKNOWN_ALLOCATION") -> DocumentScanResult:
-        if suffix.lower() in PLAIN_EXTENSIONS:
+        normalized_suffix = suffix.lower()
+        if len(data) > MAX_DOCUMENT_BYTES:
+            return DocumentScanResult((), ("DOCUMENT_SIZE_LIMIT",))
+        if normalized_suffix in PLAIN_EXTENSIONS:
             raw = self.scanner.scan_bytes(data, source=source, base_offset=base_offset,
                                           source_kind="KNOWN_FILE_CONTENT")
             occurrences = raw.occurrences
             failures = raw.failures
+        elif normalized_suffix == ".pdf":
+            units, failure = _pdf_text_units(data)
+            if failure:
+                return DocumentScanResult((), (failure,))
+            extracted: list[MnemonicOccurrence] = []
+            failures_list: list[str] = []
+            for unit in units:
+                raw = self.scanner.scan_bytes(unit.text.encode("utf-8"), source=source,
+                                              source_kind=unit.source_kind)
+                failures_list.extend(raw.failures)
+                extracted.extend(MnemonicOccurrence(replace(
+                    item.candidate, physical_start=None, physical_end=None,
+                    encoding="utf-8", confidence="MEDIUM", safe_metadata={
+                        "offset_space": "extracted_page_text_utf8_bytes",
+                        "logical_text_start": item.candidate.physical_start,
+                        "logical_text_end": item.candidate.physical_end,
+                        "extractor": unit.extractor,
+                        "page_number": unit.page_number,
+                    }), item.secret) for item in raw.occurrences)
+            occurrences = tuple(extracted)
+            failures = tuple(dict.fromkeys(failures_list))
         else:
             text, failure = extract_document_text(data, suffix)
             if failure:
@@ -99,13 +162,15 @@ class DocumentSeedRecovery:
         if suffix not in DOCUMENT_EXTENSIONS:
             return DocumentScanResult((), ("DOCUMENT_TYPE_UNSUPPORTED",))
         try:
+            if source.stat().st_size > MAX_DOCUMENT_BYTES:
+                return DocumentScanResult((), ("DOCUMENT_SIZE_LIMIT",))
             data = source.read_bytes()
         except OSError:
             return DocumentScanResult((), ("DOCUMENT_READ_FAILED",))
         return self.scan_bytes(data, source=str(source), suffix=suffix,
                                path=source.name, allocation_state="ACTIVE_FILE")
 
-    def scan_ntfs_image(self, path: str | Path, *, maximum_file_size: int = 64 * 1024 * 1024) -> DocumentScanResult:
+    def scan_ntfs_image(self, path: str | Path, *, maximum_file_size: int = MAX_DOCUMENT_BYTES) -> DocumentScanResult:
         """Read supported active/deleted files through validated MFT DATA mappings."""
         source = Path(path).resolve()
         locator = NTFSBitcoinArtifactLocator()
