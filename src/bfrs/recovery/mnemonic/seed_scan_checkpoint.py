@@ -19,8 +19,9 @@ from .raw_mnemonic_scanner import (
 # Completed units bypass validation during resume, so every scanner-semantic
 # change must use a new format.  V2 introduced contiguous BIP39, V3 added the
 # separately identified strict Electrum V1 standard, and V4 makes Electrum 2+
-# tokenization contiguous.  Older completed units can contain now-invalid hits.
-FORMAT = "BFRS_SEED_SCAN_CHECKPOINT_V4"
+# tokenization contiguous.  V5 scans both byte phases for each UTF-16 endian.
+# Older completed units can contain invalid hits or omit newly covered hits.
+FORMAT = "BFRS_SEED_SCAN_CHECKPOINT_V5"
 IDENTITY_BYTES = 64 * 1024
 
 

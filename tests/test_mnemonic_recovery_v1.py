@@ -102,6 +102,23 @@ def electrum_phrase(word_count: int = 12, language: str = "english") -> str:
     raise AssertionError("deterministic Electrum fixture not found")
 
 
+def assert_raw_occurrence(result, scanner, payload, *, phrase, standard,
+                          encoding, physical_start):
+    encoded_phrase = phrase.encode(encoding)
+    matches = [item for item in result.occurrences
+               if item.candidate.mnemonic_standard == standard and
+               item.candidate.encoding == encoding and
+               item.secret.reveal() == phrase]
+    assert len(matches) == 1
+    candidate = matches[0].candidate
+    assert candidate.physical_start == physical_start
+    assert candidate.physical_end == physical_start + len(encoded_phrase)
+    assert payload[candidate.physical_start:candidate.physical_end] == encoded_phrase
+    assert payload[candidate.physical_start:candidate.physical_end].decode(encoding) == phrase
+    assert candidate.fingerprint == scanner._fingerprint(standard, phrase)
+    return candidate
+
+
 def test_electrum_version_prefix_and_normalization():
     phrase = electrum_phrase()
     validator = ElectrumSeedValidator()
@@ -455,6 +472,104 @@ def test_raw_electrum_odd_physical_base_is_mapped_in_bytes(tmp_path, encoding):
     assert source.read_bytes()[candidate.physical_start:candidate.physical_end] == encoded_phrase
 
 
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+@pytest.mark.parametrize("physical_start", [0, 1, 2, 3])
+def test_full_scan_covers_both_utf16_phases_at_offsets_zero_through_three(
+        tmp_path, encoding, physical_start):
+    phrase = bip39_phrase("english")
+    payload = b"\xff" * physical_start + phrase.encode(encoding)
+    source = tmp_path / f"full-phase-{encoding}-{physical_start}.bin"
+    source.write_bytes(payload)
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+
+    result = scanner.scan_path(source)
+
+    assert_raw_occurrence(
+        result, scanner, payload, phrase=phrase, standard="BIP39",
+        encoding=encoding, physical_start=physical_start)
+    assert not [item for item in result.occurrences
+                if item.candidate.mnemonic_standard == "BIP39" and
+                item.secret.reveal() == phrase and
+                item.candidate.encoding != encoding]
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+@pytest.mark.parametrize("physical_start", [0, 1])
+@pytest.mark.parametrize("standard,phrase", [
+    ("BIP39", bip39_phrase("chinese_simplified")),
+    ("ELECTRUM", electrum_phrase(12, "chinese_simplified")),
+])
+def test_full_scan_utf16_phase_coverage_includes_compact_chinese_mnemonics(
+        tmp_path, encoding, physical_start, standard, phrase):
+    payload = b"\xff" * physical_start + phrase.encode(encoding)
+    source = tmp_path / f"chinese-phase-{standard}-{encoding}-{physical_start}.bin"
+    source.write_bytes(payload)
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+
+    result = scanner.scan_path(source)
+
+    candidate = assert_raw_occurrence(
+        result, scanner, payload, phrase=phrase, standard=standard,
+        encoding=encoding, physical_start=physical_start)
+    assert candidate.language == "chinese_simplified"
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+@pytest.mark.parametrize("physical_start", [4050, 4051, 5000, 5001])
+def test_full_scan_utf16_chunk_boundary_overlap_ownership_is_deduplicated(
+        tmp_path, encoding, physical_start):
+    phrase = electrum_phrase()
+    encoded_phrase = phrase.encode(encoding)
+    payload = b"\xff" * physical_start + encoded_phrase + b"\x00" * 4098
+    source = tmp_path / f"boundary-overlap-{encoding}-{physical_start}.bin"
+    source.write_bytes(payload)
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+
+    result = scanner.scan_path(source)
+
+    assert_raw_occurrence(
+        result, scanner, payload, phrase=phrase, standard="ELECTRUM",
+        encoding=encoding, physical_start=physical_start)
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+@pytest.mark.parametrize("physical_start", [4100, 4101])
+def test_full_scan_utf16_both_phases_with_odd_physical_chunk_base(
+        tmp_path, encoding, physical_start):
+    phrase = electrum_phrase()
+    encoded_phrase = phrase.encode(encoding)
+    payload = b"\xff" * physical_start + encoded_phrase + b"\x00" * 4098
+    source = tmp_path / f"odd-chunk-base-{encoding}-{physical_start}.bin"
+    source.write_bytes(payload)
+    scanner = RawMnemonicScanner(chunk_size=8193, overlap=4096)
+    units = scanner._plan_work_units(source.resolve(), 0, len(payload))
+    assert units[1][1] == 4097
+
+    result = scanner.scan_path(source)
+
+    assert_raw_occurrence(
+        result, scanner, payload, phrase=phrase, standard="ELECTRUM",
+        encoding=encoding, physical_start=physical_start)
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+@pytest.mark.parametrize("physical_start", [0, 1])
+def test_full_scan_utf16_candidate_ends_one_byte_before_eof(
+        tmp_path, encoding, physical_start):
+    phrase = electrum_phrase()
+    payload = b"\xff" * physical_start + phrase.encode(encoding) + b"\x7f"
+    source = tmp_path / f"one-byte-before-eof-{encoding}-{physical_start}.bin"
+    source.write_bytes(payload)
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+
+    result = scanner.scan_path(source)
+
+    candidate = assert_raw_occurrence(
+        result, scanner, payload, phrase=phrase, standard="ELECTRUM",
+        encoding=encoding, physical_start=physical_start)
+    assert candidate.physical_end == len(payload) - 1
+
+
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
 def test_two_electrum_candidates_have_distinct_reconstructable_spans(encoding):
     first_phrase = electrum_phrase(12)
@@ -686,7 +801,8 @@ def test_checkpoint_rejects_wrong_source_size_and_corruption(tmp_path):
 
 @pytest.mark.parametrize("old_format", ["BFRS_SEED_SCAN_CHECKPOINT_V1",
                                          "BFRS_SEED_SCAN_CHECKPOINT_V2",
-                                         "BFRS_SEED_SCAN_CHECKPOINT_V3"])
+                                         "BFRS_SEED_SCAN_CHECKPOINT_V3",
+                                         "BFRS_SEED_SCAN_CHECKPOINT_V4"])
 def test_checkpoint_rejects_pre_current_scanner_results(tmp_path, old_format):
     source = tmp_path / "source.bin"
     source.write_bytes(b"a" * 10_000)

@@ -22,7 +22,8 @@ from .mnemonic_candidate import MnemonicCandidate
 
 
 _TOKEN = re.compile(r"[^\W\d_]+", re.UNICODE)
-_ENCODINGS = ("utf-8", "utf-16-le", "utf-16-be")
+_DECODE_PASSES = (("utf-8", 0), ("utf-16-le", 0), ("utf-16-le", 1),
+                  ("utf-16-be", 0), ("utf-16-be", 1))
 _DOMAIN = b"BFRS-MNEMONIC-FINGERPRINT-V1\0"
 _MAX_PARALLEL_OWNERSHIP = 16 * 1024 * 1024
 _WORKER_SCANNER: RawMnemonicScanner | None = None
@@ -242,9 +243,14 @@ class RawMnemonicScanner:
         found: dict[tuple[str, int, int, str], MnemonicOccurrence] = {}
         anchors = invalid = 0
         failures: list[str] = []
-        for encoding in _ENCODINGS:
+        # UTF-16 code units may begin at either byte phase within a raw chunk.
+        # UTF-8 is deliberately scanned once; each UTF-16 endian is scanned at
+        # phases 0 and 1, with phase_offset retained in every physical mapping.
+        for encoding, phase_offset in _DECODE_PASSES:
             try:
-                encoded_data = data if encoding == "utf-8" else data[:len(data) // 2 * 2]
+                phase_data = data[phase_offset:]
+                encoded_data = (phase_data if encoding == "utf-8" else
+                                phase_data[:len(phase_data) // 2 * 2])
                 error_mode = "surrogateescape" if encoding == "utf-8" else "surrogatepass"
                 text = encoded_data.decode(encoding, errors=error_mode)
                 # Token boundaries are mapped in one monotonic pass.  Each span is
@@ -287,7 +293,8 @@ class RawMnemonicScanner:
                         # A V1 candidate is valid only when the entire maximal old-word
                         # run has exactly 12 or 24 words.  Invalidate a candidate that
                         # was tentatively emitted before a following word was observed.
-                        previous_physical_end = base_offset + previous_raw_end
+                        previous_physical_end = (
+                            base_offset + phase_offset + previous_raw_end)
                         for key in tuple(found):
                             if (key[0] == encoding and key[2] == previous_physical_end and
                                     key[3] == "ELECTRUM_V1"):
@@ -305,8 +312,8 @@ class RawMnemonicScanner:
                     available = tuple(window)
                     for count in range(12, min(24, len(available)) + 1):
                         selected = available[-count:]
-                        physical_start = base_offset + selected[0][5]
-                        physical_end = base_offset + selected[-1][6]
+                        physical_start = base_offset + phase_offset + selected[0][5]
+                        physical_end = base_offset + phase_offset + selected[-1][6]
                         if ((ownership_start is not None and physical_start < ownership_start) or
                                 (ownership_end is not None and physical_start >= ownership_end)):
                             continue
