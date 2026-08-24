@@ -725,3 +725,117 @@ def test_v1_report_is_secret_free_and_deterministic(tmp_path):
     assert "--standard" in help_text
     assert "--candidate-id" in help_text
     assert "--physical-start" in help_text
+
+
+def _analyze_v1_right_boundary(tmp_path, suffix, *, encoding="utf-8",
+                               context_bytes=128):
+    phrase = electrum_v1_phrase()
+    prefix = "header\n"
+    encoded_prefix = prefix.encode(encoding)
+    encoded_phrase = phrase.encode(encoding)
+    encoded_suffix = suffix if isinstance(suffix, bytes) else suffix.encode(encoding)
+    payload = raw_report(v1_candidate("v1-right", "21" * 32, [
+        provenance(len(encoded_prefix), len(encoded_prefix) + len(encoded_phrase),
+                   encoding)]))
+    item = analyze(
+        tmp_path, encoded_prefix + encoded_phrase + encoded_suffix, payload,
+        standard="ELECTRUM_V1", context_bytes=context_bytes)[
+            "candidates"][0]["occurrences"][0]
+    return phrase, item
+
+
+@pytest.mark.parametrize("suffix,continuity,delimiter", [
+    ("\nfollowing", "TERMINATED", "NEWLINE"),
+    ("\x00following", "TERMINATED", "NUL"),
+    ("   \t", "WHITESPACE_ONLY", "EOF_OR_WINDOW_LIMIT"),
+])
+def test_v1_right_boundary_termination_promotes_plaintext_without_wallet_markers(
+        tmp_path, suffix, continuity, delimiter):
+    _, item = _analyze_v1_right_boundary(tmp_path, suffix)
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    assert item["review_ranking"] == "HIGH_REVIEW"
+    assert item["phrase_starts_line"] is True
+    assert item["contiguous_dictionary_words_before"] == 0
+    assert item["contiguous_dictionary_words_after"] == 0
+    assert item["right_side_text_continuity"] == continuity
+    assert item["immediate_right_delimiter_class"] == delimiter
+    assert "V1_LINE_START_WITH_NON_PROSE_RIGHT_BOUNDARY" in item["reason_codes"]
+    assert item["detected_artifacts"] == []
+
+
+def test_v1_binary_right_boundary_promotes_plaintext_without_wallet_markers(tmp_path):
+    binary_suffix = bytes(range(0x80, 0xc0))
+    _, item = _analyze_v1_right_boundary(tmp_path, binary_suffix)
+    assert item["right_boundary_type"] == "CONTEXT_LIMIT"
+    assert item["right_side_text_continuity"] == "BINARY_OR_MISDECODED"
+    assert item["immediate_right_printable_ratio"] >= 0.0
+    assert item["bytes_examined_after_phrase"] == len(binary_suffix)
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+
+
+def test_v1_continuous_right_prose_is_not_promoted_or_rejected_without_evidence(
+        tmp_path):
+    suffix = " this narrative continues with several ordinary prose words"
+    _, item = _analyze_v1_right_boundary(tmp_path, suffix)
+    assert item["right_boundary_type"] == "TEXT"
+    assert item["right_side_text_continuity"] == "CONTINUOUS_PROSE"
+    assert item["classification"] == "INCONCLUSIVE"
+    assert item["review_ranking"] == "LOW_REVIEW"
+    assert "V1_LINE_START_WITH_NON_PROSE_RIGHT_BOUNDARY" not in item["reason_codes"]
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+def test_v1_right_boundary_metrics_are_utf16_encoding_aware(tmp_path, encoding):
+    _, item = _analyze_v1_right_boundary(
+        tmp_path, " \t\nfollowing", encoding=encoding)
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    assert item["right_side_text_continuity"] == "TERMINATED"
+    assert item["immediate_right_whitespace_prefix_length"] == 2
+    assert item["immediate_right_delimiter_class"] == "NEWLINE"
+    assert item["next_structural_boundary_distance"] == 4
+    assert item["immediate_right_decoded_char_count"] > 2
+    assert 0.0 < item["immediate_right_nul_ratio"] < 1.0
+
+
+def test_v1_overlapping_pair_retains_independent_safe_right_boundary_metrics(tmp_path):
+    phrase = electrum_v1_phrase()
+    prefix = "\ufeffheader\n"
+    suffix = "\nfooter"
+    image = (prefix + phrase + suffix).encode("utf-16-be")
+    be_start = len(prefix.encode("utf-16-be"))
+    be_end = be_start + len(phrase.encode("utf-16-be"))
+    payload = raw_report(v1_candidate("v1-right-pair", "22" * 32, [
+        provenance(be_start, be_end, "utf-16-be"),
+        provenance(be_start + 1, be_end + 1, "utf-16-le"),
+    ]))
+    items = analyze(
+        tmp_path, image, payload, standard="ELECTRUM_V1", context_bytes=128)[
+            "candidates"][0]["occurrences"]
+    assert len(items) == 2
+    assert {item["encoding"] for item in items} == {"utf-16-le", "utf-16-be"}
+    assert all(item["same_fingerprint"] is True for item in items)
+    assert all(len(item["paired_provenance"]) == 1 for item in items)
+    assert all(item["bytes_examined_after_phrase"] <= 128 for item in items)
+    assert all(item["right_side_text_continuity"] in {
+        "TERMINATED", "WHITESPACE_ONLY", "CONTINUOUS_PROSE",
+        "BINARY_OR_MISDECODED", "AMBIGUOUS"} for item in items)
+
+
+def test_v1_right_boundary_report_contains_only_safe_metrics(tmp_path):
+    phrase, item = _analyze_v1_right_boundary(
+        tmp_path, b"\x80\x81\x82\x83PRIVATE-RIGHT-CONTEXT")
+    encoded = json.dumps(item)
+    assert phrase not in encoded
+    assert "PRIVATE-RIGHT-CONTEXT" not in encoded
+    expected_metrics = {
+        "bytes_examined_after_phrase",
+        "immediate_right_decoded_char_count",
+        "immediate_right_printable_ratio",
+        "immediate_right_nul_ratio",
+        "immediate_right_whitespace_prefix_length",
+        "immediate_right_delimiter_class",
+        "next_structural_boundary_distance",
+        "right_side_text_continuity",
+    }
+    assert expected_metrics <= set(item)
+    assert "raw_bytes" not in encoded.casefold()

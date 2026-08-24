@@ -19,7 +19,7 @@ from bfrs.recovery.mnemonic.electrum_v1_validator import ElectrumV1Validator
 from bfrs.recovery.mnemonic.mnemonic_normalizer import electrum_normalize
 
 
-FORMAT = "BFRS_ELECTRUM_CONTEXT_ANALYSIS_V2_2"
+FORMAT = "BFRS_ELECTRUM_CONTEXT_ANALYSIS_V2_3"
 DEFAULT_CONTEXT_BYTES = 64 * 1024
 DEFAULT_MAX_WINDOW_BYTES = 1024 * 1024
 MAX_OCCURRENCE_SPAN = 64 * 1024
@@ -27,6 +27,7 @@ DENSITY_RADIUS = 8 * 1024
 LOCAL_SIGNAL_RADIUS = 2 * 1024
 WALLET_SIGNAL_RADIUS = 4 * 1024
 NEARBY_LABEL_RADIUS = 512
+RIGHT_BOUNDARY_INSPECTION_BYTES = 128
 _TOKEN = re.compile(r"[^\W\d_]+", re.UNICODE)
 _ENCODINGS = ("utf-8", "utf-16-le", "utf-16-be")
 _STANDARDS = ("ELECTRUM", "ELECTRUM_V1")
@@ -137,6 +138,14 @@ class _Occurrence:
     paired_span_delta: list[dict[str, int]] = field(default_factory=list)
     same_fingerprint: bool | None = None
     same_normalized_word_count: bool | None = None
+    bytes_examined_after_phrase: int = 0
+    immediate_right_decoded_char_count: int = 0
+    immediate_right_printable_ratio: float = 0.0
+    immediate_right_nul_ratio: float = 0.0
+    immediate_right_whitespace_prefix_length: int = 0
+    immediate_right_delimiter_class: str = "NONE"
+    next_structural_boundary_distance: int | None = None
+    right_side_text_continuity: str = "AMBIGUOUS"
 
     @property
     def identity(self) -> tuple[str, str, str, int | None, int | None]:
@@ -618,6 +627,88 @@ def _alignment_metrics(data: bytes, seed_start: int, seed_end: int,
         (0.10 if occurrence.bom_aligned else 0.0))
 
 
+def _right_delimiter_class(character: str) -> str:
+    if character in "\r\n":
+        return "NEWLINE"
+    if character == "\x00":
+        return "NUL"
+    if character in "\"'":
+        return "QUOTE"
+    if character in ":;,=()[]{}<>":
+        return "DELIMITER"
+    if character in ".!?":
+        return "PUNCTUATION"
+    if character.isalnum():
+        return "ALPHANUMERIC"
+    if character.isprintable():
+        return "OTHER_PRINTABLE"
+    return "BINARY"
+
+
+def _encoded_prefix_length(text: str, character_count: int, encoding: str) -> int:
+    return len(text[:character_count].encode(encoding, errors="replace"))
+
+
+def _right_side_metrics(after: bytes, encoding: str,
+                        occurrence: _Occurrence) -> None:
+    sample = after[:RIGHT_BOUNDARY_INSPECTION_BYTES]
+    if encoding.startswith("utf-16") and len(sample) % 2:
+        sample = sample[:-1]
+    occurrence.bytes_examined_after_phrase = len(sample)
+    if not sample:
+        occurrence.immediate_right_delimiter_class = "EOF"
+        occurrence.next_structural_boundary_distance = 0
+        occurrence.right_side_text_continuity = "TERMINATED"
+        return
+
+    decoded = sample.decode(encoding, errors="replace")
+    occurrence.immediate_right_decoded_char_count = len(decoded)
+    printable = sum(character.isprintable() for character in decoded)
+    occurrence.immediate_right_printable_ratio = round(
+        printable / len(decoded), 6) if decoded else 0.0
+    occurrence.immediate_right_nul_ratio = round(
+        sample.count(0) / len(sample), 6)
+
+    whitespace_prefix = len(decoded) - len(decoded.lstrip(" \t"))
+    occurrence.immediate_right_whitespace_prefix_length = whitespace_prefix
+    remainder = decoded[whitespace_prefix:]
+    if not remainder:
+        occurrence.immediate_right_delimiter_class = "EOF_OR_WINDOW_LIMIT"
+        occurrence.right_side_text_continuity = "WHITESPACE_ONLY"
+        return
+
+    occurrence.immediate_right_delimiter_class = _right_delimiter_class(remainder[0])
+    structural = "\r\n\x00\"':;,=()[]{}<>.!?"
+    structural_indexes = [index for index, character in enumerate(decoded)
+                          if character in structural]
+    if structural_indexes:
+        occurrence.next_structural_boundary_distance = _encoded_prefix_length(
+            decoded, min(structural_indexes), encoding)
+
+    delimiter_class = occurrence.immediate_right_delimiter_class
+    if delimiter_class in {
+            "NEWLINE", "NUL", "QUOTE", "DELIMITER", "PUNCTUATION"}:
+        occurrence.right_side_text_continuity = "TERMINATED"
+        return
+
+    replacement_ratio = decoded.count("\ufffd") / len(decoded) if decoded else 0.0
+    control_ratio = sum(
+        not character.isprintable() and character not in "\r\n\t\x00"
+        for character in decoded) / len(decoded) if decoded else 0.0
+    if (replacement_ratio >= 0.20 or control_ratio >= 0.20 or
+            occurrence.immediate_right_printable_ratio < 0.60):
+        occurrence.right_side_text_continuity = "BINARY_OR_MISDECODED"
+        return
+
+    words = _TOKEN.findall(remainder)
+    alphabetic_count = sum(character.isalpha() for character in remainder)
+    if (delimiter_class == "ALPHANUMERIC" and
+            (len(words) >= 3 or alphabetic_count >= 16)):
+        occurrence.right_side_text_continuity = "CONTINUOUS_PROSE"
+    else:
+        occurrence.right_side_text_continuity = "AMBIGUOUS"
+
+
 def _analyze_context(data: bytes, occurrence: _Occurrence,
                      wordlist: frozenset[str]) -> None:
     assert occurrence.context_start is not None
@@ -626,7 +717,9 @@ def _analyze_context(data: bytes, occurrence: _Occurrence,
     seed_start_bytes = occurrence.physical_start - occurrence.context_start
     seed_end_bytes = occurrence.physical_end - occurrence.context_start
     before_bytes = data[:seed_start_bytes]
-    after_bytes = data[seed_end_bytes:]
+    raw_after_bytes = data[seed_end_bytes:]
+    _right_side_metrics(raw_after_bytes, encoding, occurrence)
+    after_bytes = raw_after_bytes
     if encoding.startswith("utf-16"):
         before_bytes = before_bytes[len(before_bytes) % 2:]
         after_bytes = after_bytes[:len(after_bytes) - len(after_bytes) % 2]
@@ -782,16 +875,26 @@ def _analyze_context(data: bytes, occurrence: _Occurrence,
         occurrence.quote_delimited or occurrence.key_value_like_boundary or
         label_value or occurrence.standalone_phrase or
         (positive_nearby_label and (left_strong or right_strong)))
+    v1_line_start_plaintext = (
+        occurrence.source.get("mnemonic_standard") == "ELECTRUM_V1" and
+        occurrence.source.get("validation_status") == "ELECTRUM_V1_STRICT_VALID" and
+        occurrence.word_count == 12 and occurrence.phrase_starts_line and
+        adjacent_dictionary_words == 0 and
+        occurrence.right_side_text_continuity in {
+            "TERMINATED", "WHITESPACE_ONLY", "BINARY_OR_MISDECODED"})
+    if v1_line_start_plaintext:
+        reasons.add("V1_LINE_START_WITH_NON_PROSE_RIGHT_BOUNDARY")
     if strong_false_positive:
         occurrence.classification = "TEXTUAL_FALSE_POSITIVE"
         occurrence.review_ranking = "REJECTED"
     elif core_count >= 2:
         occurrence.classification = "ELECTRUM_WALLET_CONTEXT_CONFIRMED"
         occurrence.review_ranking = "VERY_HIGH_REVIEW"
-    elif exact_dictionary_run and plaintext_boundary:
+    elif exact_dictionary_run and (plaintext_boundary or v1_line_start_plaintext):
         occurrence.classification = "PLAINTEXT_SEED_CANDIDATE"
-        occurrence.review_ranking = "HIGH_REVIEW" if left_strong and right_strong else (
-            "MEDIUM_REVIEW")
+        occurrence.review_ranking = (
+            "HIGH_REVIEW" if v1_line_start_plaintext or
+            (left_strong and right_strong) else "MEDIUM_REVIEW")
     else:
         occurrence.classification = "INCONCLUSIVE"
         occurrence.review_ranking = "LOW_REVIEW"
@@ -936,6 +1039,19 @@ def _occurrence_dict(occurrence: _Occurrence) -> dict[str, object]:
         "paired_span_delta": occurrence.paired_span_delta,
         "same_fingerprint": occurrence.same_fingerprint,
         "same_normalized_word_count": occurrence.same_normalized_word_count,
+        "bytes_examined_after_phrase": occurrence.bytes_examined_after_phrase,
+        "immediate_right_decoded_char_count": (
+            occurrence.immediate_right_decoded_char_count),
+        "immediate_right_printable_ratio": (
+            occurrence.immediate_right_printable_ratio),
+        "immediate_right_nul_ratio": occurrence.immediate_right_nul_ratio,
+        "immediate_right_whitespace_prefix_length": (
+            occurrence.immediate_right_whitespace_prefix_length),
+        "immediate_right_delimiter_class": (
+            occurrence.immediate_right_delimiter_class),
+        "next_structural_boundary_distance": (
+            occurrence.next_structural_boundary_distance),
+        "right_side_text_continuity": occurrence.right_side_text_continuity,
     }
 
 
