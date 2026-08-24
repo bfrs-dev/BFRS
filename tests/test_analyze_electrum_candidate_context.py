@@ -7,6 +7,7 @@ import json
 import pytest
 
 from bfrs.recovery.mnemonic.electrum_seed_validator import ElectrumSeedValidator
+from bfrs.recovery.mnemonic.electrum_v1_validator import ElectrumV1Validator
 from bfrs.tools.analyze_electrum_candidate_context import (
     FORMAT,
     analyze_report,
@@ -25,6 +26,12 @@ def electrum_phrase(word_count: int = 12) -> str:
         if validator.validate(phrase).status == "ELECTRUM_SEED_VALID":
             return phrase
     raise AssertionError("deterministic Electrum fixture not found")
+
+
+@lru_cache(maxsize=1)
+def electrum_v1_phrase() -> str:
+    words = ElectrumV1Validator().mn_encode("000102030405060708090a0b0c0d0e0f")
+    return " ".join(words)
 
 
 def occurrence(start, end, *, encoding="utf-8", word_count=12,
@@ -57,6 +64,32 @@ def candidate(candidate_id, fingerprint, occurrences, *, priority="HIGH_REVIEW",
 def report(*candidates):
     return {"format": "BFRS_ELECTRUM2_REVALIDATION_V1",
             "candidates": list(candidates)}
+
+
+def v1_candidate(candidate_id, fingerprint, provenances):
+    return {
+        "candidate_id": candidate_id,
+        "fingerprint": fingerprint,
+        "mnemonic_standard": "ELECTRUM_V1",
+        "validation_status": "ELECTRUM_V1_STRICT_VALID",
+        "seed_type": "old",
+        "language": "english",
+        "word_count": 12,
+        "provenance": provenances,
+    }
+
+
+def raw_report(*candidates):
+    return {"mnemonic_recovery": {"candidates": list(candidates)}}
+
+
+def provenance(start, end, encoding="utf-8", source_kind="RAW_BYTES"):
+    return {
+        "physical_start": start,
+        "physical_end": end,
+        "encoding": encoding,
+        "source_kind": source_kind,
+    }
 
 
 def analyze(tmp_path, image, payload, **kwargs):
@@ -510,3 +543,185 @@ def test_report_is_secret_free_deterministic_and_cli_writes_json(tmp_path):
                  "--output", str(output), "--context-bytes", "64"]) == 0
     assert json.loads(output.read_text(encoding="utf-8")) == first
     assert "--context-bytes" in build_parser().format_help()
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
+def test_v1_strict_valid_whole_line_is_plaintext_candidate(tmp_path, encoding):
+    phrase = electrum_v1_phrase()
+    prefix, suffix = "note\n", "\nend"
+    image = (prefix + phrase + suffix).encode(encoding)
+    start = len(prefix.encode(encoding))
+    payload = raw_report(v1_candidate("v1-line", "11" * 32, [
+        provenance(start, start + len(phrase.encode(encoding)), encoding)]))
+    result = analyze(tmp_path, image, payload, standard="ELECTRUM_V1")
+    candidate_output = result["candidates"][0]
+    item = candidate_output["occurrences"][0]
+    assert candidate_output["mnemonic_standard"] == "ELECTRUM_V1"
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    assert item["phrase_is_whole_line"] is True
+
+
+def test_v1_seed_label_is_plaintext_candidate(tmp_path):
+    phrase = electrum_v1_phrase()
+    prefix = "seed: "
+    image = (prefix + phrase + "\n").encode()
+    start = len(prefix.encode())
+    payload = raw_report(v1_candidate("v1-label", "12" * 32, [
+        provenance(start, start + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload, standard="ELECTRUM_V1")[
+        "candidates"][0]["occurrences"][0]
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    assert item["key_value_like_boundary"] is True
+    assert "NEARBY_SEED_LABEL" in item["reason_codes"]
+
+
+def test_v1_legacy_wallet_structure_confirms_context(tmp_path):
+    phrase = electrum_v1_phrase()
+    prefix = ("{'seed_version': 4, 'master_public_key': 'safe-public-value', "
+              "'accounts': {'0': {}}, 'use_encryption': false, 'seed': '")
+    image = (prefix + phrase + "'}").encode()
+    start = len(prefix.encode())
+    payload = raw_report(v1_candidate("v1-wallet", "13" * 32, [
+        provenance(start, start + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload, standard="ELECTRUM_V1",
+                   context_bytes=512)["candidates"][0]["occurrences"][0]
+    assert item["classification"] == "ELECTRUM_WALLET_CONTEXT_CONFIRMED"
+    assert item["review_ranking"] == "VERY_HIGH_REVIEW"
+    assert {"ELECTRUM_SEED_METADATA_SIGNAL",
+            "ELECTRUM_MASTER_PUBLIC_KEY_SIGNAL",
+            "ELECTRUM_WALLET_STRUCTURE_SIGNAL"} <= set(item["reason_codes"])
+    assert {"seed_version", "master_public_key", "accounts", "use_encryption"} <= set(
+        item["detected_artifacts"])
+
+
+def test_v1_long_wordlist_is_textual_false_positive(tmp_path):
+    validator = ElectrumV1Validator()
+    phrase = electrum_v1_phrase()
+    prefix = " ".join(validator.wordlist[:20]) + " "
+    suffix = " " + " ".join(validator.wordlist[20:40])
+    image = (prefix + phrase + suffix).encode()
+    start = len(prefix.encode())
+    payload = raw_report(v1_candidate("v1-wordlist", "14" * 32, [
+        provenance(start, start + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload, standard="ELECTRUM_V1")[
+        "candidates"][0]["occurrences"][0]
+    assert item["classification"] == "TEXTUAL_FALSE_POSITIVE"
+    assert "MNEMONIC_EMBEDDED_IN_WORDLIST" in item["reason_codes"]
+
+
+def test_v1_example_vector_is_textual_false_positive(tmp_path):
+    phrase = electrum_v1_phrase()
+    prefix = "documentation test vector seed: "
+    image = (prefix + phrase + "\n").encode()
+    start = len(prefix.encode())
+    payload = raw_report(v1_candidate("v1-example", "15" * 32, [
+        provenance(start, start + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload, standard="ELECTRUM_V1")[
+        "candidates"][0]["occurrences"][0]
+    assert item["classification"] == "TEXTUAL_FALSE_POSITIVE"
+    assert "EXAMPLE_OR_TEST_CONTEXT" in item["reason_codes"]
+
+
+def test_v1_missing_wallet_structure_with_boundaries_is_not_false_positive(tmp_path):
+    phrase = electrum_v1_phrase()
+    image = ("\"" + phrase + "\"").encode()
+    payload = raw_report(v1_candidate("v1-quoted", "16" * 32, [
+        provenance(1, 1 + len(phrase.encode()))]))
+    item = analyze(tmp_path, image, payload, standard="ELECTRUM_V1")[
+        "candidates"][0]["occurrences"][0]
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+    assert item["quote_delimited"] is True
+    assert not {"ELECTRUM_WALLET_TYPE_SIGNAL", "ELECTRUM_KEYSTORE_SIGNAL"} & set(
+        item["reason_codes"])
+
+
+@pytest.mark.parametrize("natural_encoding", ["utf-16-le", "utf-16-be"])
+def test_v1_overlapping_utf16_provenance_is_paired_and_alignment_ranked(
+        tmp_path, natural_encoding):
+    phrase = electrum_v1_phrase()
+    text = "\ufeffheader\n" + phrase + "\nfooter"
+    image = text.encode(natural_encoding)
+    natural_start = len("\ufeffheader\n".encode(natural_encoding))
+    natural_end = natural_start + len(phrase.encode(natural_encoding))
+    alternate_encoding = ("utf-16-be" if natural_encoding == "utf-16-le"
+                          else "utf-16-le")
+    alternate_shift = -1 if natural_encoding == "utf-16-le" else 1
+    payload = raw_report(v1_candidate("v1-pair", "17" * 32, [
+        provenance(natural_start, natural_end, natural_encoding),
+        provenance(natural_start + alternate_shift,
+                   natural_end + alternate_shift, alternate_encoding),
+    ]))
+    result = analyze(tmp_path, image, payload, standard="ELECTRUM_V1",
+                     context_bytes=256)
+    items = result["candidates"][0]["occurrences"]
+    assert len(items) == 2
+    by_encoding = {item["encoding"]: item for item in items}
+    natural = by_encoding[natural_encoding]
+    alternate = by_encoding[alternate_encoding]
+    assert natural["encoding_alignment_assessment"] == "NATURAL"
+    assert alternate["encoding_alignment_assessment"] == "ALTERNATE_INTERPRETATION"
+    for item in items:
+        assert item["same_fingerprint"] is True
+        assert item["same_normalized_word_count"] is True
+        assert len(item["paired_provenance"]) == 1
+        assert abs(item["paired_span_delta"][0]["physical_start"]) == 1
+        assert abs(item["paired_span_delta"][0]["physical_end"]) == 1
+
+
+def test_v1_candidate_id_selects_all_raw_provenance_and_physical_start_can_narrow(
+        tmp_path):
+    phrase = electrum_v1_phrase()
+    image = (phrase + "\n" + phrase).encode("utf-16-le")
+    first_end = len(phrase.encode("utf-16-le"))
+    second_start = first_end + len("\n".encode("utf-16-le"))
+    selected = v1_candidate("wanted", "18" * 32, [
+        provenance(0, first_end, "utf-16-le"),
+        provenance(second_start, len(image), "utf-16-le"),
+        provenance(0, first_end, "utf-16-le", source_kind="DOCUMENT"),
+    ])
+    other = v1_candidate("other", "19" * 32, [
+        provenance(0, first_end, "utf-16-le")])
+    payload = raw_report(selected, other)
+    all_occurrences = analyze_report(
+        payload, _write_image(tmp_path, image), context_bytes=0,
+        standard="ELECTRUM_V1", candidate_id="wanted")
+    assert all_occurrences["summary"]["selected_candidates"] == 1
+    assert all_occurrences["summary"]["selected_occurrences"] == 2
+    narrowed = analyze_report(
+        payload, _write_image(tmp_path, image), context_bytes=0,
+        standard="ELECTRUM_V1", candidate_id="wanted",
+        physical_start=second_start)
+    assert narrowed["summary"]["selected_occurrences"] == 1
+    assert narrowed["candidates"][0]["occurrences"][0][
+        "physical_start"] == second_start
+
+
+def _write_image(tmp_path, data):
+    path = tmp_path / "v1-fixture.img"
+    path.write_bytes(data)
+    return path
+
+
+def test_v1_report_is_secret_free_and_deterministic(tmp_path):
+    phrase = electrum_v1_phrase()
+    private_marker = "xprv-V1-PRIVATE-MATERIAL"
+    prefix = "password=private; master_public_key='safe'; seed='"
+    image_data = (prefix + phrase + "'; private_key='" + private_marker + "'").encode()
+    start = len(prefix.encode())
+    payload = raw_report(v1_candidate("v1-safe", "20" * 32, [
+        provenance(start, start + len(phrase.encode()))]))
+    image = _write_image(tmp_path, image_data)
+    first = analyze_report(payload, image, context_bytes=256,
+                           standard="ELECTRUM_V1", candidate_id="v1-safe")
+    second = analyze_report(payload, image, context_bytes=256,
+                            standard="ELECTRUM_V1", candidate_id="v1-safe")
+    encoded = json.dumps(first)
+    assert first == second
+    assert phrase not in encoded
+    assert private_marker not in encoded
+    assert "raw_bytes" not in encoded.casefold()
+    assert first["candidates"][0]["mnemonic_standard"] == "ELECTRUM_V1"
+    help_text = build_parser().format_help()
+    assert "--standard" in help_text
+    assert "--candidate-id" in help_text
+    assert "--physical-start" in help_text

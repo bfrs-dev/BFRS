@@ -1,10 +1,11 @@
-"""Classify local context for selected, already-revalidated Electrum 2+ hits."""
+"""Classify local context for selected, already-validated Electrum hits."""
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,10 +15,11 @@ from typing import BinaryIO, Callable, ContextManager, Sequence
 
 from bfrs.recovery.mnemonic.bip39_validator import BIP39Validator
 from bfrs.recovery.mnemonic.electrum_seed_validator import ElectrumSeedValidator
+from bfrs.recovery.mnemonic.electrum_v1_validator import ElectrumV1Validator
 from bfrs.recovery.mnemonic.mnemonic_normalizer import electrum_normalize
 
 
-FORMAT = "BFRS_ELECTRUM_CONTEXT_ANALYSIS_V2_1"
+FORMAT = "BFRS_ELECTRUM_CONTEXT_ANALYSIS_V2_2"
 DEFAULT_CONTEXT_BYTES = 64 * 1024
 DEFAULT_MAX_WINDOW_BYTES = 1024 * 1024
 MAX_OCCURRENCE_SPAN = 64 * 1024
@@ -27,11 +29,15 @@ WALLET_SIGNAL_RADIUS = 4 * 1024
 NEARBY_LABEL_RADIUS = 512
 _TOKEN = re.compile(r"[^\W\d_]+", re.UNICODE)
 _ENCODINGS = ("utf-8", "utf-16-le", "utf-16-be")
+_STANDARDS = ("ELECTRUM", "ELECTRUM_V1")
+_FINGERPRINT_DOMAIN = b"BFRS-MNEMONIC-FINGERPRINT-V1\0"
 
 _KEYWORDS = (
     "seed", "seed_version", "wallet_type", "keystore", "master_public_key",
     "master_public_keys", "xpub", "xprv", "accounts", "receiving", "change",
     "electrum", "seed_type",
+    "use_encryption", "addresses", "imported_keys", "seed_encrypted",
+    "password",
 )
 _NEARBY_LABELS = (
     "seed", "mnemonic", "recovery", "recovery phrase", "wallet", "bitcoin",
@@ -118,17 +124,31 @@ class _Occurrence:
     nearby_labels: list[dict[str, object]] = field(default_factory=list)
     local_cluster_id: str | None = None
     nearby_selected_occurrence_count: int = 0
+    normalized_fingerprint: str | None = field(default=None, repr=False)
+    normalized_word_count: int | None = field(default=None, repr=False)
+    printable_text_ratio: float = 0.0
+    expected_nul_ratio: float = 0.0
+    opposite_nul_ratio: float = 0.0
+    aligned_context_code_units: int = 0
+    bom_aligned: bool = False
+    alignment_score: float = field(default=0.0, repr=False)
+    encoding_alignment_assessment: str = "AMBIGUOUS"
+    paired_provenance: list[dict[str, object]] = field(default_factory=list)
+    paired_span_delta: list[dict[str, int]] = field(default_factory=list)
+    same_fingerprint: bool | None = None
+    same_normalized_word_count: bool | None = None
 
     @property
-    def identity(self) -> tuple[str, str, int | None, int | None]:
+    def identity(self) -> tuple[str, str, str, int | None, int | None]:
         return (self.candidate_id, self.fingerprint,
-                self.physical_start, self.physical_end)
+                self.encoding, self.physical_start, self.physical_end)
 
 
 @dataclass(slots=True)
 class _Candidate:
     candidate_id: str
     fingerprint: str
+    mnemonic_standard: str
     source: dict[str, object]
     occurrences: list[_Occurrence]
 
@@ -147,38 +167,70 @@ def _integer(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _select(report: dict[str, object]) -> tuple[int, list[_Candidate]]:
+def _candidate_payload(report: dict[str, object]) -> object:
     payload = report.get("candidates")
+    if isinstance(payload, list):
+        return payload
+    recovery = report.get("mnemonic_recovery")
+    if isinstance(recovery, dict):
+        return recovery.get("candidates")
+    return None
+
+
+def _select(report: dict[str, object], *, standard: str,
+            candidate_id_filter: str | None,
+            physical_start_filter: int | None) -> tuple[int, list[_Candidate]]:
+    payload = _candidate_payload(report)
     if not isinstance(payload, list):
         raise ValueError("context input has no candidates list")
     selected: list[_Candidate] = []
-    seen: set[tuple[str, str, int | None, int | None]] = set()
+    seen: set[tuple[str, str, str, int | None, int | None]] = set()
     for item in payload:
-        if not isinstance(item, dict) or item.get("mnemonic_standard") != "ELECTRUM":
-            continue
-        if item.get("revalidation_priority") != "HIGH_REVIEW":
+        if not isinstance(item, dict) or item.get("mnemonic_standard") != standard:
             continue
         candidate_id = str(item.get("candidate_id", ""))
+        if candidate_id_filter is not None and candidate_id != candidate_id_filter:
+            continue
         fingerprint = str(item.get("fingerprint", ""))
+        if standard == "ELECTRUM":
+            if item.get("revalidation_priority") != "HIGH_REVIEW":
+                continue
+            source_occurrences = item.get("occurrences", [])
+        else:
+            if (item.get("validation_status") != "ELECTRUM_V1_STRICT_VALID" or
+                    _integer(item.get("word_count")) != 12):
+                continue
+            source_occurrences = item.get("provenance", [])
         occurrences = []
-        source_occurrences = item.get("occurrences", [])
         if not isinstance(source_occurrences, list):
             continue
-        for occurrence in source_occurrences:
-            if not isinstance(occurrence, dict):
+        for provenance in source_occurrences:
+            if not isinstance(provenance, dict):
                 continue
-            word_count = _integer(occurrence.get("word_count"))
-            if (occurrence.get("status") != "SURVIVED" or
-                    occurrence.get("validation_status") != "ELECTRUM_SEED_VALID" or
-                    word_count not in {12, 13}):
+            if standard == "ELECTRUM":
+                occurrence = provenance
+                word_count = _integer(occurrence.get("word_count"))
+                if (occurrence.get("status") != "SURVIVED" or
+                        occurrence.get("validation_status") != "ELECTRUM_SEED_VALID" or
+                        word_count not in {12, 13}):
+                    continue
+            else:
+                if provenance.get("source_kind") != "RAW_BYTES":
+                    continue
+                occurrence = {**item, **provenance}
+                word_count = 12
+            physical_start = _integer(occurrence.get("physical_start"))
+            if (physical_start_filter is not None and
+                    physical_start != physical_start_filter):
                 continue
             selected_occurrence = _Occurrence(
                 candidate_id=candidate_id,
                 fingerprint=fingerprint,
                 encoding=str(occurrence.get("new_encoding") or
-                             occurrence.get("old_encoding") or "unknown"),
+                             occurrence.get("old_encoding") or
+                             occurrence.get("encoding") or "unknown"),
                 word_count=word_count,
-                physical_start=_integer(occurrence.get("physical_start")),
+                physical_start=physical_start,
                 physical_end=_integer(occurrence.get("physical_end")),
                 source=occurrence,
             )
@@ -191,7 +243,8 @@ def _select(report: dict[str, object]) -> tuple[int, list[_Candidate]]:
                 value.physical_start is None,
                 value.physical_start if value.physical_start is not None else -1,
                 value.physical_end if value.physical_end is not None else -1))
-            selected.append(_Candidate(candidate_id, fingerprint, item, occurrences))
+            selected.append(_Candidate(
+                candidate_id, fingerprint, standard, item, occurrences))
     selected.sort(key=lambda value: (value.fingerprint, value.candidate_id))
     return len(payload), selected
 
@@ -523,6 +576,48 @@ def _match_distance(patterns: Sequence[str] | re.Pattern[str], text: str,
     return min(distances) if distances else None
 
 
+def _fingerprint(standard: str, normalized: str) -> str:
+    material = (_FINGERPRINT_DOMAIN + standard.encode("ascii") + b"\0" +
+                normalized.encode("utf-8"))
+    return hashlib.sha256(material).hexdigest()
+
+
+def _alignment_metrics(data: bytes, seed_start: int, seed_end: int,
+                       encoding: str, occurrence: _Occurrence) -> None:
+    if not encoding.startswith("utf-16"):
+        occurrence.encoding_alignment_assessment = "NATURAL"
+        return
+    radius = 1024
+    start = max(0, seed_start - radius)
+    start += (seed_start - start) % 2
+    end = min(len(data), seed_end + radius)
+    end -= (end - start) % 2
+    sample = data[start:end]
+    units = len(sample) // 2
+    if not units:
+        return
+    decoded = sample.decode(encoding, errors="replace")
+    textual = sum(character.isprintable() or character in "\r\n\t"
+                  for character in decoded)
+    occurrence.printable_text_ratio = round(textual / len(decoded), 6) if decoded else 0.0
+    high_index = 1 if encoding == "utf-16-le" else 0
+    expected_nuls = sum(sample[index + high_index] == 0
+                        for index in range(0, len(sample), 2))
+    opposite_nuls = sum(sample[index + (1 - high_index)] == 0
+                        for index in range(0, len(sample), 2))
+    occurrence.expected_nul_ratio = round(expected_nuls / units, 6)
+    occurrence.opposite_nul_ratio = round(opposite_nuls / units, 6)
+    occurrence.aligned_context_code_units = units
+    bom = b"\xff\xfe" if encoding == "utf-16-le" else b"\xfe\xff"
+    occurrence.bom_aligned = any(
+        sample[index:index + 2] == bom for index in range(0, len(sample), 2))
+    nul_direction = max(
+        0.0, occurrence.expected_nul_ratio - occurrence.opposite_nul_ratio)
+    occurrence.alignment_score = (
+        0.65 * occurrence.printable_text_ratio + 0.25 * nul_direction +
+        (0.10 if occurrence.bom_aligned else 0.0))
+
+
 def _analyze_context(data: bytes, occurrence: _Occurrence,
                      wordlist: frozenset[str]) -> None:
     assert occurrence.context_start is not None
@@ -530,10 +625,21 @@ def _analyze_context(data: bytes, occurrence: _Occurrence,
     encoding = occurrence.encoding if occurrence.encoding in _ENCODINGS else "utf-8"
     seed_start_bytes = occurrence.physical_start - occurrence.context_start
     seed_end_bytes = occurrence.physical_end - occurrence.context_start
-    before = data[:seed_start_bytes].decode(encoding, errors="ignore").casefold()
+    before_bytes = data[:seed_start_bytes]
+    after_bytes = data[seed_end_bytes:]
+    if encoding.startswith("utf-16"):
+        before_bytes = before_bytes[len(before_bytes) % 2:]
+        after_bytes = after_bytes[:len(after_bytes) - len(after_bytes) % 2]
+    before = before_bytes.decode(encoding, errors="ignore").casefold()
     seed = data[seed_start_bytes:seed_end_bytes].decode(
         encoding, errors="ignore").casefold()
-    after = data[seed_end_bytes:].decode(encoding, errors="ignore").casefold()
+    normalized_seed = electrum_normalize(seed)
+    occurrence.normalized_fingerprint = _fingerprint(
+        occurrence.source.get("mnemonic_standard", "ELECTRUM"), normalized_seed)
+    occurrence.normalized_word_count = len(normalized_seed.split())
+    _alignment_metrics(
+        data, seed_start_bytes, seed_end_bytes, encoding, occurrence)
+    after = after_bytes.decode(encoding, errors="ignore").casefold()
     text = before + seed + after
     seed_start = len(before)
     seed_end = seed_start + len(seed)
@@ -694,6 +800,55 @@ def _analyze_context(data: bytes, occurrence: _Occurrence,
     occurrence.artifacts = artifacts
 
 
+def _pair_provenance(candidates: list[_Candidate]) -> None:
+    for candidate in candidates:
+        occurrences = candidate.occurrences
+        for index, left in enumerate(occurrences):
+            if left.classification == "READ_FAILED":
+                continue
+            for right in occurrences[index + 1:]:
+                if right.classification == "READ_FAILED":
+                    continue
+                if ({left.encoding, right.encoding} != {"utf-16-le", "utf-16-be"} or
+                        left.physical_start is None or right.physical_start is None or
+                        left.physical_end is None or right.physical_end is None):
+                    continue
+                start_delta = right.physical_start - left.physical_start
+                end_delta = right.physical_end - left.physical_end
+                if abs(start_delta) != 1 or abs(end_delta) != 1:
+                    continue
+                same_fingerprint = bool(
+                    left.normalized_fingerprint and
+                    left.normalized_fingerprint == right.normalized_fingerprint)
+                same_word_count = bool(
+                    left.normalized_word_count is not None and
+                    left.normalized_word_count == right.normalized_word_count ==
+                    left.word_count == right.word_count)
+                for current, partner, delta_start, delta_end in (
+                        (left, right, start_delta, end_delta),
+                        (right, left, -start_delta, -end_delta)):
+                    current.paired_provenance.append({
+                        "encoding": partner.encoding,
+                        "physical_start": partner.physical_start,
+                        "physical_end": partner.physical_end,
+                    })
+                    current.paired_span_delta.append({
+                        "physical_start": delta_start,
+                        "physical_end": delta_end,
+                    })
+                    current.same_fingerprint = same_fingerprint
+                    current.same_normalized_word_count = same_word_count
+                score_delta = left.alignment_score - right.alignment_score
+                if abs(score_delta) >= 0.05:
+                    natural, alternate = ((left, right) if score_delta > 0 else
+                                          (right, left))
+                    natural.encoding_alignment_assessment = "NATURAL"
+                    alternate.encoding_alignment_assessment = "ALTERNATE_INTERPRETATION"
+                else:
+                    left.encoding_alignment_assessment = "AMBIGUOUS"
+                    right.encoding_alignment_assessment = "AMBIGUOUS"
+
+
 def _read_windows(stream: BinaryIO, windows: list[_Window],
                   wordlist: frozenset[str]) -> tuple[int, int]:
     windows_read = bytes_read = 0
@@ -770,6 +925,17 @@ def _occurrence_dict(occurrence: _Occurrence) -> dict[str, object]:
         "local_cluster_id": occurrence.local_cluster_id,
         "nearby_selected_occurrence_count": (
             occurrence.nearby_selected_occurrence_count),
+        "printable_text_ratio": occurrence.printable_text_ratio,
+        "expected_nul_ratio": occurrence.expected_nul_ratio,
+        "opposite_nul_ratio": occurrence.opposite_nul_ratio,
+        "aligned_context_code_units": occurrence.aligned_context_code_units,
+        "bom_aligned": occurrence.bom_aligned,
+        "encoding_alignment_assessment": (
+            occurrence.encoding_alignment_assessment),
+        "paired_provenance": occurrence.paired_provenance,
+        "paired_span_delta": occurrence.paired_span_delta,
+        "same_fingerprint": occurrence.same_fingerprint,
+        "same_normalized_word_count": occurrence.same_normalized_word_count,
     }
 
 
@@ -785,8 +951,8 @@ def _candidate_dict(candidate: _Candidate) -> dict[str, object]:
     return {
         "candidate_id": candidate.candidate_id,
         "fingerprint": candidate.fingerprint,
-        "mnemonic_standard": "ELECTRUM",
-        "revalidation_priority": "HIGH_REVIEW",
+        "mnemonic_standard": candidate.mnemonic_standard,
+        "revalidation_priority": candidate.source.get("revalidation_priority"),
         "classification": classification,
         "review_ranking": ranking,
         "occurrence_classification_distribution": dict(sorted(classes.items())),
@@ -796,22 +962,33 @@ def _candidate_dict(candidate: _Candidate) -> dict[str, object]:
 
 def _wordlist() -> frozenset[str]:
     electrum = ElectrumSeedValidator()
+    electrum_v1 = ElectrumV1Validator()
     bip39 = BIP39Validator()
     return frozenset(word for values in (*electrum.wordlists.values(),
-                                         *bip39.wordlists.values()) for word in values)
+                                         *bip39.wordlists.values(),
+                                         electrum_v1.wordlist) for word in values)
 
 
 def analyze_report(report: dict[str, object], image: str | Path, *,
                    context_bytes: int = DEFAULT_CONTEXT_BYTES,
                    max_window_bytes: int = DEFAULT_MAX_WINDOW_BYTES,
+                   standard: str = "ELECTRUM",
+                   candidate_id: str | None = None,
+                   physical_start: int | None = None,
                    stream_factory: StreamFactory | None = None) -> dict[str, object]:
     if context_bytes < 0:
         raise ValueError("context-bytes must be nonnegative")
     if max_window_bytes <= 0 or 2 * context_bytes + MAX_OCCURRENCE_SPAN > max_window_bytes:
         raise ValueError("max-window-bytes is too small for context and occurrence limit")
+    if standard not in _STANDARDS:
+        raise ValueError(f"unsupported standard: {standard}")
+    if physical_start is not None and physical_start < 0:
+        raise ValueError("physical-start must be nonnegative")
     image_path = Path(image).resolve()
     image_size = image_path.stat().st_size
-    input_candidates, candidates = _select(report)
+    input_candidates, candidates = _select(
+        report, standard=standard, candidate_id_filter=candidate_id,
+        physical_start_filter=physical_start)
     occurrences = [item for candidate in candidates for item in candidate.occurrences]
     readable = _prepare_occurrences(candidates, image_size, context_bytes)
     _density(readable)
@@ -820,6 +997,7 @@ def analyze_report(report: dict[str, object], image: str | Path, *,
     factory = stream_factory or (lambda path: path.open("rb"))
     with factory(image_path) as stream:
         windows_read, bytes_read = _read_windows(stream, windows, _wordlist())
+    _pair_provenance(candidates)
     results = [_candidate_dict(candidate) for candidate in candidates]
     occurrence_classes = Counter(item.classification for item in occurrences)
     candidate_classes = Counter(item["classification"] for item in results)
@@ -856,9 +1034,11 @@ def analyze_report(report: dict[str, object], image: str | Path, *,
     return {
         "format": FORMAT,
         "configuration": {
-            "priority_filter": "HIGH_REVIEW",
-            "standard_filter": "ELECTRUM",
-            "word_counts": [12, 13],
+            "priority_filter": ("HIGH_REVIEW" if standard == "ELECTRUM" else None),
+            "standard_filter": standard,
+            "candidate_id_filter": candidate_id,
+            "physical_start_filter": physical_start,
+            "word_counts": [12, 13] if standard == "ELECTRUM" else [12],
             "context_bytes": context_bytes,
             "max_window_bytes": max_window_bytes,
             "density_radius_bytes": DENSITY_RADIUS,
@@ -895,7 +1075,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__,
     )
     parser.add_argument("--report", required=True, type=Path,
-                        help="Electrum 2+ revalidation JSON")
+                        help="Electrum candidate JSON")
     parser.add_argument("--image", required=True, type=Path,
                         help="source image opened once and read-only")
     parser.add_argument("--output", required=True, type=Path,
@@ -903,6 +1083,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--context-bytes", type=int, default=DEFAULT_CONTEXT_BYTES)
     parser.add_argument("--max-window-bytes", type=int,
                         default=DEFAULT_MAX_WINDOW_BYTES)
+    parser.add_argument("--standard", choices=_STANDARDS, default="ELECTRUM",
+                        help="mnemonic standard (default: ELECTRUM)")
+    parser.add_argument("--candidate-id",
+                        help="analyze only this exact candidate id")
+    parser.add_argument("--physical-start", type=int,
+                        help="optionally restrict to one exact physical start")
     return parser
 
 
@@ -914,7 +1100,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("report root must be an object")
         result = analyze_report(
             report, arguments.image, context_bytes=arguments.context_bytes,
-            max_window_bytes=arguments.max_window_bytes)
+            max_window_bytes=arguments.max_window_bytes,
+            standard=arguments.standard, candidate_id=arguments.candidate_id,
+            physical_start=arguments.physical_start)
         write_report(result, arguments.output)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"Electrum context analysis failed: {error}", file=sys.stderr)
