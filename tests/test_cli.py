@@ -404,6 +404,40 @@ def test_cli_targets_all_uses_shared_registry_and_safe_findings(tmp_path):
     assert all("raw_bytes" not in item for item in payload["target_findings"])
 
 
+def test_cli_targets_all_reports_sparse_complete_progress(tmp_path, capsys):
+    source = tmp_path / "small.img"
+    source.write_bytes(b"nothing")
+    report = tmp_path / "small.json"
+
+    assert main(basic_arguments(source, report) + ["--targets", "all"]) == 0
+
+    stderr = capsys.readouterr().err
+    assert "Target scan 100.0%" in stderr
+    assert "7/7 bytes" in stderr
+    assert "MiB/s" in stderr
+    assert "ETA 00:00:00" in stderr
+    assert "findings=0" in stderr
+    for target in ("bitcoin-core", "multibit", "armory", "electrum", "secrets"):
+        assert f"{target}=0" in stderr
+    assert stderr.count("\rTarget scan") == 1
+
+
+def test_cli_progress_handles_empty_input_without_division_by_zero(
+    tmp_path, capsys,
+):
+    source = tmp_path / "empty.img"
+    source.write_bytes(b"")
+    report = tmp_path / "empty.json"
+
+    assert main(basic_arguments(source, report) + ["--targets", "all"]) == 0
+
+    stderr = capsys.readouterr().err
+    assert "Target scan 100.0%" in stderr
+    assert "0/0 bytes" in stderr
+    assert "0.0 MiB/s" in stderr
+    assert "ETA 00:00:00" in stderr
+
+
 def test_cli_targets_validate_unknown_and_legacy_mode_conflicts(tmp_path):
     source = tmp_path / "source.img"
     source.write_bytes(b"nothing")

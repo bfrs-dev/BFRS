@@ -1,7 +1,7 @@
 """Coordinate conservative Bitcoin wallet recovery over an image range."""
 
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -85,7 +85,12 @@ from bfrs.recovery.electrum_raw_recovery import (
     ElectrumRawRecoveryPipeline,
     known_electrum_artifacts_from_contexts,
 )
-from bfrs.scanners.fast_scanner import ChunkDetector, FastScanner, Signature
+from bfrs.scanners.fast_scanner import (
+    ChunkDetector,
+    FastScanner,
+    ScanProgress,
+    Signature,
+)
 from bfrs.scanners.target_registry import TARGET_ARMORY, TARGET_MULTIBIT
 from bfrs.scanners.hotspot_builder import (
     DEFAULT_CLUSTER_GAP,
@@ -221,6 +226,7 @@ class FullImageRecoveryCoordinator:
         *,
         electrum_only: bool = False,
         targets: frozenset[str] | None = None,
+        progress: Callable[[ScanProgress], None] | None = None,
     ) -> FullImageRecoveryResult:
         reader = ChunkReader(path, chunk_size=self._chunk_size, overlap=self._overlap)
         range_end = reader.file_size if end is None else end
@@ -229,7 +235,7 @@ class FullImageRecoveryCoordinator:
         if electrum_only:
             return self._scan_electrum_only(
                 reader, start, range_end, ntfs_locator,
-                ntfs_bitcoin_artifact_index,
+                ntfs_bitcoin_artifact_index, progress,
             )
         ntfs_directory_index_artifact_recovery = (
             NTFSDirectoryIndexArtifactRecoveryPipeline(
@@ -264,7 +270,8 @@ class FullImageRecoveryCoordinator:
         detached_indx_offsets: list[int] = []
         raw_hit_counts: Counter[str] = Counter()
         try:
-            for hit in self._scanner.scan(reader, start=start, end=range_end):
+            for hit in self._scanner.scan(
+                    reader, start=start, end=range_end, progress=progress):
                 raw_hit_counts[hit.hit_type] += 1
                 if (hit.target != "unknown" and
                         hit.artifact_kind not in {
@@ -571,6 +578,7 @@ class FullImageRecoveryCoordinator:
         range_end: int,
         ntfs_locator: NTFSBitcoinArtifactLocator,
         ntfs_index: NTFSBitcoinArtifactIndex,
+        progress: Callable[[ScanProgress], None] | None,
     ) -> FullImageRecoveryResult:
         """Run only raw Electrum validation and required NTFS correlation."""
         detached_pipeline = NTFSDetachedVolumeDiscoveryPipeline(
@@ -580,7 +588,8 @@ class FullImageRecoveryCoordinator:
         )
         electrum_hits: list[RawHit] = []
         raw_hit_counts: Counter[str] = Counter()
-        for hit in self._scanner.scan(reader, start=start, end=range_end):
+        for hit in self._scanner.scan(
+                reader, start=start, end=range_end, progress=progress):
             raw_hit_counts[hit.hit_type] += 1
             if hit.hit_type == NTFS_BOOT_SECTOR_SIGNATURE:
                 detached_pipeline.process_hit(hit)

@@ -16,6 +16,7 @@ from bfrs.recovery.mnemonic.seed_scan_checkpoint import (
 )
 from bfrs.reporting.json_report import write_json_report
 from bfrs.reporting.json_report import serialize_full_image_result
+from bfrs.scanners.fast_scanner import ScanProgress
 from bfrs.scanners.target_registry import (
     AVAILABLE_TARGETS,
     BITCOIN_CORE_SIGNATURES_V1,
@@ -34,6 +35,98 @@ DEFAULT_CLUSTER_MIB = 2
 DEFAULT_PADDING_MIB = 1
 DEFAULT_MINIMUM_HITS = 1
 DEFAULT_MINIMUM_DISTINCT_TYPES = 1
+
+
+class _ProgressLine:
+    """Render throttled aggregate scan progress on one stderr line."""
+
+    def __init__(
+        self,
+        label: str,
+        *,
+        targets: frozenset[str] = frozenset(),
+        rate_base: int = 0,
+        workers: int | None = None,
+        display_gib: bool = False,
+    ) -> None:
+        self._label = label
+        self._targets = tuple(
+            target for target in AVAILABLE_TARGETS if target in targets)
+        self._rate_base = rate_base
+        self._workers = workers
+        self._display_gib = display_gib
+        self._started = time.monotonic()
+        self._last_rendered = 0.0
+        self._rendered = False
+
+    def __call__(self, update: ScanProgress) -> None:
+        self.update(
+            update.scanned_bytes,
+            update.total_bytes,
+            findings_total=update.findings_total,
+            findings_by_target=update.findings_by_target,
+            complete=update.complete,
+        )
+
+    def update(
+        self,
+        processed: int,
+        total: int,
+        *,
+        findings_total: int | None = None,
+        findings_by_target: dict[str, int] | None = None,
+        complete: bool | None = None,
+    ) -> None:
+        now = time.monotonic()
+        is_complete = (total == 0 or processed >= total
+                       if complete is None else complete)
+        if not is_complete and now - self._last_rendered < 0.5:
+            return
+        self._last_rendered = now
+        elapsed = max(now - self._started, 1e-9)
+        rate = max(0, processed - self._rate_base) / 2**20 / elapsed
+        percent = 100.0 if total == 0 else min(100.0, processed * 100.0 / total)
+        if is_complete:
+            eta = "00:00:00"
+        elif processed == 0 or rate <= 0:
+            eta = "calculating..."
+        else:
+            remaining = max(
+                0.0,
+                (total - processed) / 2**20 / rate,
+            )
+            hours, remainder = divmod(int(remaining), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            eta = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        target_counts = " ".join(
+            f"{target}={(findings_by_target or {}).get(target, 0)}"
+            for target in self._targets
+        )
+        details = []
+        if findings_total is not None:
+            details.append(f"findings={findings_total}")
+        if target_counts:
+            details.append(target_counts)
+        if self._workers is not None:
+            details.append(f"workers={self._workers}")
+        suffix = f"  {'  '.join(details)}" if details else ""
+        byte_progress = (
+            f"{processed / 2**30:.1f}/{total / 2**30:.1f} GiB"
+            if self._display_gib else f"{processed}/{total} bytes"
+        )
+        print(
+            f"\r{self._label} {percent:5.1f}%  {byte_progress}  "
+            f"{rate:.1f} MiB/s  ETA {eta}{suffix}",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._rendered = True
+
+    def finish(self) -> None:
+        if self._rendered:
+            print(file=sys.stderr)
+            self._rendered = False
 
 
 def _integer(value: str) -> int:
@@ -165,11 +258,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--start must not exceed input size")
 
     if arguments.seed_scan_only:
-        started = time.monotonic()
-        last_progress = [0.0]
         range_end = file_size if arguments.end is None else arguments.end
         worker_count = resolve_worker_count(arguments.workers)
-        progress_rendered = [False]
         chunk_size = arguments.chunk_mib * 1024 * 1024
         overlap = arguments.overlap_kib * 1024
         checkpoint = None
@@ -188,44 +278,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"checkpoint error: {error}", file=sys.stderr)
             return 3
         resumed_bytes = checkpoint.completed_bytes if arguments.resume_checkpoint else 0
-
-        def report_progress(processed: int, total: int) -> None:
-            now = time.monotonic()
-            if processed < total and now - last_progress[0] < 0.5:
-                return
-            last_progress[0] = now
-            elapsed = max(now - started, 1e-9)
-            percent = 100.0 if not total else processed * 100.0 / total
-            newly_processed = max(0, processed - resumed_bytes)
-            rate = newly_processed / 2**20 / elapsed
-            filled = min(20, int(percent / 5))
-            if elapsed < 2.0 or processed == 0 or rate <= 0:
-                eta = "calculating..."
-            else:
-                remaining = max(0.0, (total - processed) / 2**20 / rate)
-                hours, remainder = divmod(int(remaining), 3600)
-                minutes, seconds = divmod(remainder, 60)
-                eta = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            label = "Seed scan RESUMED" if arguments.resume_checkpoint else "Seed scan"
-            print(f"\r{label} [{'#' * filled}{'-' * (20 - filled)}] {percent:5.1f}%  "
-                  f"{processed / 2**30:.1f}/{total / 2**30:.1f} GiB  {rate:.1f} MiB/s  "
-                  f"ETA {eta}  workers={worker_count}", end="", file=sys.stderr,
-                  flush=True)
-            progress_rendered[0] = True
+        seed_progress = _ProgressLine(
+            "Seed scan RESUMED" if arguments.resume_checkpoint else "Seed scan",
+            rate_base=resumed_bytes,
+            workers=worker_count,
+            display_gib=True,
+        )
 
         try:
             result = MnemonicRecoveryPipeline(
                 chunk_size=chunk_size,
                 overlap=overlap,
             ).scan(arguments.input, start=arguments.start, end=arguments.end,
-                   progress=report_progress, workers=arguments.workers,
+                   progress=seed_progress.update, workers=arguments.workers,
                    resume_results=(checkpoint.completed_results if checkpoint else None),
                    unit_complete=(checkpoint.record if checkpoint else None))
         except KeyboardInterrupt:
             if checkpoint is not None:
                 checkpoint.save(force=True)
-            if progress_rendered[0]:
-                print(file=sys.stderr)
+            seed_progress.finish()
             print("scan interrupted by user", file=sys.stderr)
             return 130
         except (OSError, ValueError) as error:
@@ -233,8 +304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 3
         if checkpoint is not None:
             checkpoint.mark_complete()
-        if progress_rendered[0]:
-            print(file=sys.stderr)
+        seed_progress.finish()
         payload = {
             "application": {"name": APP_NAME, "version": VERSION},
             "source": result.source,
@@ -272,6 +342,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cluster_gap=arguments.cluster_mib * 1024 * 1024,
         hotspot_padding=arguments.padding_mib * 1024 * 1024,
     )
+    scan_progress = _ProgressLine("Target scan", targets=selection.targets)
     try:
         result = coordinator.scan(
             arguments.input,
@@ -279,10 +350,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             end=arguments.end,
             electrum_only=arguments.electrum_only,
             targets=selection.targets,
+            progress=scan_progress,
         )
     except OSError as error:
+        scan_progress.finish()
         print(f"input error: {error}", file=sys.stderr)
         return 3
+    scan_progress.finish()
 
     try:
         report_path = write_json_report(

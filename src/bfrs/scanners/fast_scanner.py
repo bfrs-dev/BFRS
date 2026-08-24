@@ -1,11 +1,29 @@
 """Generic single-pass scanner for public chunk detectors."""
 
-from collections.abc import Iterable, Iterator
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from bfrs.core.chunk_reader import Chunk, ChunkReader
 from bfrs.core.models import RawHit
+
+
+@dataclass(frozen=True, slots=True)
+class ScanProgress:
+    """Safe aggregate progress for one bounded streaming scan."""
+
+    scanned_bytes: int
+    total_bytes: int
+    findings_total: int
+    findings_by_target: dict[str, int] = field(default_factory=dict)
+    complete: bool = False
+
+    @property
+    def percent_complete(self) -> float:
+        if self.total_bytes == 0:
+            return 100.0
+        return min(100.0, self.scanned_bytes * 100.0 / self.total_bytes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +134,8 @@ class FastScanner:
         reader: ChunkReader,
         start: int = 0,
         end: int | None = None,
+        *,
+        progress: Callable[[ScanProgress], None] | None = None,
     ) -> Iterator[RawHit]:
         file_size = reader.file_size
         range_end = file_size if end is None else end
@@ -135,6 +155,9 @@ class FastScanner:
 
         source = str(reader.path.resolve())
         seen: set[tuple[str, str, int, int]] = set()
+        findings_by_target: Counter[str] = Counter()
+        findings_total = 0
+        emitted_progress = False
         for chunk in reader.iter_chunks(start=start, end=range_end):
             ownership_end = (range_end if chunk.end_offset >= range_end else
                              min(chunk.offset + reader.chunk_size - reader.overlap,
@@ -149,4 +172,23 @@ class FastScanner:
                     if identity in seen:
                         continue
                     seen.add(identity)
+                    findings_total += 1
+                    findings_by_target[hit.target] += 1
                     yield hit
+            if progress is not None:
+                scanned_bytes = max(0, ownership_end - start)
+                progress(ScanProgress(
+                    scanned_bytes=scanned_bytes,
+                    total_bytes=range_end - start,
+                    findings_total=findings_total,
+                    findings_by_target=dict(findings_by_target),
+                    complete=ownership_end >= range_end,
+                ))
+                emitted_progress = True
+        if progress is not None and not emitted_progress:
+            progress(ScanProgress(
+                scanned_bytes=0,
+                total_bytes=0,
+                findings_total=0,
+                complete=True,
+            ))

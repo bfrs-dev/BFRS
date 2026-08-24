@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from bfrs.core.chunk_reader import Chunk, ChunkReader
-from bfrs.scanners.fast_scanner import FastScanner, Signature
+from bfrs.scanners.fast_scanner import FastScanner, ScanProgress, Signature
 
 
 def write_source(tmp_path: Path, data: bytes) -> Path:
@@ -207,3 +207,55 @@ def test_many_signatures_use_one_chunk_iteration(tmp_path: Path) -> None:
 
     assert len(list(scanner.scan(reader))) == 2
     assert reader.calls == 1
+
+
+def test_progress_reports_exact_owned_bytes_and_percent(tmp_path: Path) -> None:
+    path = write_source(tmp_path, b"ABC" + b"x" * 17)
+    reader = ChunkReader(path, chunk_size=8, overlap=2)
+    updates: list[ScanProgress] = []
+    scanner = FastScanner([
+        Signature("alpha", b"ABC", "test", target="bitcoin-core")
+    ])
+
+    list(scanner.scan(reader, progress=updates.append))
+
+    assert [update.scanned_bytes for update in updates] == [6, 12, 20]
+    assert all(update.total_bytes == 20 for update in updates)
+    assert [update.percent_complete for update in updates] == [30.0, 60.0, 100.0]
+    assert updates[-1].findings_total == 1
+    assert updates[-1].findings_by_target == {"bitcoin-core": 1}
+
+
+def test_progress_finishes_at_100_percent(tmp_path: Path) -> None:
+    path = write_source(tmp_path, b"--ABC--")
+    updates: list[ScanProgress] = []
+
+    list(FastScanner([Signature("alpha", b"ABC", "test")]).scan(
+        ChunkReader(path, chunk_size=16), progress=updates.append))
+
+    assert updates[-1].complete is True
+    assert updates[-1].percent_complete == 100.0
+    assert updates[-1].scanned_bytes == updates[-1].total_bytes == 7
+
+
+def test_empty_scan_progress_avoids_division_by_zero(tmp_path: Path) -> None:
+    path = write_source(tmp_path, b"")
+    updates: list[ScanProgress] = []
+
+    list(FastScanner([Signature("alpha", b"ABC", "test")]).scan(
+        ChunkReader(path, chunk_size=16), progress=updates.append))
+
+    assert updates == [ScanProgress(0, 0, 0, complete=True)]
+    assert updates[0].percent_complete == 100.0
+
+
+def test_small_input_emits_one_complete_progress_update(tmp_path: Path) -> None:
+    path = write_source(tmp_path, b"x")
+    updates: list[ScanProgress] = []
+
+    list(FastScanner([Signature("alpha", b"ABC", "test")]).scan(
+        ChunkReader(path, chunk_size=16), progress=updates.append))
+
+    assert len(updates) == 1
+    assert (updates[0].scanned_bytes, updates[0].total_bytes) == (1, 1)
+    assert updates[0].complete is True
