@@ -144,6 +144,41 @@ def test_raw_scanner_offsets_encodings_and_no_repr_leak(encoding):
     assert phrase not in json.dumps(candidate.safe_dict())
 
 
+def test_parallel_phase_scan_is_candidate_for_candidate_deterministic():
+    phrase = bip39_phrase("english")
+    payload = (
+        b"header:" + phrase.encode("utf-8") + b":gap:" +
+        b"\xff" + phrase.encode("utf-16-le") + b"\x00:\x00" +
+        b"\xff" + phrase.encode("utf-16-be") + b"\x00\x00"
+    )
+    sequential = RawMnemonicScanner(
+        chunk_size=8192, overlap=4096).scan_bytes(payload)
+    scanner = RawMnemonicScanner(
+        chunk_size=8192, overlap=4096, phase_workers=2)
+    try:
+        first = scanner.scan_bytes(payload)
+        second = scanner.scan_bytes(payload)
+    finally:
+        scanner.close()
+
+    assert first == sequential
+    assert second == sequential
+
+
+def test_phase_progress_reports_all_interpretations_without_claiming_bytes():
+    stages = []
+    RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(
+        b"small fixture", phase_progress=stages.append)
+
+    assert stages == [
+        "mnemonic:utf8-0",
+        "mnemonic:utf16le-0",
+        "mnemonic:utf16le-1",
+        "mnemonic:utf16be-0",
+        "mnemonic:utf16be-1",
+    ]
+
+
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
 @pytest.mark.parametrize("placement", [17, 4096, 7900])
 def test_raw_scanner_exact_offsets_at_chunk_positions(encoding, placement):

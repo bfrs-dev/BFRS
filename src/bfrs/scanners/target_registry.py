@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import re
+from collections.abc import Callable
 
 from bfrs.core.chunk_reader import Chunk
 from bfrs.core.models import RawHit
@@ -37,6 +38,7 @@ TARGET_MULTIBIT = "multibit"
 TARGET_ARMORY = "armory"
 TARGET_ELECTRUM = "electrum"
 TARGET_SECRETS = "secrets"
+TARGET_INTERNAL = "internal"
 AVAILABLE_TARGETS = (
     TARGET_BITCOIN_CORE,
     TARGET_MULTIBIT,
@@ -207,16 +209,19 @@ class MnemonicChunkDetector:
 
     required_overlap = 4096
 
-    def __init__(self, standards: frozenset[str]) -> None:
+    def __init__(self, standards: frozenset[str], *, workers: int = 1) -> None:
         self.standards = standards
-        self.scanner = RawMnemonicScanner(overlap=self.required_overlap)
+        self.scanner = RawMnemonicScanner(
+            overlap=self.required_overlap, phase_workers=workers)
 
     def detect_chunk(self, chunk: Chunk, *, source: str,
                      ownership_start: int,
-                     ownership_end: int):
+                     ownership_end: int,
+                     status: Callable[[str], None] | None = None):
         result = self.scanner.scan_bytes(
             chunk.data, source=source, base_offset=chunk.offset,
-            ownership_start=ownership_start, ownership_end=ownership_end)
+            ownership_start=ownership_start, ownership_end=ownership_end,
+            phase_progress=status)
         for occurrence in result.occurrences:
             candidate = occurrence.candidate
             if candidate.mnemonic_standard not in self.standards:
@@ -246,6 +251,9 @@ class MnemonicChunkDetector:
                 },
                 recommended_recovery_action="MNEMONIC_CONTEXT_REVIEW")
 
+    def close(self) -> None:
+        self.scanner.close()
+
 
 _BASE58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _BASE58_INDEX = {value: index for index, value in enumerate(_BASE58_ALPHABET)}
@@ -269,7 +277,8 @@ class ValidatedSecretChunkDetector:
     required_overlap = 52
 
     def detect_chunk(self, chunk: Chunk, *, source: str,
-                     ownership_start: int, ownership_end: int):
+                     ownership_start: int, ownership_end: int,
+                     status: Callable[[str], None] | None = None):
         for match in _WIF.finditer(chunk.data):
             start = chunk.offset + match.start()
             if not ownership_start <= start < ownership_end:
@@ -307,13 +316,16 @@ class TargetSelection:
     chunk_detectors: tuple[MnemonicChunkDetector, ...]
 
 
-_BITCOIN_TARGET_SIGNATURES = (
+_SHARED_NTFS_SIGNATURES = (
     Signature(NTFS_BOOT_SECTOR_SIGNATURE, NTFS_BOOT_SECTOR_PATTERN,
-              "ntfs_boot_sector", TARGET_BITCOIN_CORE, "filesystem_anchor"),
+              "ntfs_boot_sector", TARGET_INTERNAL, "filesystem_anchor"),
     Signature(NTFS_FILE_RECORD_SIGNATURE, NTFS_FILE_RECORD_PATTERN,
-              "ntfs_file_record", TARGET_BITCOIN_CORE, "filesystem_record"),
+              "ntfs_file_record", TARGET_INTERNAL, "filesystem_record"),
     Signature(NTFS_INDX_RECORD_SIGNATURE, NTFS_INDX_RECORD_PATTERN,
-              "ntfs_indx_record", TARGET_BITCOIN_CORE, "filesystem_index"),
+              "ntfs_indx_record", TARGET_INTERNAL, "filesystem_index"),
+)
+
+_BITCOIN_TARGET_SIGNATURES = (
     Signature("berkeley_metadata_little_endian", BTREE_MAGIC.to_bytes(4, "little"),
               "berkeley_metadata", TARGET_BITCOIN_CORE, "berkeley_metadata"),
     Signature("berkeley_metadata_big_endian", BTREE_MAGIC.to_bytes(4, "big"),
@@ -334,14 +346,14 @@ _ELECTRUM_TARGET_SIGNATURES = (
 )
 
 BITCOIN_CORE_SIGNATURES_V1 = (
+    *_SHARED_NTFS_SIGNATURES,
     *_BITCOIN_TARGET_SIGNATURES,
     *_SECRET_SIGNATURES,
     *_ELECTRUM_TARGET_SIGNATURES,
 )
 
 ELECTRUM_ONLY_SIGNATURES_V1 = (
-    Signature(NTFS_BOOT_SECTOR_SIGNATURE, NTFS_BOOT_SECTOR_PATTERN,
-              "ntfs_boot_sector", TARGET_ELECTRUM, "filesystem_anchor"),
+    _SHARED_NTFS_SIGNATURES[0],
     *_ELECTRUM_TARGET_SIGNATURES,
 )
 
@@ -389,9 +401,13 @@ def parse_targets(value: str) -> frozenset[str]:
 
 
 def build_target_selection(targets: frozenset[str], *,
-                           include_mnemonics: bool = True) -> TargetSelection:
+                           include_mnemonics: bool = True,
+                           mnemonic_workers: int = 1) -> TargetSelection:
     signatures: list[Signature] = []
+    if targets & {TARGET_BITCOIN_CORE, TARGET_ELECTRUM}:
+        signatures.append(_SHARED_NTFS_SIGNATURES[0])
     if TARGET_BITCOIN_CORE in targets:
+        signatures.extend(_SHARED_NTFS_SIGNATURES[1:])
         signatures.extend(_BITCOIN_TARGET_SIGNATURES)
     if TARGET_SECRETS in targets:
         signatures.extend(_SECRET_SIGNATURES)
@@ -408,7 +424,8 @@ def build_target_selection(targets: frozenset[str], *,
         *(('BIP39',) if TARGET_SECRETS in targets else ()),
     })
     if include_mnemonics and standards:
-        detectors.append(MnemonicChunkDetector(standards))
+        detectors.append(MnemonicChunkDetector(
+            standards, workers=mnemonic_workers))
     if TARGET_SECRETS in targets:
         detectors.append(ValidatedSecretChunkDetector())
     return TargetSelection(

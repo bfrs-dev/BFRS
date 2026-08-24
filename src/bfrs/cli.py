@@ -65,6 +65,8 @@ class _ProgressLine:
             update.total_bytes,
             findings_total=update.findings_total,
             findings_by_target=update.findings_by_target,
+            anchors_total=update.anchors_total,
+            stage=update.stage,
             complete=update.complete,
         )
 
@@ -75,6 +77,8 @@ class _ProgressLine:
         *,
         findings_total: int | None = None,
         findings_by_target: dict[str, int] | None = None,
+        anchors_total: int | None = None,
+        stage: str | None = None,
         complete: bool | None = None,
     ) -> None:
         now = time.monotonic()
@@ -105,10 +109,14 @@ class _ProgressLine:
         details = []
         if findings_total is not None:
             details.append(f"findings={findings_total}")
+        if anchors_total is not None:
+            details.append(f"anchors={anchors_total}")
         if target_counts:
             details.append(target_counts)
         if self._workers is not None:
             details.append(f"workers={self._workers}")
+        if stage is not None:
+            details.append(f"phase={stage}")
         suffix = f"  {'  '.join(details)}" if details else ""
         byte_progress = (
             f"{processed / 2**30:.1f}/{total / 2**30:.1f} GiB"
@@ -161,8 +169,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--seed-scan-only", action="store_true",
         help="run only BIP39/Electrum mnemonic raw and document recovery",
     )
+    parser.add_argument(
+        "--skip-mnemonic",
+        action="store_true",
+        help=("skip raw BIP39/Electrum mnemonic detection while keeping all "
+              "selected wallet, secret, and filesystem detectors"),
+    )
     parser.add_argument("--workers", type=_integer, default=1,
-                        help="seed scan worker processes; 0 selects up to 4 automatically")
+                        help=("mnemonic worker processes; target scans parallelize "
+                              "encoding phases; 0 selects up to 4 automatically"))
     parser.add_argument("--checkpoint", type=Path,
                         help="create a new seed-scan checkpoint (must not exist)")
     parser.add_argument("--resume-checkpoint", type=Path,
@@ -186,6 +201,8 @@ def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
         parser.error("--targets cannot be combined with legacy only-mode flags")
     if arguments.electrum_only and arguments.seed_scan_only:
         parser.error("--electrum-only and --seed-scan-only are mutually exclusive")
+    if arguments.seed_scan_only and arguments.skip_mnemonic:
+        parser.error("--skip-mnemonic cannot be combined with --seed-scan-only")
     if arguments.checkpoint and arguments.resume_checkpoint:
         parser.error("--checkpoint and --resume-checkpoint are mutually exclusive")
     if (arguments.checkpoint or arguments.resume_checkpoint) and not arguments.seed_scan_only:
@@ -219,7 +236,11 @@ def _selection(parser: argparse.ArgumentParser, arguments):
     except ValueError as error:
         parser.error(str(error))
     return build_target_selection(
-        targets, include_mnemonics=arguments.targets is not None)
+        targets,
+        include_mnemonics=(
+            arguments.targets is not None and not arguments.skip_mnemonic),
+        mnemonic_workers=arguments.workers,
+    )
 
 
 def _configuration(arguments, selection=None) -> dict[str, object]:
@@ -236,6 +257,7 @@ def _configuration(arguments, selection=None) -> dict[str, object]:
         "minimum_distinct_types": arguments.minimum_distinct_types,
         "electrum_only": arguments.electrum_only,
         "seed_scan_only": arguments.seed_scan_only,
+        "skip_mnemonic": arguments.skip_mnemonic,
         "workers": arguments.workers,
         "targets": sorted(selection.targets),
         "signature_set": [signature.name for signature in selection.signatures],

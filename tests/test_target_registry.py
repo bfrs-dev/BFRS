@@ -14,6 +14,7 @@ from bfrs.scanners.target_registry import (
     TARGET_ARMORY,
     TARGET_BITCOIN_CORE,
     TARGET_ELECTRUM,
+    TARGET_INTERNAL,
     TARGET_MULTIBIT,
     TARGET_SECRETS,
     build_target_selection,
@@ -173,7 +174,8 @@ def test_target_finding_safe_dict_has_no_payload(tmp_path):
 def test_individual_target_selection_does_not_enable_other_wallet_families():
     bitcoin = build_target_selection(
         frozenset({TARGET_BITCOIN_CORE}), include_mnemonics=False)
-    assert {item.target for item in bitcoin.signatures} == {TARGET_BITCOIN_CORE}
+    assert {item.target for item in bitcoin.signatures} == {
+        TARGET_BITCOIN_CORE, "internal"}
     armory = build_target_selection(
         frozenset({TARGET_ARMORY}), include_mnemonics=False)
     assert {item.target for item in armory.signatures} == {TARGET_ARMORY}
@@ -224,3 +226,54 @@ def test_existing_strict_mnemonic_validator_runs_as_shared_chunk_detector(tmp_pa
     assert mnemonic[0].validation_status == "ELECTRUM_V1_STRICT_VALID"
     assert mnemonic[0].start_offset == len("header\n".encode())
     assert phrase not in repr(mnemonic[0].safe_dict())
+
+
+def test_filesystem_anchors_are_internal_but_remain_streamed_downstream(tmp_path):
+    path = tmp_path / "filesystem.img"
+    path.write_bytes(b"FILE--INDX--\x04ckey")
+    selection = build_target_selection(
+        parse_targets("bitcoin-core,electrum"), include_mnemonics=False)
+    updates = []
+
+    hits = list(FastScanner(selection.signatures).scan(
+        ChunkReader(path, chunk_size=64, overlap=16),
+        progress=updates.append,
+    ))
+
+    filesystem = [item for item in hits if item.artifact_kind.startswith("filesystem")]
+    assert {item.hit_type for item in filesystem} == {
+        "ntfs_file_record_anchor", "ntfs_indx_record_anchor"}
+    assert {item.target for item in filesystem} == {TARGET_INTERNAL}
+    assert updates[-1].anchors_total == 2
+    assert updates[-1].findings_total == 1
+    assert updates[-1].findings_by_target == {TARGET_BITCOIN_CORE: 1}
+
+
+def test_shared_boot_anchor_owner_is_stable_across_target_combinations():
+    selections = (
+        build_target_selection(frozenset({TARGET_BITCOIN_CORE}),
+                               include_mnemonics=False),
+        build_target_selection(frozenset({TARGET_ELECTRUM}),
+                               include_mnemonics=False),
+        build_target_selection(frozenset({TARGET_ELECTRUM, TARGET_BITCOIN_CORE}),
+                               include_mnemonics=False),
+    )
+
+    for selection in selections:
+        boot = [item for item in selection.signatures
+                if item.name == "ntfs_boot_sector_oem_anchor"]
+        assert len(boot) == 1
+        assert boot[0].target == TARGET_INTERNAL
+
+
+def test_wallet_signatures_keep_wallet_target_ownership(tmp_path):
+    hits = _scan(
+        tmp_path,
+        b"\x04ckey--BIE1",
+        {TARGET_BITCOIN_CORE, TARGET_ELECTRUM},
+    )
+
+    assert next(item for item in hits if item.hit_type == "bitcoin_ckey").target == (
+        TARGET_BITCOIN_CORE)
+    assert next(item for item in hits if item.hit_type ==
+                "electrum_bie1_raw_anchor").target == TARGET_ELECTRUM

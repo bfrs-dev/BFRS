@@ -1065,6 +1065,7 @@ def serialize_full_image_result(
             "minimum_hits",
             "minimum_distinct_types",
             "electrum_only",
+            "skip_mnemonic",
             "targets",
             "signature_set",
         )

@@ -17,6 +17,8 @@ class ScanProgress:
     total_bytes: int
     findings_total: int
     findings_by_target: dict[str, int] = field(default_factory=dict)
+    anchors_total: int = 0
+    stage: str | None = None
     complete: bool = False
 
     @property
@@ -47,7 +49,9 @@ class ChunkDetector(Protocol):
 
     def detect_chunk(self, chunk: Chunk, *, source: str,
                      ownership_start: int,
-                     ownership_end: int) -> Iterable[RawHit]: ...
+                     ownership_end: int,
+                     status: Callable[[str], None] | None = None,
+                     ) -> Iterable[RawHit]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +88,9 @@ class BinarySignatureDetector:
 
     def detect_chunk(self, chunk: Chunk, *, source: str,
                      ownership_start: int,
-                     ownership_end: int) -> Iterator[RawHit]:
+                     ownership_end: int,
+                     status: Callable[[str], None] | None = None,
+                     ) -> Iterator[RawHit]:
         for signature in self.signatures:
             local_offset = chunk.data.find(signature.pattern)
             while local_offset != -1:
@@ -157,34 +163,55 @@ class FastScanner:
         seen: set[tuple[str, str, int, int]] = set()
         findings_by_target: Counter[str] = Counter()
         findings_total = 0
+        anchors_total = 0
         emitted_progress = False
-        for chunk in reader.iter_chunks(start=start, end=range_end):
-            ownership_end = (range_end if chunk.end_offset >= range_end else
-                             min(chunk.offset + reader.chunk_size - reader.overlap,
-                                 range_end))
+        try:
+            for chunk in reader.iter_chunks(start=start, end=range_end):
+                ownership_end = (range_end if chunk.end_offset >= range_end else
+                                 min(chunk.offset + reader.chunk_size - reader.overlap,
+                                     range_end))
+                for detector in self.detectors:
+                    def report_stage(stage: str) -> None:
+                        if progress is not None:
+                            progress(ScanProgress(
+                                scanned_bytes=max(0, chunk.offset - start),
+                                total_bytes=range_end - start,
+                                findings_total=findings_total,
+                                findings_by_target=dict(findings_by_target),
+                                anchors_total=anchors_total,
+                                stage=stage,
+                            ))
+                    for hit in detector.detect_chunk(
+                            chunk, source=source, ownership_start=chunk.offset,
+                            ownership_end=ownership_end, status=report_stage):
+                        identity = (
+                            hit.target, hit.artifact_kind,
+                            hit.start_offset, hit.end_offset)
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        if hit.target == "internal":
+                            anchors_total += 1
+                        else:
+                            findings_total += 1
+                            findings_by_target[hit.target] += 1
+                        yield hit
+                if progress is not None:
+                    scanned_bytes = max(0, ownership_end - start)
+                    progress(ScanProgress(
+                        scanned_bytes=scanned_bytes,
+                        total_bytes=range_end - start,
+                        findings_total=findings_total,
+                        findings_by_target=dict(findings_by_target),
+                        anchors_total=anchors_total,
+                        complete=ownership_end >= range_end,
+                    ))
+                    emitted_progress = True
+        finally:
             for detector in self.detectors:
-                for hit in detector.detect_chunk(
-                        chunk, source=source, ownership_start=chunk.offset,
-                        ownership_end=ownership_end):
-                    identity = (
-                        hit.target, hit.artifact_kind,
-                        hit.start_offset, hit.end_offset)
-                    if identity in seen:
-                        continue
-                    seen.add(identity)
-                    findings_total += 1
-                    findings_by_target[hit.target] += 1
-                    yield hit
-            if progress is not None:
-                scanned_bytes = max(0, ownership_end - start)
-                progress(ScanProgress(
-                    scanned_bytes=scanned_bytes,
-                    total_bytes=range_end - start,
-                    findings_total=findings_total,
-                    findings_by_target=dict(findings_by_target),
-                    complete=ownership_end >= range_end,
-                ))
-                emitted_progress = True
+                close = getattr(detector, "close", None)
+                if close is not None:
+                    close()
         if progress is not None and not emitted_progress:
             progress(ScanProgress(
                 scanned_bytes=0,

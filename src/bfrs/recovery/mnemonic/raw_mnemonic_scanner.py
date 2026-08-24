@@ -81,6 +81,23 @@ def _scan_work_unit(unit: tuple[str, int, int, int, int]) -> RawMnemonicScanResu
         ownership_start=ownership_start, ownership_end=ownership_end)
 
 
+def _scan_phase_work_unit(
+    unit: tuple[bytes, str, int, str, int | None, int | None, tuple[str, int]],
+) -> RawMnemonicScanResult:
+    data, source, base_offset, source_kind, ownership_start, ownership_end, phase = unit
+    if _WORKER_SCANNER is None:  # pragma: no cover - protects non-pool callers
+        raise RuntimeError("mnemonic worker was not initialized")
+    return _WORKER_SCANNER.scan_bytes(
+        data,
+        source=source,
+        base_offset=base_offset,
+        source_kind=source_kind,
+        ownership_start=ownership_start,
+        ownership_end=ownership_end,
+        decode_passes=(phase,),
+    )
+
+
 UnitComplete = Callable[[tuple[str, int, int, int, int], RawMnemonicScanResult,
                          int, int], None]
 
@@ -89,11 +106,13 @@ class RawMnemonicScanner:
     """Scan overlapping chunks; retained state is bounded by one chunk and overlap."""
 
     def __init__(self, *, chunk_size: int = 64 * 1024 * 1024,
-                 overlap: int = 64 * 1024) -> None:
+                 overlap: int = 64 * 1024, phase_workers: int = 1) -> None:
         if overlap < 4096:
             raise ValueError("mnemonic overlap must be at least 4096 bytes")
         self.chunk_size = chunk_size
         self.overlap = overlap
+        self.phase_workers = min(resolve_worker_count(phase_workers), len(_DECODE_PASSES))
+        self._phase_executor: ProcessPoolExecutor | None = None
         self.bip39 = BIP39Validator()
         self.electrum = ElectrumSeedValidator()
         self.electrum_v1 = ElectrumV1Validator()
@@ -239,14 +258,31 @@ class RawMnemonicScanner:
     def scan_bytes(self, data: bytes, *, source: str = "<memory>",
                    base_offset: int = 0, source_kind: str = "RAW_BYTES",
                    ownership_start: int | None = None,
-                   ownership_end: int | None = None) -> RawMnemonicScanResult:
+                   ownership_end: int | None = None,
+                   phase_progress: Callable[[str], None] | None = None,
+                   decode_passes: tuple[tuple[str, int], ...] = _DECODE_PASSES,
+                   ) -> RawMnemonicScanResult:
+        if self.phase_workers > 1 and len(decode_passes) > 1:
+            return self._scan_bytes_parallel_phases(
+                data,
+                source=source,
+                base_offset=base_offset,
+                source_kind=source_kind,
+                ownership_start=ownership_start,
+                ownership_end=ownership_end,
+                phase_progress=phase_progress,
+                decode_passes=decode_passes,
+            )
         found: dict[tuple[str, int, int, str], MnemonicOccurrence] = {}
         anchors = invalid = 0
         failures: list[str] = []
         # UTF-16 code units may begin at either byte phase within a raw chunk.
         # UTF-8 is deliberately scanned once; each UTF-16 endian is scanned at
         # phases 0 and 1, with phase_offset retained in every physical mapping.
-        for encoding, phase_offset in _DECODE_PASSES:
+        for encoding, phase_offset in decode_passes:
+            if phase_progress is not None:
+                phase_progress(
+                    f"mnemonic:{encoding.replace('-', '')}-{phase_offset}")
             try:
                 phase_data = data[phase_offset:]
                 encoded_data = (phase_data if encoding == "utf-8" else
@@ -267,12 +303,17 @@ class RawMnemonicScanner:
                     if len(original) > self._max_token_chars:
                         word = electrum_word = ""
                         bip_mask = electrum_mask = electrum_v1_member = 0
+                    elif original.isascii():
+                        word = electrum_word = original.casefold()
+                        membership = self._membership.get(word, (0, 0, 0))
+                        bip_mask, electrum_mask, electrum_v1_member = membership
                     else:
                         word, electrum_word = self._normalize_token(original)
                         membership = self._membership.get(word, (0, 0, 0))
                         bip_mask = membership[0]
-                        electrum_mask = self._membership.get(
-                            electrum_word, (0, 0, 0))[1]
+                        electrum_mask = (membership[1] if electrum_word == word else
+                                         self._membership.get(
+                                             electrum_word, (0, 0, 0))[1])
                         electrum_v1_member = membership[2]
                     known = bool(bip_mask or electrum_mask or electrum_v1_member)
                     separator = "" if previous_end is None else text[previous_end:match.start()]
@@ -329,20 +370,29 @@ class RawMnemonicScanner:
                         contiguous_source = all(
                             item[7] and len(item[7]) <= 32 and item[7].isspace()
                             for item in selected[1:])
-                        span_start, span_end = selected[0][5], selected[-1][6]
-                        span_bytes = encoded_data[span_start:span_end]
-                        span_text = span_bytes.decode(encoding, errors=error_mode)
-                        span_parts = span_text.split()
-                        bip39_span_integrity = (
-                            len(span_parts) == count and
-                            tuple(self._normalize_token(part)[0] for part in span_parts) ==
-                            tuple(item[1] for item in selected)
-                        )
-                        electrum_span_integrity = (
-                            len(span_parts) == count and
-                            tuple(self._normalize_token(part)[1] for part in span_parts) ==
-                            tuple(item[2] for item in selected)
-                        )
+                        bip39_span_integrity = electrum_span_integrity = False
+                        if contiguous_source and (
+                                bip_languages or electrum_languages or
+                                (count in {12, 24} and v1_run_length == count)):
+                            span_start, span_end = selected[0][5], selected[-1][6]
+                            span_bytes = encoded_data[span_start:span_end]
+                            span_text = span_bytes.decode(encoding, errors=error_mode)
+                            span_parts = span_text.split()
+                            normalized_parts = tuple(
+                                ((part.casefold(), part.casefold())
+                                 if part.isascii() else self._normalize_token(part))
+                                for part in span_parts
+                            )
+                            bip39_span_integrity = (
+                                len(span_parts) == count and
+                                tuple(item[0] for item in normalized_parts) ==
+                                tuple(item[1] for item in selected)
+                            )
+                            electrum_span_integrity = (
+                                len(span_parts) == count and
+                                tuple(item[1] for item in normalized_parts) ==
+                                tuple(item[2] for item in selected)
+                            )
                         if (count in WORD_COUNTS and bip_languages and
                                 contiguous_source and bip39_span_integrity):
                             words = tuple(item[1] for item in selected)
@@ -408,3 +458,76 @@ class RawMnemonicScanner:
                 failures.append(f"{encoding}:{type(error).__name__}")
         return RawMnemonicScanResult(tuple(found.values()), anchors, invalid,
                                      tuple(dict.fromkeys(failures)))
+
+    def _scan_bytes_parallel_phases(
+        self,
+        data: bytes,
+        *,
+        source: str,
+        base_offset: int,
+        source_kind: str,
+        ownership_start: int | None,
+        ownership_end: int | None,
+        phase_progress: Callable[[str], None] | None,
+        decode_passes: tuple[tuple[str, int], ...],
+    ) -> RawMnemonicScanResult:
+        if self._phase_executor is None:
+            self._phase_executor = ProcessPoolExecutor(
+                max_workers=self.phase_workers,
+                initializer=_initialize_worker,
+                initargs=(self.chunk_size, self.overlap),
+            )
+        if phase_progress is not None:
+            phase_progress(f"mnemonic:parallel-{self.phase_workers}")
+        futures = []
+        try:
+            futures = [
+                self._phase_executor.submit(
+                    _scan_phase_work_unit,
+                    (data, source, base_offset, source_kind,
+                     ownership_start, ownership_end, phase),
+                )
+                for phase in decode_passes
+            ]
+            results = [future.result() for future in futures]
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor = self._phase_executor
+            for process in tuple(
+                    getattr(executor, "_processes", {}).values()):
+                process.terminate()
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._phase_executor = None
+            raise
+        return self._merge_phase_results(results)
+
+    @staticmethod
+    def _merge_phase_results(
+        results: list[RawMnemonicScanResult],
+    ) -> RawMnemonicScanResult:
+        found: dict[tuple[str, int, int, str], MnemonicOccurrence] = {}
+        anchors = invalid = 0
+        failures: list[str] = []
+        for result in results:
+            anchors += result.anchors_found
+            invalid += result.checksum_invalid
+            failures.extend(result.failures)
+            for occurrence in result.occurrences:
+                candidate = occurrence.candidate
+                key = (
+                    candidate.encoding or "",
+                    candidate.physical_start or 0,
+                    candidate.physical_end or 0,
+                    candidate.mnemonic_standard,
+                )
+                found[key] = occurrence
+        return RawMnemonicScanResult(
+            tuple(found.values()), anchors, invalid,
+            tuple(dict.fromkeys(failures)),
+        )
+
+    def close(self) -> None:
+        if self._phase_executor is not None:
+            self._phase_executor.shutdown(wait=True, cancel_futures=True)
+            self._phase_executor = None

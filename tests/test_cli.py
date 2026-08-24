@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 
 import pytest
@@ -17,6 +18,7 @@ from bfrs.cli import (
 )
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
 import bfrs.recovery.full_image_coordinator as coordinator_module
+import bfrs.scanners.target_registry as target_registry_module
 
 
 def basic_arguments(source, output) -> list[str]:
@@ -52,6 +54,18 @@ def structural_metadata() -> bytes:
 def encrypted_electrum(magic=b"BIE1") -> bytes:
     decoded = magic + b"\x02" + b"P" * 32 + b"C" * 32 + b"M" * 32
     return base64.b64encode(decoded)
+
+
+def valid_wif() -> bytes:
+    alphabet = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    payload = b"\x80" + bytes.fromhex("11" * 32) + b"\x01"
+    raw = payload + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    number = int.from_bytes(raw, "big")
+    encoded = bytearray()
+    while number:
+        number, remainder = divmod(number, 58)
+        encoded.append(alphabet[remainder])
+    return bytes(reversed(encoded))
 
 
 def plaintext_electrum() -> tuple[bytes, str, str]:
@@ -277,6 +291,7 @@ def test_cli_help_is_available(capsys):
     assert "--input" in help_text and "--output" in help_text
     assert "--electrum-only" in help_text
     assert "--targets" in help_text
+    assert "--skip-mnemonic" in help_text
     assert "BFRS filesystem and wallet recovery scan" in help_text
 
 
@@ -404,6 +419,55 @@ def test_cli_targets_all_uses_shared_registry_and_safe_findings(tmp_path):
     assert all("raw_bytes" not in item for item in payload["target_findings"])
 
 
+def test_cli_targets_all_runs_mnemonic_by_default(tmp_path, monkeypatch):
+    calls = 0
+    original = target_registry_module.MnemonicChunkDetector.detect_chunk
+
+    def tracked(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        yield from original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        target_registry_module.MnemonicChunkDetector, "detect_chunk", tracked)
+    source = tmp_path / "default-mnemonic.img"
+    source.write_bytes(b"small fixture")
+
+    assert main(basic_arguments(source, tmp_path / "default.json") +
+                ["--targets", "all"]) == 0
+    assert calls == 1
+
+
+def test_cli_skip_mnemonic_keeps_all_other_target_detectors(
+    tmp_path, monkeypatch, capsys,
+):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("MnemonicChunkDetector ran with --skip-mnemonic")
+
+    monkeypatch.setattr(
+        target_registry_module.MnemonicChunkDetector, "detect_chunk", forbidden)
+    multibit = (b"\x0a\x16org.bitcoin.production" +
+                b"\x12\x21\x02" + b"P" * 32 +
+                b"\x1a\x20" + b"K" * 32)
+    armory = b"\xbaWALLET\x00" + (1).to_bytes(4, "little") + b"walletID:x rootKey:y"
+    source = tmp_path / "skip-mnemonic.img"
+    source.write_bytes(
+        b"\x04ckey-invalid--" + multibit + b"--" + armory +
+        b"--BIE1--" + valid_wif())
+    report = tmp_path / "skip-mnemonic.json"
+
+    assert main(basic_arguments(source, report) +
+                ["--targets", "all", "--skip-mnemonic"]) == 0
+
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["configuration"]["skip_mnemonic"] is True
+    families = {item["target"] for item in payload["target_findings"]}
+    assert {"bitcoin-core", "multibit", "armory", "electrum", "secrets"} <= families
+    assert any(item["artifact_kind"] == "WIF_PRIVATE_KEY"
+               for item in payload["target_findings"])
+    assert "phase=mnemonic" not in capsys.readouterr().err
+
+
 def test_cli_targets_all_reports_sparse_complete_progress(tmp_path, capsys):
     source = tmp_path / "small.img"
     source.write_bytes(b"nothing")
@@ -419,7 +483,7 @@ def test_cli_targets_all_reports_sparse_complete_progress(tmp_path, capsys):
     assert "findings=0" in stderr
     for target in ("bitcoin-core", "multibit", "armory", "electrum", "secrets"):
         assert f"{target}=0" in stderr
-    assert stderr.count("\rTarget scan") == 1
+    assert stderr.count("\rTarget scan") <= 2
 
 
 def test_cli_progress_handles_empty_input_without_division_by_zero(
@@ -450,3 +514,18 @@ def test_cli_targets_validate_unknown_and_legacy_mode_conflicts(tmp_path):
         main(["--input", str(source), "--output", str(output),
               "--targets", "electrum", "--electrum-only"])
     assert conflict.value.code == 2
+
+
+def test_cli_rejects_skip_mnemonic_with_seed_scan_only(tmp_path):
+    source = tmp_path / "source.img"
+    source.write_bytes(b"nothing")
+
+    with pytest.raises(SystemExit) as raised:
+        main([
+            "--input", str(source),
+            "--output", str(tmp_path / "report.json"),
+            "--seed-scan-only",
+            "--skip-mnemonic",
+        ])
+
+    assert raised.value.code == 2
