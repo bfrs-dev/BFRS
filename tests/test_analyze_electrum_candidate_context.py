@@ -839,3 +839,108 @@ def test_v1_right_boundary_report_contains_only_safe_metrics(tmp_path):
     }
     assert expected_metrics <= set(item)
     assert "raw_bytes" not in encoded.casefold()
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+def test_utf16_ascii_after_mnemonic_has_expected_raw_nuls_but_is_continuous_prose(
+        tmp_path, encoding):
+    _, item = _analyze_v1_right_boundary(
+        tmp_path, "continuation of ordinary printable text", encoding=encoding)
+    assert 0.45 <= item["immediate_right_raw_nul_ratio"] <= 0.55
+    assert item["immediate_right_nul_ratio"] == item[
+        "immediate_right_raw_nul_ratio"]
+    assert item["immediate_right_first_char_class"] == "ALPHANUMERIC"
+    assert item["immediate_right_decoded_printable_ratio"] == 1.0
+    assert item["immediate_right_decoded_control_ratio"] == 0.0
+    assert item["utf16_zero_lane_consistency"] == 1.0
+    assert item["right_side_text_continuity"] == "CONTINUOUS_PROSE"
+    assert item["classification"] == "INCONCLUSIVE"
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+def test_utf16_newline_and_whitespace_use_decoded_stream(tmp_path, encoding):
+    _, newline = _analyze_v1_right_boundary(
+        tmp_path, "\nfollowing", encoding=encoding)
+    assert newline["immediate_right_first_char_class"] == "NEWLINE"
+    assert newline["right_side_text_continuity"] == "TERMINATED"
+    assert newline["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+
+    _, whitespace = _analyze_v1_right_boundary(
+        tmp_path, " \t  ", encoding=encoding)
+    assert whitespace["immediate_right_first_char_class"] == "WHITESPACE"
+    assert whitespace["right_side_text_continuity"] == "WHITESPACE_ONLY"
+    assert whitespace["immediate_right_decoded_control_ratio"] == 0.0
+    assert whitespace["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+
+
+@pytest.mark.parametrize("encoding,binary_suffix", [
+    ("utf-16-le", b"\x01\x00\x02\x00\x03\x00\x04\x00" * 8),
+    ("utf-16-be", b"\x00\x01\x00\x02\x00\x03\x00\x04" * 8),
+])
+def test_utf16_actual_control_bytes_are_binary_or_misdecoded(
+        tmp_path, encoding, binary_suffix):
+    _, item = _analyze_v1_right_boundary(
+        tmp_path, binary_suffix, encoding=encoding)
+    assert item["immediate_right_first_char_class"] == "CONTROL"
+    assert item["immediate_right_decoded_control_ratio"] == 1.0
+    assert item["right_side_text_continuity"] == "BINARY_OR_MISDECODED"
+    assert item["classification"] == "PLAINTEXT_SEED_CANDIDATE"
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+def test_utf16_odd_global_phase_keeps_exact_occurrence_alignment(tmp_path, encoding):
+    phrase = electrum_v1_phrase()
+    prefix = "header\n"
+    suffix = "continuation text"
+    encoded_prefix = prefix.encode(encoding)
+    encoded_phrase = phrase.encode(encoding)
+    image = b"\xff" + encoded_prefix + encoded_phrase + suffix.encode(encoding)
+    start = 1 + len(encoded_prefix)
+    payload = raw_report(v1_candidate("v1-odd-phase", "23" * 32, [
+        provenance(start, start + len(encoded_phrase), encoding)]))
+    item = analyze(
+        tmp_path, image, payload, standard="ELECTRUM_V1", context_bytes=128)[
+            "candidates"][0]["occurrences"][0]
+    assert start % 2 == 1
+    assert item["immediate_right_first_char_class"] == "ALPHANUMERIC"
+    assert item["utf16_zero_lane_consistency"] == 1.0
+    assert item["right_side_text_continuity"] == "CONTINUOUS_PROSE"
+
+
+def test_overlapping_utf16_pair_decodes_right_text_per_provenance_phase(tmp_path):
+    phrase = electrum_v1_phrase()
+    prefix = "\ufeffheader\n"
+    suffix = "continuation printable text"
+    image = (prefix + phrase + suffix).encode("utf-16-be")
+    be_start = len(prefix.encode("utf-16-be"))
+    be_end = be_start + len(phrase.encode("utf-16-be"))
+    payload = raw_report(v1_candidate("v1-decoded-right-pair", "24" * 32, [
+        provenance(be_start, be_end, "utf-16-be"),
+        provenance(be_start + 1, be_end + 1, "utf-16-le"),
+    ]))
+    items = analyze(
+        tmp_path, image, payload, standard="ELECTRUM_V1", context_bytes=128)[
+            "candidates"][0]["occurrences"]
+    assert len(items) == 2
+    assert all(item["same_fingerprint"] is True for item in items)
+    assert all(item["right_side_text_continuity"] == "CONTINUOUS_PROSE"
+               for item in items)
+    assert all(item["immediate_right_first_char_class"] == "ALPHANUMERIC"
+               for item in items)
+    assert all(item["utf16_zero_lane_consistency"] == 1.0 for item in items)
+
+
+def test_new_decoded_right_metrics_do_not_disclose_text_or_raw_bytes(tmp_path):
+    phrase, item = _analyze_v1_right_boundary(
+        tmp_path, "PRIVATE-DECODED-RIGHT-TEXT", encoding="utf-16-le")
+    encoded = json.dumps(item)
+    assert phrase not in encoded
+    assert "PRIVATE-DECODED-RIGHT-TEXT" not in encoded
+    assert {
+        "immediate_right_first_char_class",
+        "immediate_right_decoded_printable_ratio",
+        "immediate_right_decoded_control_ratio",
+        "immediate_right_raw_nul_ratio",
+        "utf16_zero_lane_consistency",
+    } <= set(item)
+    assert "raw_bytes" not in encoded.casefold()

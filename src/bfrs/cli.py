@@ -14,28 +14,16 @@ from bfrs.recovery.mnemonic.seed_scan_checkpoint import (
     CheckpointError,
     SeedScanCheckpoint,
 )
-from bfrs.recovery.metadata_less_fragments import FRAMED_BITCOIN_RECORD_PATTERNS
-from bfrs.recovery.orphan_private_key_der import (
-    HISTORICAL_EC_PRIVATE_KEY_DER_ANCHOR,
-    HISTORICAL_EC_PRIVATE_KEY_DER_SIGNATURE,
-)
-from bfrs.recovery.ntfs_stale_file import (
-    NTFS_FILE_RECORD_PATTERN,
-    NTFS_FILE_RECORD_SIGNATURE,
-)
-from bfrs.recovery.ntfs_stale_indx import (
-    NTFS_INDX_RECORD_PATTERN,
-    NTFS_INDX_RECORD_SIGNATURE,
-)
-from bfrs.recovery.ntfs_detached_volume import (
-    NTFS_BOOT_SECTOR_PATTERN,
-    NTFS_BOOT_SECTOR_SIGNATURE,
-)
-from bfrs.recovery.electrum_raw_recovery import ELECTRUM_SIGNATURE_PATTERNS
 from bfrs.reporting.json_report import write_json_report
 from bfrs.reporting.json_report import serialize_full_image_result
-from bfrs.scanners.fast_scanner import Signature
-from bfrs.validators.berkeley_metadata import BTREE_MAGIC
+from bfrs.scanners.target_registry import (
+    AVAILABLE_TARGETS,
+    BITCOIN_CORE_SIGNATURES_V1,
+    ELECTRUM_ONLY_SIGNATURES_V1,
+    LEGACY_TARGETS,
+    build_target_selection,
+    parse_targets,
+)
 from bfrs.validators.candidate_policy import CandidatePolicy
 from bfrs.version import APP_NAME, VERSION
 
@@ -46,60 +34,6 @@ DEFAULT_CLUSTER_MIB = 2
 DEFAULT_PADDING_MIB = 1
 DEFAULT_MINIMUM_HITS = 1
 DEFAULT_MINIMUM_DISTINCT_TYPES = 1
-
-
-BITCOIN_CORE_SIGNATURES_V1 = (
-    Signature(
-        NTFS_BOOT_SECTOR_SIGNATURE,
-        NTFS_BOOT_SECTOR_PATTERN,
-        "ntfs_boot_sector",
-    ),
-    Signature(
-        NTFS_FILE_RECORD_SIGNATURE,
-        NTFS_FILE_RECORD_PATTERN,
-        "ntfs_file_record",
-    ),
-    Signature(
-        NTFS_INDX_RECORD_SIGNATURE,
-        NTFS_INDX_RECORD_PATTERN,
-        "ntfs_indx_record",
-    ),
-    Signature(
-        "berkeley_metadata_little_endian",
-        BTREE_MAGIC.to_bytes(4, "little"),
-        "berkeley_metadata",
-    ),
-    Signature(
-        "berkeley_metadata_big_endian",
-        BTREE_MAGIC.to_bytes(4, "big"),
-        "berkeley_metadata",
-    ),
-    Signature(
-        HISTORICAL_EC_PRIVATE_KEY_DER_SIGNATURE,
-        HISTORICAL_EC_PRIVATE_KEY_DER_ANCHOR,
-        "historical_private_key_der",
-    ),
-    *(
-        Signature(name, pattern, "bitcoin_record")
-        for name, pattern in FRAMED_BITCOIN_RECORD_PATTERNS
-    ),
-    *(
-        Signature(name, pattern, "electrum_raw_anchor")
-        for name, pattern in ELECTRUM_SIGNATURE_PATTERNS
-    ),
-)
-
-ELECTRUM_ONLY_SIGNATURES_V1 = (
-    Signature(
-        NTFS_BOOT_SECTOR_SIGNATURE,
-        NTFS_BOOT_SECTOR_PATTERN,
-        "ntfs_boot_sector",
-    ),
-    *(
-        Signature(name, pattern, "electrum_raw_anchor")
-        for name, pattern in ELECTRUM_SIGNATURE_PATTERNS
-    ),
-)
 
 
 def _integer(value: str) -> int:
@@ -120,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end", type=_integer, help="exclusive byte offset")
     parser.add_argument("--chunk-mib", type=_integer, default=DEFAULT_CHUNK_MIB)
     parser.add_argument("--overlap-kib", type=_integer, default=DEFAULT_OVERLAP_KIB)
+    parser.add_argument(
+        "--targets",
+        help=("comma-separated targets: " + ",".join(AVAILABLE_TARGETS) +
+              "; use 'all' for every target"),
+    )
     parser.add_argument(
         "--electrum-only",
         action="store_true",
@@ -150,6 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
+    if arguments.targets and (arguments.electrum_only or arguments.seed_scan_only):
+        parser.error("--targets cannot be combined with legacy only-mode flags")
     if arguments.electrum_only and arguments.seed_scan_only:
         parser.error("--electrum-only and --seed-scan-only are mutually exclusive")
     if arguments.checkpoint and arguments.resume_checkpoint:
@@ -177,11 +118,22 @@ def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
         parser.error("--overlap-kib must be smaller than --chunk-mib")
 
 
-def _configuration(arguments) -> dict[str, object]:
-    signatures = (
-        ELECTRUM_ONLY_SIGNATURES_V1
-        if arguments.electrum_only else BITCOIN_CORE_SIGNATURES_V1
-    )
+def _selection(parser: argparse.ArgumentParser, arguments):
+    try:
+        targets = (parse_targets(arguments.targets) if arguments.targets else
+                   (frozenset({"electrum"}) if arguments.electrum_only else
+                    LEGACY_TARGETS))
+    except ValueError as error:
+        parser.error(str(error))
+    return build_target_selection(
+        targets, include_mnemonics=arguments.targets is not None)
+
+
+def _configuration(arguments, selection=None) -> dict[str, object]:
+    if selection is None:
+        targets = (frozenset({"electrum"}) if arguments.electrum_only else
+                   LEGACY_TARGETS)
+        selection = build_target_selection(targets, include_mnemonics=False)
     return {
         "chunk_mib": arguments.chunk_mib,
         "overlap_kib": arguments.overlap_kib,
@@ -192,7 +144,8 @@ def _configuration(arguments) -> dict[str, object]:
         "electrum_only": arguments.electrum_only,
         "seed_scan_only": arguments.seed_scan_only,
         "workers": arguments.workers,
-        "signature_set": [signature.name for signature in signatures],
+        "targets": sorted(selection.targets),
+        "signature_set": [signature.name for signature in selection.signatures],
     }
 
 
@@ -200,6 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
     _validate_arguments(parser, arguments)
+    selection = _selection(parser, arguments)
     try:
         file_size = arguments.input.stat().st_size
     except OSError as error:
@@ -285,7 +239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "application": {"name": APP_NAME, "version": VERSION},
             "source": result.source,
             "range": {"start": result.start_offset, "end": result.end_offset},
-            "configuration": _configuration(arguments),
+            "configuration": _configuration(arguments, selection),
             "mnemonic_recovery": result.recovery.safe_dict(),
         }
         try:
@@ -309,13 +263,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_hits=arguments.minimum_hits,
         min_distinct_types=arguments.minimum_distinct_types,
     )
-    signatures = (
-        ELECTRUM_ONLY_SIGNATURES_V1
-        if arguments.electrum_only else BITCOIN_CORE_SIGNATURES_V1
-    )
     coordinator = FullImageRecoveryCoordinator(
-        signatures,
+        selection.signatures,
         policy,
+        chunk_detectors=selection.chunk_detectors,
         chunk_size=arguments.chunk_mib * 1024 * 1024,
         overlap=arguments.overlap_kib * 1024,
         cluster_gap=arguments.cluster_mib * 1024 * 1024,
@@ -327,6 +278,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             start=arguments.start,
             end=arguments.end,
             electrum_only=arguments.electrum_only,
+            targets=selection.targets,
         )
     except OSError as error:
         print(f"input error: {error}", file=sys.stderr)
@@ -336,7 +288,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         report_path = write_json_report(
             arguments.output,
             result,
-            _configuration(arguments),
+            _configuration(arguments, selection),
         )
     except OSError as error:
         print(f"report error: {error}", file=sys.stderr)
@@ -358,7 +310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"electrum active duplicates: {electrum.known_active_duplicates}")
         print(f"report path: {report_path}")
         return 0
-    legacy = serialize_full_image_result(result, _configuration(arguments))[
+    legacy = serialize_full_image_result(result, _configuration(arguments, selection))[
         "legacy_wallet_recovery"
     ]
     summary = legacy["summary"]

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import unicodedata
 from typing import BinaryIO, Callable, ContextManager, Sequence
 
 from bfrs.recovery.mnemonic.bip39_validator import BIP39Validator
@@ -19,7 +20,7 @@ from bfrs.recovery.mnemonic.electrum_v1_validator import ElectrumV1Validator
 from bfrs.recovery.mnemonic.mnemonic_normalizer import electrum_normalize
 
 
-FORMAT = "BFRS_ELECTRUM_CONTEXT_ANALYSIS_V2_3"
+FORMAT = "BFRS_ELECTRUM_CONTEXT_ANALYSIS_V2_4"
 DEFAULT_CONTEXT_BYTES = 64 * 1024
 DEFAULT_MAX_WINDOW_BYTES = 1024 * 1024
 MAX_OCCURRENCE_SPAN = 64 * 1024
@@ -146,6 +147,11 @@ class _Occurrence:
     immediate_right_delimiter_class: str = "NONE"
     next_structural_boundary_distance: int | None = None
     right_side_text_continuity: str = "AMBIGUOUS"
+    immediate_right_first_char_class: str = "NONE"
+    immediate_right_decoded_printable_ratio: float = 0.0
+    immediate_right_decoded_control_ratio: float = 0.0
+    immediate_right_raw_nul_ratio: float = 0.0
+    utf16_zero_lane_consistency: float | None = None
 
     @property
     def identity(self) -> tuple[str, str, str, int | None, int | None]:
@@ -627,11 +633,15 @@ def _alignment_metrics(data: bytes, seed_start: int, seed_end: int,
         (0.10 if occurrence.bom_aligned else 0.0))
 
 
-def _right_delimiter_class(character: str) -> str:
+def _decoded_char_class(character: str) -> str:
+    if character == "\ufffd":
+        return "DECODE_FAILURE"
     if character in "\r\n":
         return "NEWLINE"
     if character == "\x00":
         return "NUL"
+    if character.isspace():
+        return "WHITESPACE"
     if character in "\"'":
         return "QUOTE"
     if character in ":;,=()[]{}<>":
@@ -642,7 +652,7 @@ def _right_delimiter_class(character: str) -> str:
         return "ALPHANUMERIC"
     if character.isprintable():
         return "OTHER_PRINTABLE"
-    return "BINARY"
+    return "CONTROL"
 
 
 def _encoded_prefix_length(text: str, character_count: int, encoding: str) -> int:
@@ -664,10 +674,32 @@ def _right_side_metrics(after: bytes, encoding: str,
     decoded = sample.decode(encoding, errors="replace")
     occurrence.immediate_right_decoded_char_count = len(decoded)
     printable = sum(character.isprintable() for character in decoded)
-    occurrence.immediate_right_printable_ratio = round(
+    decoded_printable_ratio = round(
         printable / len(decoded), 6) if decoded else 0.0
-    occurrence.immediate_right_nul_ratio = round(
+    occurrence.immediate_right_printable_ratio = decoded_printable_ratio
+    occurrence.immediate_right_decoded_printable_ratio = decoded_printable_ratio
+    raw_nul_ratio = round(
         sample.count(0) / len(sample), 6)
+    occurrence.immediate_right_nul_ratio = raw_nul_ratio
+    occurrence.immediate_right_raw_nul_ratio = raw_nul_ratio
+    controls = sum(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs"} and
+        not character.isspace() and character != "\x00"
+        for character in decoded)
+    occurrence.immediate_right_decoded_control_ratio = round(
+        controls / len(decoded), 6) if decoded else 0.0
+
+    if encoding.startswith("utf-16"):
+        high_lane = 1 if encoding == "utf-16-le" else 0
+        expected_zeros = sum(sample[index + high_lane] == 0
+                             for index in range(0, len(sample), 2))
+        opposite_zeros = sum(sample[index + (1 - high_lane)] == 0
+                             for index in range(0, len(sample), 2))
+        zero_count = expected_zeros + opposite_zeros
+        occurrence.utf16_zero_lane_consistency = (
+            round(expected_zeros / zero_count, 6) if zero_count else None)
+
+    occurrence.immediate_right_first_char_class = _decoded_char_class(decoded[0])
 
     whitespace_prefix = len(decoded) - len(decoded.lstrip(" \t"))
     occurrence.immediate_right_whitespace_prefix_length = whitespace_prefix
@@ -677,7 +709,7 @@ def _right_side_metrics(after: bytes, encoding: str,
         occurrence.right_side_text_continuity = "WHITESPACE_ONLY"
         return
 
-    occurrence.immediate_right_delimiter_class = _right_delimiter_class(remainder[0])
+    occurrence.immediate_right_delimiter_class = _decoded_char_class(remainder[0])
     structural = "\r\n\x00\"':;,=()[]{}<>.!?"
     structural_indexes = [index for index, character in enumerate(decoded)
                           if character in structural]
@@ -692,18 +724,24 @@ def _right_side_metrics(after: bytes, encoding: str,
         return
 
     replacement_ratio = decoded.count("\ufffd") / len(decoded) if decoded else 0.0
-    control_ratio = sum(
-        not character.isprintable() and character not in "\r\n\t\x00"
-        for character in decoded) / len(decoded) if decoded else 0.0
-    if (replacement_ratio >= 0.20 or control_ratio >= 0.20 or
-            occurrence.immediate_right_printable_ratio < 0.60):
+    decoded_control_ratio = occurrence.immediate_right_decoded_control_ratio
+    zero_lane_inconsistent = bool(
+        encoding.startswith("utf-16") and raw_nul_ratio >= 0.15 and
+        occurrence.utf16_zero_lane_consistency is not None and
+        occurrence.utf16_zero_lane_consistency < 0.75)
+    if (replacement_ratio >= 0.20 or decoded_control_ratio >= 0.20 or
+            decoded_printable_ratio < 0.60 or zero_lane_inconsistent):
         occurrence.right_side_text_continuity = "BINARY_OR_MISDECODED"
+        return
+
+    if delimiter_class == "CONTROL":
+        occurrence.right_side_text_continuity = "TERMINATED"
         return
 
     words = _TOKEN.findall(remainder)
     alphabetic_count = sum(character.isalpha() for character in remainder)
     if (delimiter_class == "ALPHANUMERIC" and
-            (len(words) >= 3 or alphabetic_count >= 16)):
+            (words or alphabetic_count > 0)):
         occurrence.right_side_text_continuity = "CONTINUOUS_PROSE"
     else:
         occurrence.right_side_text_continuity = "AMBIGUOUS"
@@ -1052,6 +1090,14 @@ def _occurrence_dict(occurrence: _Occurrence) -> dict[str, object]:
         "next_structural_boundary_distance": (
             occurrence.next_structural_boundary_distance),
         "right_side_text_continuity": occurrence.right_side_text_continuity,
+        "immediate_right_first_char_class": (
+            occurrence.immediate_right_first_char_class),
+        "immediate_right_decoded_printable_ratio": (
+            occurrence.immediate_right_decoded_printable_ratio),
+        "immediate_right_decoded_control_ratio": (
+            occurrence.immediate_right_decoded_control_ratio),
+        "immediate_right_raw_nul_ratio": occurrence.immediate_right_raw_nul_ratio,
+        "utf16_zero_lane_consistency": occurrence.utf16_zero_lane_consistency,
     }
 
 

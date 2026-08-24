@@ -276,6 +276,7 @@ def test_cli_help_is_available(capsys):
     assert "python -m bfrs.cli" in help_text
     assert "--input" in help_text and "--output" in help_text
     assert "--electrum-only" in help_text
+    assert "--targets" in help_text
     assert "BFRS filesystem and wallet recovery scan" in help_text
 
 
@@ -381,3 +382,37 @@ def test_standard_mode_keeps_bitcoin_signatures_and_behavior(tmp_path):
     ]
     assert payload["raw_hit_count"] == 1
     assert payload["accepted_hotspot_count"] == 1
+
+
+def test_cli_targets_all_uses_shared_registry_and_safe_findings(tmp_path):
+    multibit = (b"\x0a\x16org.bitcoin.production" +
+                b"\x12\x21\x02" + b"P" * 32 +
+                b"\x1a\x20" + b"K" * 32)
+    armory = b"\xbaWALLET\x00" + (1).to_bytes(4, "little") + b"walletID:x rootKey:y"
+    source = tmp_path / "all-targets.img"
+    source.write_bytes(
+        b"\x04ckey-invalid" + b"X" * 32 + multibit + b"Y" * 32 +
+        armory + b"Z" * 32 + b"BIE1")
+    report = tmp_path / "all-targets.json"
+    assert main(basic_arguments(source, report) + ["--targets", "all"]) == 0
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert set(payload["configuration"]["targets"]) == {
+        "bitcoin-core", "multibit", "armory", "electrum", "secrets"}
+    families = {item["target"] for item in payload["target_findings"]}
+    assert {"bitcoin-core", "multibit", "armory", "electrum"} <= families
+    assert b"K" * 32 not in report.read_bytes()
+    assert all("raw_bytes" not in item for item in payload["target_findings"])
+
+
+def test_cli_targets_validate_unknown_and_legacy_mode_conflicts(tmp_path):
+    source = tmp_path / "source.img"
+    source.write_bytes(b"nothing")
+    output = tmp_path / "report.json"
+    with pytest.raises(SystemExit) as unknown:
+        main(["--input", str(source), "--output", str(output),
+              "--targets", "unknown-wallet"])
+    assert unknown.value.code == 2
+    with pytest.raises(SystemExit) as conflict:
+        main(["--input", str(source), "--output", str(output),
+              "--targets", "electrum", "--electrum-only"])
+    assert conflict.value.code == 2

@@ -1065,6 +1065,7 @@ def serialize_full_image_result(
             "minimum_hits",
             "minimum_distinct_types",
             "electrum_only",
+            "targets",
             "signature_set",
         )
         if name in configuration
@@ -1148,6 +1149,7 @@ def serialize_full_image_result(
         "electrum_raw_recovery": _electrum_raw_recovery(
             result.electrum_raw_recovery
         ),
+        "target_findings": [item.safe_dict() for item in result.target_findings],
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())
         ),

@@ -85,7 +85,8 @@ from bfrs.recovery.electrum_raw_recovery import (
     ElectrumRawRecoveryPipeline,
     known_electrum_artifacts_from_contexts,
 )
-from bfrs.scanners.fast_scanner import FastScanner, Signature
+from bfrs.scanners.fast_scanner import ChunkDetector, FastScanner, Signature
+from bfrs.scanners.target_registry import TARGET_ARMORY, TARGET_MULTIBIT
 from bfrs.scanners.hotspot_builder import (
     DEFAULT_CLUSTER_GAP,
     DEFAULT_PADDING,
@@ -138,6 +139,7 @@ class FullImageRecoveryResult:
     ntfs_detached_metadata_recovery: NTFSDetachedMetadataRecovery | None = None
     ntfs_historical_wallet_recovery: NtfsHistoricalWalletRecovery | None = None
     electrum_raw_recovery: ElectrumRawRecovery | None = None
+    target_findings: tuple[RawHit, ...] = ()
 
 
 class _AcceptedContextRangeReader:
@@ -192,16 +194,17 @@ class FullImageRecoveryCoordinator:
         candidate_policy: CandidatePolicy,
         chunk_size: int = 64 * 1024 * 1024,
         overlap: int | None = None,
+        chunk_detectors: Iterable[ChunkDetector] = (),
         cluster_gap: int = DEFAULT_CLUSTER_GAP,
         hotspot_padding: int = DEFAULT_PADDING,
     ) -> None:
         collected = tuple(signatures)
-        self._scanner = FastScanner(collected)
+        self._scanner = FastScanner(collected, chunk_detectors=chunk_detectors)
         if not isinstance(candidate_policy, CandidatePolicy):
             raise ValueError("candidate_policy must be CandidatePolicy")
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
-        required_overlap = max(len(signature.pattern) for signature in collected) - 1
+        required_overlap = self._scanner.required_overlap
         selected_overlap = required_overlap if overlap is None else overlap
         if selected_overlap < 0 or selected_overlap >= chunk_size:
             raise ValueError("overlap must be nonnegative and less than chunk_size")
@@ -217,6 +220,7 @@ class FullImageRecoveryCoordinator:
         end: int | None = None,
         *,
         electrum_only: bool = False,
+        targets: frozenset[str] | None = None,
     ) -> FullImageRecoveryResult:
         reader = ChunkReader(path, chunk_size=self._chunk_size, overlap=self._overlap)
         range_end = reader.file_size if end is None else end
@@ -255,12 +259,21 @@ class FullImageRecoveryCoordinator:
         )
         recovery_hits: list[RawHit] = []
         electrum_hits: list[RawHit] = []
+        target_findings: list[RawHit] = []
         detached_file_offsets: list[int] = []
         detached_indx_offsets: list[int] = []
         raw_hit_counts: Counter[str] = Counter()
         try:
             for hit in self._scanner.scan(reader, start=start, end=range_end):
                 raw_hit_counts[hit.hit_type] += 1
+                if (hit.target != "unknown" and
+                        hit.artifact_kind not in {
+                            "filesystem_anchor", "filesystem_record",
+                            "filesystem_index"}):
+                    target_findings.append(hit)
+                if (hit.target in {TARGET_MULTIBIT, TARGET_ARMORY} or
+                        hit.artifact_kind == "mnemonic"):
+                    continue
                 if hit.hit_type == NTFS_FILE_RECORD_SIGNATURE:
                     detached_file_offsets.append(hit.start_offset)
                     stale_pipeline.process_hit(hit)
@@ -445,12 +458,19 @@ class FullImageRecoveryCoordinator:
             result.status for result in wallet_results
         )
         all_statuses += (metadata_less.status,)
+        target_structural_count = sum(
+            item.structural_status == "STRONG" for item in target_findings)
+        target_fragment_count = sum(
+            item.structural_status in {"FRAGMENT", "COMPLETE"}
+            for item in target_findings)
         structural_count = sum(
             status is ValidationStatus.STRUCTURAL for status in all_statuses
         )
         fragment_count = sum(
             status is ValidationStatus.FRAGMENT for status in all_statuses
         )
+        structural_count += target_structural_count
+        fragment_count += target_fragment_count
         if structural_count:
             status = ValidationStatus.STRUCTURAL
             reasons: tuple[str, ...] = ()
@@ -491,6 +511,7 @@ class FullImageRecoveryCoordinator:
             ntfs_detached_metadata_recovery=ntfs_detached_metadata_recovery,
             ntfs_historical_wallet_recovery=ntfs_historical_wallet_recovery,
             electrum_raw_recovery=electrum_raw_recovery,
+            target_findings=tuple(target_findings),
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,
             reasons=reasons,
@@ -539,6 +560,7 @@ class FullImageRecoveryCoordinator:
                 "raw_hit_counts_by_signature": tuple(
                     sorted(raw_hit_counts.items())
                 ),
+                "selected_targets": tuple(sorted(targets or ())),
             },
         )
 
