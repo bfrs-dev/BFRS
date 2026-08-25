@@ -8,6 +8,8 @@ import hashlib
 import json
 import re
 
+from bfrs.recovery.mnemonic.electrum_v1_validator import ElectrumV1Validator
+
 
 LEGACY_ELECTRUM_SIGNATURE_PATTERNS = (
     ("electrum_legacy_seed_version_single_quote", b"'seed_version'"),
@@ -25,6 +27,10 @@ LEGACY_ELECTRUM_SIGNATURE_PATTERNS = (
     ("electrum_legacy_addresses_json", b'"addresses"'),
     ("electrum_legacy_change_addresses_json", b'"change_addresses"'),
     ("electrum_legacy_imported_keys_json", b'"imported_keys"'),
+    ("electrum_legacy_tuple_plaintext", b"(1, False,"),
+    ("electrum_legacy_tuple_encrypted", b"(1, True,"),
+    ("electrum_legacy_list_plaintext", b"[1, False,"),
+    ("electrum_legacy_list_encrypted", b"[1, True,"),
 )
 LEGACY_ELECTRUM_SIGNATURE_NAMES = frozenset(
     name for name, _ in LEGACY_ELECTRUM_SIGNATURE_PATTERNS
@@ -33,6 +39,11 @@ MAX_LEGACY_WALLET_SIZE = 32 * 1024 * 1024
 MAX_FRAGMENT_SIZE = 256 * 1024
 MAX_FRAGMENT_FIELD_SPAN = 64 * 1024
 HEX_OLD_MPK = re.compile(r"[0-9a-fA-F]{128}")
+HOSTNAME = re.compile(
+    r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z]{2,63}\Z"
+)
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 WALLET_TYPES = frozenset({
     "old", "standard", "xpub", "imported", "bip44", "2fa",
     "trezor", "keepkey", "ledger", "btchip",
@@ -130,6 +141,77 @@ def _balanced_dicts(data: bytes, required_anchor_offset: int | None = None):
                     break
 
 
+def _balanced_legacy_sequences(data: bytes,
+                               required_anchor_offset: int | None = None):
+    """Yield only sequences beginning with the exact historical tuple prefix."""
+    prefixes = (b"(1, False,", b"(1, True,", b"[1, False,", b"[1, True,")
+    starts = sorted({position
+                     for prefix in prefixes
+                     for position in _all_occurrences(data, prefix)})
+    if required_anchor_offset is not None:
+        starts = [item for item in starts if item <= required_anchor_offset][-16:]
+    pairs = {0x28: 0x29, 0x5B: 0x5D, 0x7B: 0x7D}
+    for start in starts:
+        stack = []
+        quote = None
+        escaped = False
+        for end in range(start, min(len(data), start + MAX_LEGACY_WALLET_SIZE)):
+            current = data[end]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif current == 0x5C:
+                    escaped = True
+                elif current == quote:
+                    quote = None
+                continue
+            if current in (0x22, 0x27):
+                quote = current
+            elif current in pairs:
+                stack.append(pairs[current])
+            elif current in pairs.values():
+                if not stack or current != stack.pop():
+                    break
+                if not stack:
+                    yield start, end + 1
+                    break
+
+
+def _all_occurrences(data: bytes, token: bytes):
+    position = data.find(token)
+    while position >= 0:
+        yield position
+        position = data.find(token, position + 1)
+
+
+def _base58check_address(value) -> bool:
+    if not isinstance(value, str) or not 26 <= len(value) <= 35:
+        return False
+    number = 0
+    try:
+        for character in value:
+            number = number * 58 + BASE58_ALPHABET.index(character)
+    except ValueError:
+        return False
+    raw = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
+    raw = b"\x00" * (len(value) - len(value.lstrip("1"))) + raw
+    if len(raw) != 25 or raw[0] not in {0x00, 0x6F}:
+        return False
+    return hashlib.sha256(hashlib.sha256(raw[:-4]).digest()).digest()[:4] == raw[-4:]
+
+
+def _network_host(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    if HOSTNAME.fullmatch(value) is not None:
+        return True
+    parts = value.split(".")
+    return len(parts) == 4 and all(
+        part.isdigit() and str(int(part)) == part and 0 <= int(part) <= 255
+        for part in parts
+    )
+
+
 def _public_key_shape(value) -> bool:
     if isinstance(value, str):
         return bool(HEX_OLD_MPK.fullmatch(value) or value.startswith("xpub"))
@@ -145,6 +227,9 @@ def _wallet_type(value) -> bool:
 
 
 class ElectrumLegacyStructuralValidator:
+    def __init__(self) -> None:
+        self.electrum_v1 = ElectrumV1Validator()
+
     def validate(self, value, *, serialization_type: str, raw: bytes,
                  start: int, end: int, text_encoding: str = "UTF_8"
                  ) -> LegacyDetection | None:
@@ -161,7 +246,10 @@ class ElectrumLegacyStructuralValidator:
         change_addresses = value.get("change_addresses")
         account_layout = isinstance(accounts, dict)
         address_layout = (isinstance(addresses, (list, tuple))
-                          and isinstance(change_addresses, (list, tuple)))
+                          and isinstance(change_addresses, (list, tuple))
+                          and all(_base58check_address(item) for item in addresses)
+                          and all(_base58check_address(item)
+                                  for item in change_addresses))
         if not account_layout and not address_layout:
             return None
         wallet_type = value.get("wallet_type")
@@ -174,7 +262,10 @@ class ElectrumLegacyStructuralValidator:
                       and all(isinstance(key, str) and _public_key_shape(item)
                               for key, item in mpks.items()))
         imported_keys = value.get("imported_keys", {})
-        if not isinstance(imported_keys, dict):
+        if (not isinstance(imported_keys, dict)
+                or not all(_base58check_address(address)
+                           and isinstance(private, str) and bool(private)
+                           for address, private in imported_keys.items())):
             return None
         imported = self._imported(accounts if account_layout else {}, value)
         if not (valid_old_mpk or valid_mpks or imported):
@@ -188,6 +279,7 @@ class ElectrumLegacyStructuralValidator:
         if not isinstance(master_private, dict):
             return None
         has_seed = isinstance(value.get("seed"), str) and bool(value.get("seed"))
+        seed_confirmation = self._seed_confirmation(value.get("seed"))
         has_private = has_seed or bool(master_private) or bool(value.get("imported_keys"))
         watch_only = not has_private
         encryption = "FIELD_LEVEL_ENCRYPTED" if use_encryption and has_private else "PLAINTEXT_STRUCTURE"
@@ -208,7 +300,9 @@ class ElectrumLegacyStructuralValidator:
             "imported": imported,
             "use_encryption": use_encryption,
             "has_seed_material": has_seed,
+            "seed_confirmation": seed_confirmation,
             "has_private_material": has_private,
+            "has_imported_keys": bool(imported_keys),
             "has_master_public_key": valid_old_mpk,
             "has_master_public_keys": valid_mpks,
             "account_count": len(accounts) if account_layout else 0,
@@ -225,11 +319,103 @@ class ElectrumLegacyStructuralValidator:
             reasons.append("LEGACY_WATCH_ONLY_STRUCTURE")
         if imported:
             reasons.append("LEGACY_IMPORTED_STRUCTURE")
+        if seed_confirmation in {
+                "ELECTRUM_V1_STRICT_VALID", "ELECTRUM_V1_COMPAT_VALID"}:
+            reasons.append("ELECTRUM_V1_SEED_CONFIRMED")
         return LegacyDetection(
             start, end, legacy_format, generation, serialization_type,
             "COMPLETE", encryption, "HIGH", tuple(reasons), safe,
             hashlib.sha256(raw).hexdigest(),
         )
+
+    def validate_sequence(self, value, *, raw: bytes, start: int, end: int,
+                          text_encoding: str) -> LegacyDetection | None:
+        """Validate the exact pre-dict 14-field electrum.dat layout."""
+        if not isinstance(value, (tuple, list)) or len(value) != 14:
+            return None
+        (version, use_encryption, fee, host, port, blocks, seed, addresses,
+         private_keys, change_addresses, status, history, labels,
+         addressbook) = value
+        if type(version) is not int or version != 1:
+            return None
+        if type(use_encryption) is not bool:
+            return None
+        if (not isinstance(fee, (int, float)) or isinstance(fee, bool)
+                or not 0 <= fee <= 1):
+            return None
+        if not _network_host(host):
+            return None
+        if type(port) is not int or not 1 <= port <= 65535:
+            return None
+        if type(blocks) is not int or not 0 <= blocks <= 100_000_000:
+            return None
+        if not isinstance(seed, str) or not seed:
+            return None
+        if not isinstance(addresses, list) or not addresses:
+            return None
+        if not all(_base58check_address(item) for item in addresses):
+            return None
+        if not isinstance(change_addresses, list):
+            return None
+        change_as_indices = all(type(item) is int and 0 <= item < len(addresses)
+                                for item in change_addresses)
+        change_as_addresses = all(_base58check_address(item)
+                                  for item in change_addresses)
+        if change_addresses and not (change_as_indices or change_as_addresses):
+            return None
+        if not isinstance(private_keys, str):
+            return None
+        if not use_encryption:
+            try:
+                decoded_private = ast.literal_eval(
+                    _python2_literal_compat(private_keys))
+            except (ValueError, SyntaxError, MemoryError, RecursionError):
+                return None
+            if not isinstance(decoded_private, list):
+                return None
+        if not all(isinstance(item, dict) for item in (status, history, labels)):
+            return None
+        if not isinstance(addressbook, list) or not all(
+                isinstance(item, str) for item in addressbook):
+            return None
+        seed_confirmation = self._seed_confirmation(seed)
+        reasons = [
+            "ELECTRUM_PRE_DICT_SEQUENCE_STRUCTURE_VALID",
+            "ELECTRUM_PRE_DICT_EXACT_ARITY_VALID",
+            "ELECTRUM_PRE_DICT_NETWORK_AND_ADDRESS_EVIDENCE_VALID",
+        ]
+        if seed_confirmation in {
+                "ELECTRUM_V1_STRICT_VALID", "ELECTRUM_V1_COMPAT_VALID"}:
+            reasons.append("ELECTRUM_V1_SEED_CONFIRMED")
+        serialization = "PYTHON_TUPLE" if isinstance(value, tuple) else "PYTHON_LIST"
+        safe = {
+            "storage_version": version,
+            "use_encryption": use_encryption,
+            "network_endpoint_present": True,
+            "receiving_address_count": len(addresses),
+            "change_address_count": len(change_addresses),
+            "change_representation": (
+                "INDICES" if change_as_indices else "ADDRESSES"),
+            "has_seed_material": True,
+            "has_private_material": bool(private_keys),
+            "seed_confirmation": seed_confirmation,
+            "text_encoding": text_encoding,
+        }
+        return LegacyDetection(
+            start, end, "ELECTRUM_PRE_DICT_SEQUENCE",
+            "ELECTRUM_0_X_PRE_DICT_STORAGE", serialization, "COMPLETE",
+            "FIELD_LEVEL_ENCRYPTED" if use_encryption else "PLAINTEXT_STRUCTURE",
+            "HIGH", tuple(reasons), safe, hashlib.sha256(raw).hexdigest(),
+        )
+
+    def _seed_confirmation(self, seed) -> str:
+        if not isinstance(seed, str) or not seed:
+            return "NOT_APPLICABLE"
+        words = tuple(seed.casefold().split())
+        if len(words) not in {12, 24} or not all(word.isalpha() for word in words):
+            return "NOT_APPLICABLE"
+        result = self.electrum_v1.validate_words(words)
+        return result.status
 
     @staticmethod
     def _imported(accounts, value) -> bool:
@@ -282,6 +468,26 @@ class ElectrumLegacyCandidateAssembler:
             )
             if candidate is not None:
                 found[(start, end, candidate.legacy_format)] = candidate
+        for start, end in _balanced_legacy_sequences(data, required_anchor_offset):
+            if required_anchor_offset is not None and not start <= required_anchor_offset < end:
+                continue
+            raw = data[start:end]
+            value = encoding = None
+            for text, selected_encoding in _decoded_texts(raw):
+                try:
+                    value = ast.literal_eval(_python2_literal_compat(text))
+                    encoding = selected_encoding
+                    break
+                except (ValueError, SyntaxError, MemoryError, RecursionError):
+                    continue
+            if value is None:
+                continue
+            candidate = self.validator.validate_sequence(
+                value, raw=raw, start=start, end=end,
+                text_encoding=encoding or "UNKNOWN",
+            )
+            if candidate is not None:
+                found[(start, end, candidate.legacy_format)] = candidate
         if found:
             return tuple(found.values())
         if balanced_wallet_like:
@@ -289,8 +495,7 @@ class ElectrumLegacyCandidateAssembler:
         fragment = self._fragment(data, required_anchor_offset)
         return () if fragment is None else (fragment,)
 
-    @staticmethod
-    def _fragment(data: bytes, required_anchor_offset: int | None):
+    def _fragment(self, data: bytes, required_anchor_offset: int | None):
         if required_anchor_offset is None:
             sample_start = 0
             sample = data[:MAX_FRAGMENT_SIZE]
@@ -364,14 +569,23 @@ class ElectrumLegacyCandidateAssembler:
                                "ADDRESS_LISTS" if address_layout else None),
             "logical_object_reconstructed": True,
         }
+        seed_text = self._fragment_seed_text(tail)
+        seed_confirmation = self.validator._seed_confirmation(seed_text)
+        safe["seed_confirmation"] = seed_confirmation
+        reasons = [
+            "ELECTRUM_LEGACY_STRUCTURAL_FRAGMENT",
+            "LEGACY_MULTIPLE_FIELDS_PRESERVED",
+            "ELECTRUM_LEGACY_LOGICAL_OBJECT_RECONSTRUCTED",
+        ]
+        if seed_confirmation in {
+                "ELECTRUM_V1_STRICT_VALID", "ELECTRUM_V1_COMPAT_VALID"}:
+            reasons.append("ELECTRUM_V1_SEED_CONFIRMED")
         return LegacyDetection(
             sample_start + start, sample_start + start + len(tail),
             f"ELECTRUM_TRANSITIONAL_{quote_style}_FRAGMENT",
             "ELECTRUM_1_X_TO_2_7_LEGACY_STORAGE", quote_style,
             completeness, "UNKNOWN", "MEDIUM",
-            ("ELECTRUM_LEGACY_STRUCTURAL_FRAGMENT",
-             "LEGACY_MULTIPLE_FIELDS_PRESERVED",
-             "ELECTRUM_LEGACY_LOGICAL_OBJECT_RECONSTRUCTED"),
+            tuple(reasons),
             safe, hashlib.sha256(tail).hexdigest(),
         )
 
@@ -407,3 +621,13 @@ class ElectrumLegacyCandidateAssembler:
     def _field_has_value(raw: bytes, field: str) -> bool:
         encoded = re.escape(field.encode("ascii"))
         return re.search(rb"[\"']" + encoded + rb"[\"']\s*:\s*[\"'][^\"']+", raw) is not None
+
+    @staticmethod
+    def _fragment_seed_text(raw: bytes) -> str | None:
+        match = re.search(rb"[\"']seed[\"']\s*:\s*([\"'])([^\"']+)\1", raw)
+        if match is None:
+            return None
+        try:
+            return match.group(2).decode("ascii")
+        except UnicodeDecodeError:
+            return None

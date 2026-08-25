@@ -13,6 +13,7 @@ from bfrs.recovery.electrum_raw_recovery import (
     ElectrumRawRecoveryPipeline,
     KnownElectrumArtifact,
 )
+from bfrs.recovery.mnemonic.electrum_v1_validator import ElectrumV1Validator
 from bfrs.reporting.json_report import _electrum_raw_recovery
 from bfrs.scanners.fast_scanner import FastScanner, Signature
 
@@ -20,6 +21,8 @@ from bfrs.scanners.fast_scanner import FastScanner, Signature
 SYNTHETIC_SECRET = "synthetic legacy seed placeholder never use"
 SYNTHETIC_PRIVATE = "synthetic-xprv-private-placeholder"
 OLD_MPK = "ab" * 64
+RECEIVING_ADDRESS = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+CHANGE_ADDRESS = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"
 
 
 def _old_literal(**updates):
@@ -67,8 +70,8 @@ def test_valid_early_address_list_python_literal_wallet():
         "use_encryption": False,
         "seed": SYNTHETIC_SECRET,
         "master_public_key": OLD_MPK,
-        "addresses": ["synthetic-receiving-address"],
-        "change_addresses": ["synthetic-change-address"],
+        "addresses": [RECEIVING_ADDRESS],
+        "change_addresses": [CHANGE_ADDRESS],
         "imported_keys": {},
     }).encode()
     item = _legacy(raw)[0]
@@ -89,6 +92,50 @@ def test_python2_long_integer_and_cp1252_text_are_supported():
     item = _legacy(raw)[0]
     assert item.completeness == "COMPLETE"
     assert item.safe_metadata["text_encoding"] in {"CP1252", "CP1250"}
+
+
+def _pre_dict_sequence(sequence_type=tuple):
+    return sequence_type((
+        1, False, 0.005, "ecdsa.org", 50000, 150000,
+        "00" * 16, [RECEIVING_ADDRESS], "[]", [0], {}, {}, {},
+        [CHANGE_ADDRESS],
+    ))
+
+
+def test_pre_dict_tuple_and_list_require_exact_electrum_structure():
+    for value, serialization in (
+        (_pre_dict_sequence(tuple), "PYTHON_TUPLE"),
+        (_pre_dict_sequence(list), "PYTHON_LIST"),
+    ):
+        item = _legacy(repr(value).encode())[0]
+        assert item.legacy_format == "ELECTRUM_PRE_DICT_SEQUENCE"
+        assert item.serialization_type == serialization
+        assert item.completeness == "COMPLETE"
+        assert item.safe_metadata["receiving_address_count"] == 1
+
+    assert not _legacy(repr(tuple(range(14))).encode())
+    malformed = list(_pre_dict_sequence())
+    malformed[7] = ["not-a-bitcoin-address"]
+    assert not _legacy(repr(tuple(malformed)).encode())
+
+    encrypted = list(_pre_dict_sequence())
+    encrypted[1] = True
+    encrypted[3] = "127.0.0.1"
+    encrypted[6] = "synthetic-encrypted-seed"
+    encrypted[8] = "synthetic-encrypted-private-key-list"
+    item = _legacy(repr(tuple(encrypted)).encode())[0]
+    assert item.encryption_state == "FIELD_LEVEL_ENCRYPTED"
+
+
+def test_existing_v1_validator_is_additional_seed_confirmation():
+    seed = " ".join(ElectrumV1Validator().mn_encode(
+        "000102030405060708090a0b0c0d0e0f"))
+    item = _legacy(_old_literal(seed=seed))[0]
+    assert item.safe_metadata["seed_confirmation"] == "ELECTRUM_V1_STRICT_VALID"
+    assert "ELECTRUM_V1_SEED_CONFIRMED" in item.reason_codes
+    invalid = _legacy(_old_literal(seed="word " * 11 + "invalid"))[0]
+    assert invalid.safe_metadata["seed_confirmation"].startswith("ELECTRUM_V1_")
+    assert "ELECTRUM_V1_SEED_CONFIRMED" not in invalid.reason_codes
 
 
 def test_valid_complete_transitional_json_field_encrypted_wallet():
@@ -167,6 +214,14 @@ def test_imported_and_watch_only_are_structurally_classified():
     item = _legacy(imported)[0]
     assert item.safe_metadata["imported"]
     assert item.safe_metadata["watch_only"]
+
+
+def test_top_level_imported_keys_are_validated_and_not_exposed():
+    raw = _old_literal(imported_keys={RECEIVING_ADDRESS: "synthetic-private"})
+    item = _legacy(raw)[0]
+    assert item.safe_metadata["has_imported_keys"]
+    assert "synthetic-private" not in json.dumps(item.safe_metadata)
+    assert not _legacy(_old_literal(imported_keys={"bad-address": "private"}))
 
 
 def test_chunk_boundary_anchor_and_pipeline(tmp_path):

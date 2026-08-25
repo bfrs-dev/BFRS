@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import re
 
 import pytest
 
@@ -19,6 +20,7 @@ from bfrs.cli import (
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
 import bfrs.recovery.full_image_coordinator as coordinator_module
 import bfrs.scanners.target_registry as target_registry_module
+from bfrs.recovery.mnemonic.electrum_v1_validator import ElectrumV1Validator
 
 
 def basic_arguments(source, output) -> list[str]:
@@ -108,20 +110,39 @@ def plaintext_electrum() -> tuple[bytes, str, str]:
     return json.dumps(payload, separators=(",", ":")).encode(), seed, xprv
 
 
-HISTORICAL_ELECTRUM_SEED = "synthetic historical electrum seed placeholder"
+HISTORICAL_ELECTRUM_SEED = " ".join(ElectrumV1Validator().mn_encode(
+    "000102030405060708090a0b0c0d0e0f"))
 HISTORICAL_ELECTRUM_MPK = "ab" * 64
+HISTORICAL_RECEIVING_ADDRESS = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+HISTORICAL_CHANGE_ADDRESS = "1BoatSLRHtKNngkdXEeobR76b53LETtpyT"
+HISTORICAL_IMPORTED_PRIVATE = "synthetic-imported-private-material"
 
 
-def historical_electrum_wallet() -> bytes:
-    return repr({
+def historical_electrum_wallet(*, address_layout=False, imported=False) -> bytes:
+    value = {
         "seed_version": 4,
         "use_encryption": False,
         "seed": HISTORICAL_ELECTRUM_SEED,
         "master_public_key": HISTORICAL_ELECTRUM_MPK,
-        "addresses": ["synthetic-receiving-address"],
-        "change_addresses": ["synthetic-change-address"],
-        "imported_keys": {},
-    }).encode()
+        "imported_keys": ({HISTORICAL_RECEIVING_ADDRESS:
+                           HISTORICAL_IMPORTED_PRIVATE} if imported else {}),
+    }
+    if address_layout:
+        value.update({
+            "addresses": [HISTORICAL_RECEIVING_ADDRESS],
+            "change_addresses": [HISTORICAL_CHANGE_ADDRESS],
+        })
+    else:
+        value["accounts"] = {0: {0: [HISTORICAL_RECEIVING_ADDRESS], 1: []}}
+    return repr(value).encode()
+
+
+def historical_electrum_tuple() -> bytes:
+    return repr((
+        1, False, 0.005, "ecdsa.org", 50000, 150000,
+        "00" * 16, [HISTORICAL_RECEIVING_ADDRESS], "[]", [0],
+        {}, {}, {}, [HISTORICAL_CHANGE_ADDRESS],
+    )).encode()
 
 
 def test_cli_dry_scan_writes_json_and_short_progress(tmp_path, capsys):
@@ -329,6 +350,10 @@ def test_cli_defaults_and_signature_set_are_explicit():
             "electrum_legacy_addresses_json",
             "electrum_legacy_change_addresses_json",
             "electrum_legacy_imported_keys_json",
+            "electrum_legacy_tuple_plaintext",
+            "electrum_legacy_tuple_encrypted",
+            "electrum_legacy_list_plaintext",
+            "electrum_legacy_list_encrypted",
         }
 
 
@@ -552,8 +577,13 @@ def test_public_progress_counts_accepted_multibit_and_armory_findings(
 
 def historical_electrum_raw_fixture(case: str) -> bytes:
     wallet = historical_electrum_wallet()
-    if case == "full":
+    if case == "dict_full":
         return b"random-prefix" + wallet + b"random-suffix"
+    if case == "tuple_full":
+        return b"random-prefix" + historical_electrum_tuple() + b"random-suffix"
+    if case == "address_layout":
+        return b"random-prefix" + historical_electrum_wallet(
+            address_layout=True) + b"random-suffix"
     if case == "boundary":
         marker = b"'seed_version'"
         marker_in_wallet = wallet.index(marker)
@@ -568,30 +598,44 @@ def historical_electrum_raw_fixture(case: str) -> bytes:
             f"'seed': '{HISTORICAL_ELECTRUM_SEED}', 'seed_version': 4, "
             f"'master_public_key': '{HISTORICAL_ELECTRUM_MPK}'"
         ).encode()
-    if case == "seed_only":
-        return json.dumps({"seed": "ordinary phrase in unrelated json"}).encode()
+    if case == "python2_long":
+        value = historical_electrum_wallet()[:-1] + b", 'fee': 100000L}"
+        return b"random-prefix" + value
+    if case == "non_utf8":
+        value = historical_electrum_wallet()[:-1] + b", 'label': 'caf\xe9'}"
+        return b"random-prefix" + value
+    if case == "imported_keys":
+        return historical_electrum_wallet(imported=True)
     if case == "source_code":
         return (
-            b'FIELDS = ["seed_version", "master_public_key", "accounts", '
-            b'"use_encryption", "addresses", "change_addresses"]\n'
+            b'FIELDS = ["master_public_key", "accounts"]\n'
             b'def seed(value): return value\n'
-            b'def wallet_type(value): return value\n'
         )
+    if case == "random_sequence":
+        return repr((1, False, "ordinary", "tuple", 1, 2, 3, 4,
+                     5, 6, 7, 8, 9, 10)).encode()
+    if case == "single_anchor_json":
+        return b'{"master_public_key": !!! damaged unrelated json'
     raise AssertionError(case)
 
 
 @pytest.mark.parametrize("case,expected_status", [
-    ("full", "STRONG"),
+    ("dict_full", "STRONG"),
+    ("tuple_full", "STRONG"),
+    ("address_layout", "STRONG"),
     ("boundary", "STRONG"),
     ("damaged_beginning", "FRAGMENT"),
-    ("damaged_end", "FRAGMENT"),
     ("minimal_fragment", "FRAGMENT"),
-    ("seed_only", "REJECTED"),
+    ("python2_long", "STRONG"),
+    ("non_utf8", "STRONG"),
+    ("imported_keys", "STRONG"),
     ("source_code", "REJECTED"),
+    ("random_sequence", "REJECTED"),
+    ("single_anchor_json", "REJECTED"),
 ])
 @pytest.mark.parametrize("target", ["electrum", "all"])
 def test_public_electrum_historical_fixtures(
-    tmp_path, case, expected_status, target,
+    tmp_path, capsys, case, expected_status, target,
 ):
     source = tmp_path / f"historical-electrum-{case}-{target}.img"
     report = tmp_path / f"historical-electrum-{case}-{target}.json"
@@ -605,7 +649,25 @@ def test_public_electrum_historical_fixtures(
 
     payload = json.loads(report.read_text(encoding="utf-8"))
     recovery = payload["electrum_raw_recovery"]
+    target_findings = [item for item in payload["target_findings"]
+                       if item["target"] == "electrum"]
+    wallet_anchors = [item for item in target_findings
+                      if item["artifact_kind"] == "electrum_wallet_anchor"]
+    assert recovery["anchors_found"] == len(wallet_anchors)
+    assert len({(item["physical_start"], item["physical_end"])
+                for item in wallet_anchors}) == len(wallet_anchors)
+    progress_counts = re.findall(r"electrum=(\d+)", capsys.readouterr().err)
+    assert progress_counts and int(progress_counts[-1]) == len(target_findings)
     assert recovery["structural_status"] == expected_status
+    assert payload["status"] == {
+        "STRONG": "structural",
+        "FRAGMENT": "fragment",
+        "REJECTED": "rejected",
+    }[expected_status]
+    if expected_status == "STRONG":
+        assert payload["structural_result_count"] >= 1
+    elif expected_status == "FRAGMENT":
+        assert payload["fragment_result_count"] >= 1
     if expected_status == "REJECTED":
         assert recovery["candidates_total"] == 0
         assert recovery["reason_codes"]
@@ -616,8 +678,14 @@ def test_public_electrum_historical_fixtures(
         }
         assert all(item["source"] == str(source.resolve())
                    for item in recovery["candidates"])
+        identities = {
+            (item["candidate_id"], item["physical_start"], item["physical_end"])
+            for item in recovery["candidates"]
+        }
+        assert len(identities) == recovery["candidates_total"]
     encoded = report.read_text(encoding="utf-8")
     assert HISTORICAL_ELECTRUM_SEED not in encoded
+    assert HISTORICAL_IMPORTED_PRIVATE not in encoded
 
 
 def test_cli_targets_all_runs_mnemonic_by_default(tmp_path, monkeypatch):

@@ -470,14 +470,22 @@ class FullImageRecoveryCoordinator:
         target_fragment_count = sum(
             item.structural_status in {"FRAGMENT", "COMPLETE"}
             for item in target_findings)
+        electrum_structural_count = sum(
+            item.structural_status == "STRONG"
+            for item in electrum_raw_recovery.candidates
+        )
+        electrum_fragment_count = sum(
+            item.structural_status == "FRAGMENT"
+            for item in electrum_raw_recovery.candidates
+        )
         structural_count = sum(
             status is ValidationStatus.STRUCTURAL for status in all_statuses
         )
         fragment_count = sum(
             status is ValidationStatus.FRAGMENT for status in all_statuses
         )
-        structural_count += target_structural_count
-        fragment_count += target_fragment_count
+        structural_count += target_structural_count + electrum_structural_count
+        fragment_count += target_fragment_count + electrum_fragment_count
         if structural_count:
             status = ValidationStatus.STRUCTURAL
             reasons: tuple[str, ...] = ()
