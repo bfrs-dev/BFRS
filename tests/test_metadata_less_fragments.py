@@ -222,6 +222,22 @@ def test_generic_structural_leaf_near_unrelated_hit_is_rejected():
     assert result.valid_ckey_count == 0
 
 
+@pytest.mark.parametrize("container_marker", [b"MZ\x90\x00", b"PK\x03\x04", b"Adobe"])
+def test_empty_leaf_shape_in_unrelated_binary_context_is_insufficient(container_marker):
+    empty = leaf(3, ())
+    data = container_marker + image_with_page(
+        empty, suffix=b"unrelated-padding\x04ckey-not-a-record"
+    )
+    result, _ = run(data, (hit_for(data, "bitcoin_ckey", b"\x04ckey"),))
+
+    assert result.status is ValidationStatus.REJECTED
+    assert result.candidate_page_count == 0
+    assert result.structural_leaf_count == 0
+    assert result.record_pair_count == 0
+    assert "metadata_less_empty_leaf_without_independent_evidence" in result.reasons
+    assert result.evidence["empty_leaf_rejection_count"] > 0
+
+
 def test_hit_must_be_inside_recovered_key_record():
     valid_page = leaf(20, ckey_pair())
     data = image_with_page(valid_page, suffix=b"\x04ckey")

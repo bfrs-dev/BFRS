@@ -68,6 +68,30 @@ def valid_wif() -> bytes:
     return bytes(reversed(encoded))
 
 
+def multibit_classic_wallet(*, fragment=False) -> bytes:
+    network = b"org.bitcoin.production"
+    key = bytearray(b"\x08\x01")
+    if not fragment:
+        key.extend(b"\x12\x20" + b"\x11" * 32)
+    key.extend(b"\x1a\x21\x02" + b"P" * 32)
+    return (b"\x0a" + bytes((len(network),)) + network + b"\x1a" +
+            bytes((len(key),)) + bytes(key))
+
+
+def armory_wallet(*, fragment=False) -> bytes:
+    result = bytearray(70 if fragment else 2107)
+    result[:8] = b"\xbaWALLET\x00"
+    result[8:12] = (13_500_000).to_bytes(4, "little")
+    result[12:16] = b"\xf9\xbe\xb4\xd9"
+    result[16:24] = (1).to_bytes(8, "little")
+    result[24:30] = b"ABCDE\x00"
+    result[30:38] = (1_500_000_000).to_bytes(8, "little")
+    result[38:50] = b"test wallet\x00"
+    if not fragment:
+        result[846:1083] = bytes((index % 251) + 1 for index in range(237))
+    return bytes(result)
+
+
 def plaintext_electrum() -> tuple[bytes, str, str]:
     seed = "synthetic resident seed must never enter report"
     xprv = "synthetic-xprv-must-never-enter-report"
@@ -400,10 +424,8 @@ def test_standard_mode_keeps_bitcoin_signatures_and_behavior(tmp_path):
 
 
 def test_cli_targets_all_uses_shared_registry_and_safe_findings(tmp_path):
-    multibit = (b"\x0a\x16org.bitcoin.production" +
-                b"\x12\x21\x02" + b"P" * 32 +
-                b"\x1a\x20" + b"K" * 32)
-    armory = b"\xbaWALLET\x00" + (1).to_bytes(4, "little") + b"walletID:x rootKey:y"
+    multibit = multibit_classic_wallet()
+    armory = armory_wallet()
     source = tmp_path / "all-targets.img"
     source.write_bytes(
         b"\x04ckey-invalid" + b"X" * 32 + multibit + b"Y" * 32 +
@@ -417,6 +439,89 @@ def test_cli_targets_all_uses_shared_registry_and_safe_findings(tmp_path):
     assert {"bitcoin-core", "multibit", "armory", "electrum"} <= families
     assert b"K" * 32 not in report.read_bytes()
     assert all("raw_bytes" not in item for item in payload["target_findings"])
+
+
+def raw_wallet_fixture(case: str) -> bytes:
+    if case == "multibit_full":
+        return b"random-prefix" + multibit_classic_wallet() + b"random-suffix"
+    if case == "multibit_boundary":
+        wallet = multibit_classic_wallet()
+        marker_in_wallet = wallet.index(b"org.bitcoin.production")
+        prefix = b"R" * ((1 << 20) - 4 - marker_in_wallet)
+        return prefix + wallet + b"tail"
+    if case == "multibit_fragment":
+        return b"damaged" + multibit_classic_wallet(fragment=True) + b"truncated"
+    if case == "armory_full":
+        return b"random-prefix" + armory_wallet() + b"random-suffix"
+    if case == "armory_boundary":
+        wallet = armory_wallet()
+        prefix = b"R" * ((1 << 20) - 3)
+        return prefix + wallet + b"tail"
+    if case == "armory_fragment":
+        return b"damaged" + armory_wallet(fragment=True)
+    if case == "short_anchors":
+        return (b"MZ random org.bitcoin.production PK\x03\x04 Salted__ "
+                b"com.google.bitcoin \xbaWALLET\x00 trailing noise")
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize("case,family,expected_status", [
+    ("multibit_full", "multibit", "STRONG"),
+    ("multibit_boundary", "multibit", "STRONG"),
+    ("multibit_fragment", "multibit", "FRAGMENT"),
+    ("armory_full", "armory", "STRONG"),
+    ("armory_boundary", "armory", "STRONG"),
+    ("armory_fragment", "armory", "FRAGMENT"),
+    ("short_anchors", None, None),
+])
+@pytest.mark.parametrize("target", ["multibit", "armory", "all"])
+def test_public_target_pipeline_synthetic_raw_fixtures(
+    tmp_path, case, family, expected_status, target,
+):
+    source = tmp_path / f"{case}-{target}.img"
+    report = tmp_path / f"{case}-{target}.json"
+    source.write_bytes(raw_wallet_fixture(case))
+    arguments = basic_arguments(source, report) + [
+        "--targets", target,
+        "--chunk-mib", "1",
+        "--overlap-kib", "4",
+    ]
+    if target == "all":
+        arguments.append("--skip-mnemonic")
+
+    assert main(arguments) == 0
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    accepted = [
+        item for item in payload["target_findings"]
+        if item["structural_status"] in {"STRONG", "FRAGMENT", "COMPLETE"}
+    ]
+    if family is not None and target in {family, "all"}:
+        matching = [item for item in accepted if item["target"] == family]
+        assert matching
+        assert expected_status in {item["structural_status"] for item in matching}
+        assert all(item["source_kind"] == "RAW_BYTES" for item in matching)
+    else:
+        assert accepted == []
+        if case == "short_anchors":
+            assert payload["target_findings"]
+            assert all(item["structural_status"] == "REJECTED"
+                       for item in payload["target_findings"])
+
+
+def test_public_progress_counts_accepted_multibit_and_armory_findings(
+    tmp_path, capsys,
+):
+    source = tmp_path / "accepted-targets.img"
+    report = tmp_path / "accepted-targets.json"
+    source.write_bytes(multibit_classic_wallet() + b"gap" + armory_wallet())
+
+    assert main(basic_arguments(source, report) + [
+        "--targets", "all", "--skip-mnemonic",
+    ]) == 0
+
+    stderr = capsys.readouterr().err
+    assert "multibit=1" in stderr
+    assert "armory=1" in stderr
 
 
 def test_cli_targets_all_runs_mnemonic_by_default(tmp_path, monkeypatch):
@@ -446,10 +551,8 @@ def test_cli_skip_mnemonic_keeps_all_other_target_detectors(
 
     monkeypatch.setattr(
         target_registry_module.MnemonicChunkDetector, "detect_chunk", forbidden)
-    multibit = (b"\x0a\x16org.bitcoin.production" +
-                b"\x12\x21\x02" + b"P" * 32 +
-                b"\x1a\x20" + b"K" * 32)
-    armory = b"\xbaWALLET\x00" + (1).to_bytes(4, "little") + b"walletID:x rootKey:y"
+    multibit = multibit_classic_wallet()
+    armory = armory_wallet()
     source = tmp_path / "skip-mnemonic.img"
     source.write_bytes(
         b"\x04ckey-invalid--" + multibit + b"--" + armory +

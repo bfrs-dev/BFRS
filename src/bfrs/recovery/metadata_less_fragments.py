@@ -131,6 +131,7 @@ class MetadataLessBerkeleyFragmentRecoveryPipeline:
         self._decoder = BitcoinRecordTypeDecoder()
 
     def run(self) -> MetadataLessBerkeleyFragmentRecovery:
+        self._empty_leaf_rejection_count = 0
         tested_starts: set[int] = set()
         attempts: dict[tuple[int, int, str], _RecoveredPage | None] = {}
         pages: dict[tuple[int, int, str, int], _RecoveredPage] = {}
@@ -245,11 +246,15 @@ class MetadataLessBerkeleyFragmentRecoveryPipeline:
             if item.validation_status is ValidationStatus.FRAGMENT
         } - structural_offsets
         status = ValidationStatus.FRAGMENT if valid_count else ValidationStatus.REJECTED
-        reasons = (
-            ("metadata_less_bitcoin_evidence",)
-            if valid_count
-            else ("no_valid_metadata_less_bitcoin_evidence",)
-        )
+        if valid_count:
+            reasons = ("metadata_less_bitcoin_evidence",)
+        elif self._empty_leaf_rejection_count:
+            reasons = (
+                "metadata_less_empty_leaf_without_independent_evidence",
+                "no_valid_metadata_less_bitcoin_evidence",
+            )
+        else:
+            reasons = ("no_valid_metadata_less_bitcoin_evidence",)
         return MetadataLessBerkeleyFragmentRecovery(
             status=status,
             source=self.source,
@@ -290,6 +295,7 @@ class MetadataLessBerkeleyFragmentRecoveryPipeline:
                     for page in attempts.values()
                 ),
                 "strong_hit_count": len(self.hits),
+                "empty_leaf_rejection_count": self._empty_leaf_rejection_count,
             },
         )
 
@@ -360,6 +366,14 @@ class MetadataLessBerkeleyFragmentRecoveryPipeline:
                 raise
             return None
         if extraction.page_status is ValidationStatus.REJECTED:
+            return None
+        # In a metadata-less scan no database metadata/root topology, sibling
+        # continuity, or parent/child map exists to corroborate an otherwise
+        # empty leaf.  The six-byte entries=0/level=1/type=5 shape is common in
+        # unrelated PE/JAR/Adobe data and must not become page evidence by
+        # itself.  Non-empty damaged leaves still take the normal fragment path.
+        if not extraction.records and not extraction.pairs:
+            self._empty_leaf_rejection_count += 1
             return None
         return _RecoveredPage(
             MetadataLessPageLocation(

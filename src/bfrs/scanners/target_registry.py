@@ -52,6 +52,11 @@ LEGACY_TARGETS = frozenset({
 
 ARMORY_HEADER = b"\xbaWALLET\x00"
 MULTIBIT_NETWORK = b"org.bitcoin.production"
+MULTIBIT_NETWORKS = (
+    MULTIBIT_NETWORK,
+    b"org.bitcoin.test",
+    b"org.bitcoin.regtest",
+)
 MULTIBIT_EXPORT_HEADER = b"# KEEP YOUR PRIVATE KEYS SAFE"
 MULTIBIT_HD_MARKERS = (b"mbhd.wallet.aes", b"org.multibit.hd", b"MultiBit HD")
 MULTIBIT_LEGACY_MARKERS = (b"com.google.bitcoin", b"org.multibit.wallet")
@@ -65,10 +70,101 @@ def _bounded(chunk: Chunk, local_offset: int, before: int = 512,
 
 
 def _protobuf_network_framed(data: bytes, offset: int) -> bool:
-    length = len(MULTIBIT_NETWORK)
-    if offset < 2 or data[offset - 1] != length:
+    if offset < 2 or data[offset - 2] != 0x0A:
         return False
-    return data[offset - 2] & 0x07 == 2
+    return data[offset - 1] in {len(marker) for marker in MULTIBIT_NETWORKS}
+
+
+def _protobuf_varint(data: bytes, offset: int) -> tuple[int, int] | None:
+    value = 0
+    for index in range(offset, min(len(data), offset + 10)):
+        byte = data[index]
+        value |= (byte & 0x7F) << (7 * (index - offset))
+        if not byte & 0x80:
+            return value, index + 1
+    return None
+
+
+def _protobuf_fields(data: bytes) -> tuple[tuple[int, int, object, bool], ...]:
+    """Decode enough protobuf wire structure to validate bitcoinj records."""
+    result: list[tuple[int, int, object, bool]] = []
+    cursor = 0
+    while cursor < len(data):
+        decoded = _protobuf_varint(data, cursor)
+        if decoded is None:
+            break
+        tag, cursor = decoded
+        field_number, wire_type = tag >> 3, tag & 7
+        if field_number == 0:
+            break
+        if wire_type == 0:
+            decoded = _protobuf_varint(data, cursor)
+            if decoded is None:
+                result.append((field_number, wire_type, 0, False))
+                break
+            value, cursor = decoded
+            result.append((field_number, wire_type, value, True))
+        elif wire_type == 2:
+            decoded = _protobuf_varint(data, cursor)
+            if decoded is None:
+                result.append((field_number, wire_type, b"", False))
+                break
+            length, cursor = decoded
+            end = cursor + length
+            complete = end <= len(data)
+            result.append((field_number, wire_type, data[cursor:min(end, len(data))], complete))
+            if not complete:
+                break
+            cursor = end
+        elif wire_type in {1, 5}:
+            width = 8 if wire_type == 1 else 4
+            end = cursor + width
+            complete = end <= len(data)
+            result.append((field_number, wire_type, data[cursor:min(end, len(data))], complete))
+            if not complete:
+                break
+            cursor = end
+        else:
+            break
+    return tuple(result)
+
+
+def _multibit_key_evidence(payload: bytes, complete: bool) -> tuple[set[str], bool]:
+    fields = _protobuf_fields(payload)
+    key_type = any(field == 1 and wire == 0 and valid and value in {1, 2}
+                   for field, wire, value, valid in fields)
+    secret = any(
+        field == 2 and wire == 2 and valid and isinstance(value, bytes)
+        and len(value) == 32 and 1 <= int.from_bytes(value, "big") < GROUP_ORDER
+        for field, wire, value, valid in fields
+    )
+    public = any(
+        field == 3 and wire == 2 and valid and isinstance(value, bytes)
+        and ((len(value) == 33 and value[:1] in {b"\x02", b"\x03"})
+             or (len(value) == 65 and value[:1] == b"\x04"))
+        for field, wire, value, valid in fields
+    )
+    encrypted = False
+    for field, wire, value, valid in fields:
+        if field != 6 or wire != 2 or not valid or not isinstance(value, bytes):
+            continue
+        nested = _protobuf_fields(value)
+        iv = any(f == 1 and w == 2 and ok and isinstance(v, bytes) and len(v) == 16
+                 for f, w, v, ok in nested)
+        cipher = any(f == 2 and w == 2 and ok and isinstance(v, bytes) and len(v) >= 16
+                     for f, w, v, ok in nested)
+        encrypted = iv and cipher
+    evidence = set()
+    if key_type:
+        evidence.add("KEY_TYPE_FIELD")
+    if secret:
+        evidence.add("EC_PRIVATE_KEY_FIELD")
+    if public:
+        evidence.add("EC_PUBLIC_KEY_FIELD")
+    if encrypted:
+        evidence.add("ENCRYPTED_KEY_FIELD")
+    structurally_complete = complete and key_type and public and (secret or encrypted)
+    return evidence, structurally_complete
 
 
 def _multibit_network_assessment(signature: Signature, chunk: Chunk,
@@ -76,32 +172,49 @@ def _multibit_network_assessment(signature: Signature, chunk: Chunk,
     context = _bounded(chunk, local_offset)
     relative = local_offset - max(0, local_offset - 512)
     framed = _protobuf_network_framed(context, relative)
-    public_key = any(marker in context for marker in (b"\x12\x21", b"\x12\x41"))
-    private_key = b"\x1a\x20" in context
-    encrypted_key = b"Salted__" in context or b"encryptedPrivateKey" in context
-    evidence = tuple(name for name, present in (
-        ("PROTOBUF_NETWORK_FIELD", framed),
-        ("EC_PUBLIC_KEY_FIELD", public_key),
-        ("EC_PRIVATE_KEY_FIELD", private_key),
-        ("ENCRYPTED_KEY_FIELD", encrypted_key),
-    ) if present)
-    if framed and public_key and (private_key or encrypted_key):
+    network = next((item.decode("ascii") for item in MULTIBIT_NETWORKS
+                    if context[relative:relative + len(item)] == item), None)
+    key_evidence: set[str] = set()
+    complete_key = False
+    wallet_fields: tuple[tuple[int, int, object, bool], ...] = ()
+    if framed:
+        wallet_start = relative - 2
+        wallet_fields = _protobuf_fields(context[wallet_start:])
+        for field, wire, value, complete in wallet_fields:
+            if field == 3 and wire == 2 and isinstance(value, bytes):
+                evidence_for_key, valid_key = _multibit_key_evidence(value, complete)
+                key_evidence.update(evidence_for_key)
+                complete_key = complete_key or valid_key
+    evidence = tuple(sorted({"PROTOBUF_NETWORK_FIELD"} | key_evidence)) if framed else ()
+    if framed and complete_key:
+        encrypted_key = "ENCRYPTED_KEY_FIELD" in key_evidence
         return SignatureAssessment(
             0.95, "STRONG", "PROTOBUF_STRUCTURAL_VALID",
             ("MULTIBIT_PROTOBUF_WALLET_CONFIRMED",), evidence,
-            {"network": "bitcoin-mainnet", "key_material_kind": (
+            {"network": network, "key_material_kind": (
                 "ENCRYPTED" if encrypted_key else "PLAINTEXT")},
             "MULTIBIT_WALLET_RECOVERY")
-    if framed and (public_key or private_key or encrypted_key):
+    known_wallet_field = any(
+        field in {2, 3, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16}
+        for field, _, _, _ in wallet_fields[1:]
+    )
+    if framed and key_evidence >= {"KEY_TYPE_FIELD"} and (
+            key_evidence & {"EC_PUBLIC_KEY_FIELD", "EC_PRIVATE_KEY_FIELD",
+                            "ENCRYPTED_KEY_FIELD"}):
         return SignatureAssessment(
             0.65, "FRAGMENT", "PROTOBUF_FRAGMENT_VALID",
             ("MULTIBIT_PROTOBUF_KEY_FRAGMENT",), evidence,
-            {"network": "bitcoin-mainnet"}, "MULTIBIT_FRAGMENT_RECOVERY")
+            {"network": network}, "MULTIBIT_FRAGMENT_RECOVERY")
+    if framed and known_wallet_field:
+        return SignatureAssessment(
+            0.55, "FRAGMENT", "PROTOBUF_FRAGMENT_VALID",
+            ("MULTIBIT_PROTOBUF_WALLET_FRAGMENT",), evidence,
+            {"network": network}, "MULTIBIT_FRAGMENT_RECOVERY")
     return SignatureAssessment(
-        0.15, "WEAK", "ANCHOR_ONLY",
+        0.05, "REJECTED", "INSUFFICIENT_PROTOBUF_STRUCTURE",
         (("MULTIBIT_NETWORK_ANCHOR_WITHOUT_PROTOBUF_STRUCTURE",)
          if not framed else ("MULTIBIT_NETWORK_FIELD_ONLY",)), evidence,
-        {"network": "bitcoin-mainnet"}, "REVIEW_CONTEXT")
+        {"network": network}, "REVIEW_CONTEXT")
 
 
 def _multibit_export_assessment(signature: Signature, chunk: Chunk,
@@ -118,20 +231,23 @@ def _multibit_export_assessment(signature: Signature, chunk: Chunk,
             {"encryption_state": "ENCRYPTED" if encrypted else "PLAINTEXT"},
             "MULTIBIT_KEY_EXPORT_RECOVERY")
     return SignatureAssessment(
-        0.20, "WEAK", "MARKER_ONLY", ("MULTIBIT_EXPORT_MARKER_ONLY",),
+        0.05, "REJECTED", "INSUFFICIENT_EXPORT_STRUCTURE",
+        ("MULTIBIT_EXPORT_MARKER_ONLY",),
         (), {}, "REVIEW_CONTEXT")
 
 
 def _multibit_encrypted_assessment(signature: Signature, chunk: Chunk,
                                    local_offset: int) -> SignatureAssessment:
     context = _bounded(chunk, local_offset, 512, 512)
-    multibit_marker = (MULTIBIT_NETWORK in context or
-                       MULTIBIT_EXPORT_HEADER in context or
-                       any(marker in context for marker in MULTIBIT_HD_MARKERS))
+    # OpenSSL's Salted__ prefix is ubiquitous.  It is attributable to a
+    # MultiBit Classic key export only when the export's own warning header is
+    # present; a nearby wallet/HD string is not independent structure.
+    multibit_marker = MULTIBIT_EXPORT_HEADER in context
     return SignatureAssessment(
         0.65 if multibit_marker else 0.30,
-        "FRAGMENT" if multibit_marker else "WEAK",
-        "ENCRYPTED_FRAGMENT" if multibit_marker else "GENERIC_ENCRYPTED_ANCHOR",
+        "FRAGMENT" if multibit_marker else "REJECTED",
+        ("ENCRYPTED_FRAGMENT" if multibit_marker else
+         "INSUFFICIENT_ENCRYPTED_STRUCTURE"),
         (("MULTIBIT_ENCRYPTED_KEY_FRAGMENT",) if multibit_marker else
          ("OPENSSL_SALTED_ANCHOR_ONLY",)),
         (("MULTIBIT_MARKER", "ENCRYPTED_PAYLOAD") if multibit_marker else ()),
@@ -141,16 +257,10 @@ def _multibit_encrypted_assessment(signature: Signature, chunk: Chunk,
 
 def _multibit_hd_assessment(signature: Signature, chunk: Chunk,
                             local_offset: int) -> SignatureAssessment:
-    context = _bounded(chunk, local_offset, 512, 2048)
-    metadata = sum(marker in context for marker in (
-        b"wallet", b"recovery", b"encrypted", b"mbhd"))
     return SignatureAssessment(
-        0.70 if metadata >= 2 else 0.30,
-        "FRAGMENT" if metadata >= 2 else "WEAK",
-        "MULTIBIT_HD_METADATA" if metadata >= 2 else "MARKER_ONLY",
-        ("MULTIBIT_HD_STRUCTURE",) if metadata >= 2 else ("MULTIBIT_HD_MARKER_ONLY",),
-        ("HD_WALLET_MARKER",), {"mnemonic_standard": "UNCONFIRMED"},
-        "MULTIBIT_HD_RECOVERY")
+        0.05, "REJECTED", "OUT_OF_SCOPE_MULTIBIT_HD",
+        ("MULTIBIT_HD_NOT_CLASSIC",), ("HD_WALLET_MARKER",),
+        {"mnemonic_standard": "UNCONFIRMED"}, "REVIEW_CONTEXT")
 
 
 def _multibit_legacy_assessment(signature: Signature, chunk: Chunk,
@@ -158,9 +268,10 @@ def _multibit_legacy_assessment(signature: Signature, chunk: Chunk,
     context = _bounded(chunk, local_offset, 1024, 2048)
     serialized = b"\xac\xed\x00\x05" in context
     return SignatureAssessment(
-        0.60 if serialized else 0.20,
-        "FRAGMENT" if serialized else "WEAK",
-        "JAVA_SERIALIZED_WALLET_FRAGMENT" if serialized else "MARKER_ONLY",
+        0.60 if serialized else 0.05,
+        "FRAGMENT" if serialized else "REJECTED",
+        ("JAVA_SERIALIZED_WALLET_FRAGMENT" if serialized else
+         "INSUFFICIENT_JAVA_SERIALIZATION_STRUCTURE"),
         (("MULTIBIT_LEGACY_SERIALIZED_FRAGMENT",) if serialized else
          ("MULTIBIT_LEGACY_MARKER_ONLY",)),
         (("JAVA_SERIALIZATION_HEADER", "MULTIBIT_CLASS_MARKER")
@@ -170,30 +281,57 @@ def _multibit_legacy_assessment(signature: Signature, chunk: Chunk,
 
 def _armory_assessment(signature: Signature, chunk: Chunk,
                        local_offset: int) -> SignatureAssessment:
-    context = _bounded(chunk, local_offset, 64, 2048)
-    wallet_id = b"walletID" in context
-    root = any(marker in context for marker in (b"rootKey", b"keyData", b"watching-only"))
-    version_bytes = chunk.data[local_offset + len(ARMORY_HEADER):
-                               local_offset + len(ARMORY_HEADER) + 4]
-    version = int.from_bytes(version_bytes, "little") if len(version_bytes) == 4 else 0
-    plausible_version = 1 <= version <= 10_000_000
-    if wallet_id and root and plausible_version:
+    data = chunk.data[local_offset:local_offset + 4096]
+    version = int.from_bytes(data[8:12], "little") if len(data) >= 12 else 0
+    network_magic = data[12:16] if len(data) >= 16 else b""
+    networks = {
+        b"\xf9\xbe\xb4\xd9": ("bitcoin-mainnet", 0x00),
+        b"\xfa\xbf\xb5\xda": ("bitcoin-old-testnet", 0x6F),
+        b"\x0b\x11\x09\x07": ("bitcoin-testnet3", 0x6F),
+    }
+    plausible_version = 10_000_000 <= version < 100_000_000
+    known_network = network_magic in networks
+    flags = int.from_bytes(data[16:24], "little") if len(data) >= 24 else None
+    plausible_flags = flags is not None and flags & ~0x3 == 0
+    unique_id = data[24:30] if len(data) >= 30 else b""
+    network_id = networks.get(network_magic, (None, None))[1]
+    plausible_id = len(unique_id) == 6 and unique_id[-1] == network_id
+    created = int.from_bytes(data[30:38], "little") if len(data) >= 38 else 0
+    plausible_date = created == 0 or 1_231_006_505 <= created <= 4_102_444_800
+    full_header = len(data) >= 2107
+    root_section = data[846:1083] if full_header else b""
+    reserved = data[1083:2107] if full_header else b""
+    complete_layout = full_header and any(root_section) and reserved.count(0) >= 1000
+    evidence = tuple(name for name, present in (
+        ("BAWALLET_HEADER", True),
+        ("VERSION_FIELD", plausible_version),
+        ("NETWORK_MAGIC", known_network),
+        ("WALLET_FLAGS", plausible_flags),
+        ("BINARY_UNIQUE_ID", plausible_id),
+        ("CREATION_TIME", plausible_date and len(data) >= 38),
+        ("FIXED_HEADER_LAYOUT", complete_layout),
+    ) if present)
+    metadata = {
+        "format_version_integer": version or None,
+        "network": networks.get(network_magic, (None, None))[0],
+    }
+    if (plausible_version and known_network and plausible_flags and
+            plausible_id and plausible_date and complete_layout):
         return SignatureAssessment(
             0.95, "STRONG", "ARMORY_HEADER_STRUCTURAL_VALID",
             ("ARMORY_FULL_HEADER_CONFIRMED",),
-            ("BAWALLET_HEADER", "WALLET_ID_FIELD", "ROOT_KEY_FIELD"),
-            {}, "ARMORY_WALLET_RECOVERY")
-    if wallet_id or root or plausible_version:
+            evidence, metadata, "ARMORY_WALLET_RECOVERY")
+    if plausible_version and known_network and sum(
+            (plausible_flags, plausible_id, plausible_date and len(data) >= 38)
+    ) >= 1:
         return SignatureAssessment(
             0.60, "FRAGMENT", "ARMORY_FRAGMENT_VALID",
             ("ARMORY_STRUCTURAL_FRAGMENT",),
-            tuple(name for name, present in (
-                ("WALLET_ID_FIELD", wallet_id), ("ROOT_KEY_FIELD", root),
-                ("VERSION_FIELD", plausible_version)) if present),
-            {}, "ARMORY_FRAGMENT_RECOVERY")
+            evidence, metadata, "ARMORY_FRAGMENT_RECOVERY")
     return SignatureAssessment(
-        0.10, "WEAK", "SIGNATURE_ONLY", ("ARMORY_SIGNATURE_ONLY",),
-        ("BAWALLET_HEADER",), {}, "REVIEW_CONTEXT")
+        0.05, "REJECTED", "INSUFFICIENT_ARMORY_STRUCTURE",
+        ("ARMORY_SIGNATURE_ONLY",),
+        ("BAWALLET_HEADER",), metadata, "REVIEW_CONTEXT")
 
 
 def _armory_paper_assessment(signature: Signature, chunk: Chunk,
@@ -358,9 +496,11 @@ ELECTRUM_ONLY_SIGNATURES_V1 = (
 )
 
 MULTIBIT_SIGNATURES = (
-    Signature("multibit_network_anchor", MULTIBIT_NETWORK, "multibit",
-              TARGET_MULTIBIT, "MULTIBIT_CLASSIC_PROTOBUF",
-              _multibit_network_assessment),
+    *(Signature(("multibit_network_anchor" if index == 1 else
+                 f"multibit_network_anchor_{index}"), network, "multibit",
+                TARGET_MULTIBIT, "MULTIBIT_CLASSIC_PROTOBUF",
+                _multibit_network_assessment)
+      for index, network in enumerate(MULTIBIT_NETWORKS, start=1)),
     Signature("multibit_export_header", MULTIBIT_EXPORT_HEADER, "multibit",
               TARGET_MULTIBIT, "MULTIBIT_KEY_EXPORT",
               _multibit_export_assessment),

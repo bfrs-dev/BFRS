@@ -31,14 +31,29 @@ def _scan(tmp_path, data, targets, *, chunk_size=256, overlap=64):
 
 
 def _multibit_wallet(*, encrypted=False, public=True, private=True):
-    result = bytearray((0x0a, len(MULTIBIT_NETWORK)))
-    result.extend(MULTIBIT_NETWORK)
+    key = bytearray(b"\x08" + (b"\x02" if encrypted else b"\x01"))
+    if private and not encrypted:
+        key.extend(b"\x12\x20" + b"\x11" * 32)
     if public:
-        result.extend(b"\x12\x21" + b"\x02" + b"P" * 32)
-    if private:
-        result.extend(b"\x1a\x20" + b"K" * 32)
+        key.extend(b"\x1a\x21" + b"\x02" + b"P" * 32)
     if encrypted:
-        result.extend(b"Salted__" + b"E" * 32)
+        encrypted_data = b"\x0a\x10" + b"I" * 16 + b"\x12\x20" + b"E" * 32
+        key.extend(b"\x32" + bytes((len(encrypted_data),)) + encrypted_data)
+    return (b"\x0a" + bytes((len(MULTIBIT_NETWORK),)) + MULTIBIT_NETWORK +
+            b"\x1a" + bytes((len(key),)) + bytes(key))
+
+
+def _armory_wallet(*, full=True):
+    result = bytearray(2107 if full else 70)
+    result[:8] = ARMORY_HEADER
+    result[8:12] = (13_500_000).to_bytes(4, "little")
+    result[12:16] = b"\xf9\xbe\xb4\xd9"
+    result[16:24] = (1).to_bytes(8, "little")
+    result[24:30] = b"ABCDE\x00"
+    result[30:38] = (1_500_000_000).to_bytes(8, "little")
+    result[38:50] = b"test wallet\x00"
+    if full:
+        result[846:1083] = bytes((index % 251) + 1 for index in range(237))
     return bytes(result)
 
 
@@ -56,7 +71,7 @@ def test_multibit_network_string_without_protobuf_is_not_high(tmp_path):
     hits = _scan(tmp_path, b"ordinary " + MULTIBIT_NETWORK + b" text",
                  {TARGET_MULTIBIT})
     assert len(hits) == 1
-    assert hits[0].structural_status == "WEAK"
+    assert hits[0].structural_status == "REJECTED"
     assert hits[0].confidence < 0.5
 
 
@@ -76,8 +91,8 @@ def test_multibit_malformed_protobuf_anchor_is_weak(tmp_path):
     hits = _scan(tmp_path, b"\x0a\xff" + MULTIBIT_NETWORK,
                  {TARGET_MULTIBIT})
     network = next(item for item in hits if item.hit_type == "multibit_network_anchor")
-    assert network.validation_status == "ANCHOR_ONLY"
-    assert network.structural_status == "WEAK"
+    assert network.validation_status == "INSUFFICIENT_PROTOBUF_STRUCTURE"
+    assert network.structural_status == "REJECTED"
 
 
 def test_multibit_hd_and_legacy_markers_are_format_specific_fragments(tmp_path):
@@ -85,7 +100,8 @@ def test_multibit_hd_and_legacy_markers_are_format_specific_fragments(tmp_path):
         tmp_path, b"mbhd.wallet.aes wallet recovery encrypted mbhd",
         {TARGET_MULTIBIT})[0]
     assert hd.artifact_kind == "MULTIBIT_HD"
-    assert hd.structural_status == "FRAGMENT"
+    assert hd.structural_status == "REJECTED"
+    assert hd.validation_status == "OUT_OF_SCOPE_MULTIBIT_HD"
     assert hd.safe_metadata["mnemonic_standard"] == "UNCONFIRMED"
     legacy = _scan(
         tmp_path, b"\xac\xed\x00\x05 serialized com.google.bitcoin wallet",
@@ -105,13 +121,15 @@ def test_multibit_chunk_boundary_and_overlap_ownership(tmp_path):
 
 
 def test_armory_full_fragment_signature_only_and_random_text(tmp_path):
-    full = ARMORY_HEADER + (1).to_bytes(4, "little") + b"walletID:x rootKey:y"
-    fragment = ARMORY_HEADER + (2).to_bytes(4, "little")
+    full = _armory_wallet()
+    fragment = _armory_wallet(full=False)
     signature_only = ARMORY_HEADER
     random_text = b"ordinary BAWALLET text without binary magic"
-    assert _scan(tmp_path, full, {TARGET_ARMORY})[0].structural_status == "STRONG"
+    assert _scan(
+        tmp_path, full, {TARGET_ARMORY}, chunk_size=4096, overlap=64
+    )[0].structural_status == "STRONG"
     assert _scan(tmp_path, fragment, {TARGET_ARMORY})[0].structural_status == "FRAGMENT"
-    assert _scan(tmp_path, signature_only, {TARGET_ARMORY})[0].structural_status == "WEAK"
+    assert _scan(tmp_path, signature_only, {TARGET_ARMORY})[0].structural_status == "REJECTED"
     assert _scan(tmp_path, random_text, {TARGET_ARMORY}) == []
 
 
@@ -139,7 +157,7 @@ def test_one_shared_chunk_iteration_returns_all_wallet_families(tmp_path):
     parts = (
         b"\x04ckey-invalid-but-owned-anchor",
         _multibit_wallet(),
-        ARMORY_HEADER + (1).to_bytes(4, "little") + b"walletID:x rootKey:y",
+        _armory_wallet(),
         b"BIE1",
     )
     gaps = (b"A" * 17, b"B" * 19, b"C" * 23)
