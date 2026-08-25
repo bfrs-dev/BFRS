@@ -61,6 +61,36 @@ def test_valid_complete_electrum_1x_python_literal_wallet():
     assert item.safe_metadata["seed_version"] == 4
 
 
+def test_valid_early_address_list_python_literal_wallet():
+    raw = repr({
+        "seed_version": 4,
+        "use_encryption": False,
+        "seed": SYNTHETIC_SECRET,
+        "master_public_key": OLD_MPK,
+        "addresses": ["synthetic-receiving-address"],
+        "change_addresses": ["synthetic-change-address"],
+        "imported_keys": {},
+    }).encode()
+    item = _legacy(raw)[0]
+    assert item.legacy_format == "ELECTRUM_1X_PYTHON_LITERAL"
+    assert item.completeness == "COMPLETE"
+    assert item.safe_metadata["address_layout"] == "ADDRESS_LISTS"
+    assert item.safe_metadata["receiving_address_count"] == 1
+    assert item.safe_metadata["change_address_count"] == 1
+
+
+def test_python2_long_integer_and_cp1252_text_are_supported():
+    raw = (
+        "{'seed_version': 4, 'use_encryption': False, "
+        f"'seed': '{SYNTHETIC_SECRET}', 'master_public_key': '{OLD_MPK}', "
+        "'addresses': [], 'change_addresses': [], 'imported_keys': {}, "
+        "'fee': 100000L, 'label': 'Zażółć'}"
+    ).encode("cp1250")
+    item = _legacy(raw)[0]
+    assert item.completeness == "COMPLETE"
+    assert item.safe_metadata["text_encoding"] in {"CP1252", "CP1250"}
+
+
 def test_valid_complete_transitional_json_field_encrypted_wallet():
     item = _legacy(_transitional())[0]
     assert item.legacy_format == "ELECTRUM_TRANSITIONAL_JSON"
@@ -78,16 +108,54 @@ def test_truncated_and_structural_fragment():
     assert item.safe_metadata["preserved_field_count"] >= 3
 
 
+def test_fragment_reconstruction_survives_destroyed_opening_brace():
+    item = _legacy(_old_literal()[1:])[0]
+    assert item.completeness == "STRUCTURAL_FRAGMENT"
+    assert item.safe_metadata["logical_object_reconstructed"]
+    assert item.safe_metadata["reconstructed_seed_version"] == 4
+
+
+def test_seed_version_and_old_mpk_form_a_correlated_minimal_fragment():
+    raw = (
+        f"'seed': '{SYNTHETIC_SECRET}', 'seed_version': 4, "
+        f"'master_public_key': '{OLD_MPK}'"
+    ).encode()
+    item = _legacy(raw)[0]
+    assert item.completeness == "TRUNCATED"
+    assert item.safe_metadata["has_seed_material"]
+    assert item.safe_metadata["has_master_public_key"]
+    assert item.safe_metadata["preserved_field_count"] == 3
+
+
 def test_malformed_serialization_and_bad_types_rejected():
     assert not _legacy(b"{'seed_version': 4, 'accounts': {}, 'master_public_key': !!!}")
     assert not _legacy(_old_literal(seed_version="4"))
     assert not _legacy(_old_literal(accounts=[]))
+    early_bad = {
+        "seed_version": 4,
+        "use_encryption": False,
+        "seed": SYNTHETIC_SECRET,
+        "master_public_key": OLD_MPK,
+        "addresses": "not-a-list",
+        "change_addresses": [],
+    }
+    assert not _legacy(repr(early_bad).encode())
 
 
 def test_ordinary_json_source_and_config_text_rejected():
     ordinary = json.dumps({"seed_version": 4, "accounts": {}, "theme": "wallet"}).encode()
     source = b"config = {'seed_version': 4, 'accounts': {}}\ndef wallet(seed): return seed"
     assert not _legacy(ordinary)
+    assert not _legacy(source)
+
+
+def test_source_code_with_legacy_field_names_is_rejected():
+    source = (
+        b'FIELDS = ["seed_version", "master_public_key", "accounts", '
+        b'"use_encryption"]\n'
+        b'def seed_version(value): return value\n'
+        b'def master_public_key(value): return value\n'
+    )
     assert not _legacy(source)
 
 

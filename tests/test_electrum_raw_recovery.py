@@ -123,6 +123,23 @@ def test_ordinary_json_or_single_words_are_rejected():
     assert not _analyze(random)
 
 
+def test_rejected_recovery_has_explicit_reason_code(tmp_path):
+    path = tmp_path / "seed-only.img"
+    path.write_bytes(json.dumps({"seed": "ordinary phrase"}).encode())
+    result = ElectrumRawRecoveryPipeline(source=path).analyze_range(
+        start=0, end=path.stat().st_size,
+    )
+    assert result.structural_status == "REJECTED"
+    assert result.reason_codes == ("NO_ELECTRUM_WALLET_STRUCTURE_CONFIRMED",)
+
+
+def test_complete_and_fragment_candidates_expose_structural_classification():
+    complete = _analyze(_plaintext())[0]
+    fragment = _analyze(_plaintext()[:-20])[0]
+    assert complete.structural_status == "STRONG"
+    assert fragment.structural_status == "FRAGMENT"
+
+
 def test_inconsistent_wallet_structure_is_rejected():
     assert not _analyze(_plaintext(keystore={"type": "unknown"}))
     assert not _analyze(_plaintext(seed_version="71"))

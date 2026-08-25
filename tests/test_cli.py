@@ -108,6 +108,22 @@ def plaintext_electrum() -> tuple[bytes, str, str]:
     return json.dumps(payload, separators=(",", ":")).encode(), seed, xprv
 
 
+HISTORICAL_ELECTRUM_SEED = "synthetic historical electrum seed placeholder"
+HISTORICAL_ELECTRUM_MPK = "ab" * 64
+
+
+def historical_electrum_wallet() -> bytes:
+    return repr({
+        "seed_version": 4,
+        "use_encryption": False,
+        "seed": HISTORICAL_ELECTRUM_SEED,
+        "master_public_key": HISTORICAL_ELECTRUM_MPK,
+        "addresses": ["synthetic-receiving-address"],
+        "change_addresses": ["synthetic-change-address"],
+        "imported_keys": {},
+    }).encode()
+
+
 def test_cli_dry_scan_writes_json_and_short_progress(tmp_path, capsys):
     source = tmp_path / "image.img"
     source.write_bytes(b"prefix\x04ckeysuffix")
@@ -303,6 +319,16 @@ def test_cli_defaults_and_signature_set_are_explicit():
             "electrum_legacy_master_public_keys_single_quote",
             "electrum_legacy_accounts_single_quote",
             "electrum_legacy_use_encryption_single_quote",
+            "electrum_legacy_addresses_single_quote",
+            "electrum_legacy_change_addresses_single_quote",
+            "electrum_legacy_imported_keys_single_quote",
+            "electrum_legacy_master_public_key_json",
+            "electrum_legacy_master_public_keys_json",
+            "electrum_legacy_accounts_json",
+            "electrum_legacy_use_encryption_json",
+            "electrum_legacy_addresses_json",
+            "electrum_legacy_change_addresses_json",
+            "electrum_legacy_imported_keys_json",
         }
 
 
@@ -522,6 +548,76 @@ def test_public_progress_counts_accepted_multibit_and_armory_findings(
     stderr = capsys.readouterr().err
     assert "multibit=1" in stderr
     assert "armory=1" in stderr
+
+
+def historical_electrum_raw_fixture(case: str) -> bytes:
+    wallet = historical_electrum_wallet()
+    if case == "full":
+        return b"random-prefix" + wallet + b"random-suffix"
+    if case == "boundary":
+        marker = b"'seed_version'"
+        marker_in_wallet = wallet.index(marker)
+        prefix = b"R" * ((1 << 20) - 4 - marker_in_wallet)
+        return prefix + wallet + b"tail"
+    if case == "damaged_beginning":
+        return b"overwritten-prefix" + wallet[1:]
+    if case == "damaged_end":
+        return b"random-prefix" + wallet[:-28]
+    if case == "minimal_fragment":
+        return (
+            f"'seed': '{HISTORICAL_ELECTRUM_SEED}', 'seed_version': 4, "
+            f"'master_public_key': '{HISTORICAL_ELECTRUM_MPK}'"
+        ).encode()
+    if case == "seed_only":
+        return json.dumps({"seed": "ordinary phrase in unrelated json"}).encode()
+    if case == "source_code":
+        return (
+            b'FIELDS = ["seed_version", "master_public_key", "accounts", '
+            b'"use_encryption", "addresses", "change_addresses"]\n'
+            b'def seed(value): return value\n'
+            b'def wallet_type(value): return value\n'
+        )
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize("case,expected_status", [
+    ("full", "STRONG"),
+    ("boundary", "STRONG"),
+    ("damaged_beginning", "FRAGMENT"),
+    ("damaged_end", "FRAGMENT"),
+    ("minimal_fragment", "FRAGMENT"),
+    ("seed_only", "REJECTED"),
+    ("source_code", "REJECTED"),
+])
+@pytest.mark.parametrize("target", ["electrum", "all"])
+def test_public_electrum_historical_fixtures(
+    tmp_path, case, expected_status, target,
+):
+    source = tmp_path / f"historical-electrum-{case}-{target}.img"
+    report = tmp_path / f"historical-electrum-{case}-{target}.json"
+    source.write_bytes(historical_electrum_raw_fixture(case))
+
+    assert main(basic_arguments(source, report) + [
+        "--targets", target,
+        "--chunk-mib", "1",
+        "--overlap-kib", "4",
+    ]) == 0
+
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    recovery = payload["electrum_raw_recovery"]
+    assert recovery["structural_status"] == expected_status
+    if expected_status == "REJECTED":
+        assert recovery["candidates_total"] == 0
+        assert recovery["reason_codes"]
+    else:
+        assert recovery["candidates_total"] >= 1
+        assert expected_status in {
+            item["structural_status"] for item in recovery["candidates"]
+        }
+        assert all(item["source"] == str(source.resolve())
+                   for item in recovery["candidates"])
+    encoded = report.read_text(encoding="utf-8")
+    assert HISTORICAL_ELECTRUM_SEED not in encoded
 
 
 def test_cli_targets_all_runs_mnemonic_by_default(tmp_path, monkeypatch):

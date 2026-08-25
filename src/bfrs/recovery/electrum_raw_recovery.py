@@ -91,6 +91,12 @@ class ElectrumRawCandidate:
     legacy_format: str | None = None
     format_generation: str | None = None
 
+    @property
+    def structural_status(self) -> str:
+        if self.completeness == "COMPLETE" and self.confidence == "HIGH":
+            return "STRONG"
+        return "FRAGMENT"
+
 
 @dataclass(frozen=True, slots=True)
 class ElectrumRawRecovery:
@@ -106,6 +112,24 @@ class ElectrumRawRecovery:
     failures: tuple[str, ...]
     candidates: tuple[ElectrumRawCandidate, ...]
     legacy_anchor_hits: int = 0
+
+    @property
+    def structural_status(self) -> str:
+        if self.complete_candidates:
+            return "STRONG"
+        if self.fragment_candidates:
+            return "FRAGMENT"
+        return "REJECTED"
+
+    @property
+    def reason_codes(self) -> tuple[str, ...]:
+        if self.structural_status == "REJECTED":
+            return self.failures or ("NO_ELECTRUM_WALLET_STRUCTURE_CONFIRMED",)
+        return tuple(dict.fromkeys(
+            reason
+            for candidate in self.candidates
+            for reason in candidate.reason_codes
+        ))
 
     @property
     def legacy_anchors_found(self) -> int:

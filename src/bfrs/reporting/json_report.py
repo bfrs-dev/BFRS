@@ -1004,6 +1004,8 @@ def _electrum_raw_recovery(result) -> dict[str, Any]:
             "complete_candidates": 0, "fragment_candidates": 0,
             "encrypted_candidates": 0, "plaintext_candidates": 0,
             "known_active_duplicates": 0, "new_unknown_candidates": 0,
+            "structural_status": "REJECTED",
+            "reason_codes": ["electrum_raw_recovery_not_available"],
             "failures": ["electrum_raw_recovery_not_available"],
             "candidates": [],
         }
@@ -1018,9 +1020,30 @@ def _electrum_raw_recovery(result) -> dict[str, Any]:
         "encryption_state", "confidence", "source", "physical_start",
         "physical_end", "allocation_state", "known_active_duplicate",
         "state",
+        "structural_status",
     )
+    structural_status = getattr(
+        result,
+        "structural_status",
+        ("STRONG" if result.complete_candidates else
+         "FRAGMENT" if result.fragment_candidates else "REJECTED"),
+    )
+    reason_codes = getattr(result, "reason_codes", None)
+    if reason_codes is None:
+        if structural_status == "REJECTED":
+            reason_codes = tuple(result.failures) or (
+                "NO_ELECTRUM_WALLET_STRUCTURE_CONFIRMED",
+            )
+        else:
+            reason_codes = tuple(dict.fromkeys(
+                reason
+                for candidate in result.candidates
+                for reason in candidate.reason_codes
+            ))
     return {
         **{name: getattr(result, name) for name in fields},
+        "structural_status": structural_status,
+        "reason_codes": list(reason_codes),
         "failures": list(result.failures),
         "legacy": {
             **{name: getattr(result, name, 0) for name in (
