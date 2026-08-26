@@ -1,6 +1,7 @@
 """Validate historical Bitcoin wallet Berkeley key suffix framing."""
 
 from dataclasses import dataclass
+import hashlib
 from typing import Any
 
 from bfrs.core.secp256k1 import FIELD_PRIME, decode_sec_public_key
@@ -15,6 +16,7 @@ SECP256K1_FIELD_PRIME = FIELD_PRIME
 _PUBLIC_KEY_RECORD_TYPES = frozenset({"key", "wkey", "ckey", "keymeta"})
 _SUPPORTED_RECORD_TYPES = _PUBLIC_KEY_RECORD_TYPES | {"mkey", "defaultkey"}
 RAW_KEY_SIDE_RECORD_TYPES = frozenset({"key", "wkey", "ckey"})
+MAX_RAW_KEY_SIDE_BYTES = 5 + 9 + 65
 
 BITCOIN_RECORD_KEY_SIDE_VALID = "BITCOIN_RECORD_KEY_SIDE_VALID"
 BITCOIN_RECORD_KEY_COMPACTSIZE_INVALID = (
@@ -64,6 +66,16 @@ class RawBitcoinRecordKeySideValidator:
         self._decoder = BitcoinRecordTypeDecoder(RAW_KEY_SIDE_RECORD_TYPES)
         self._record_key_validator = BitcoinRecordKeyValidator()
 
+    def validate_detected(
+        self,
+        data: bytes,
+    ) -> RawBitcoinRecordKeySideValidation | None:
+        """Detect a supported framed type from bytes and validate its key side."""
+        decoded = self._decoder.decode(data)
+        if decoded is None:
+            return None
+        return self.validate(data, expected_record_type=decoded.name)
+
     def validate(
         self,
         data: bytes,
@@ -106,6 +118,14 @@ class RawBitcoinRecordKeySideValidator:
 
         key_side_length = length.encoded_length + length.value
         if len(decoded.remaining_key) < key_side_length:
+            evidence.update(
+                {
+                    "available_record_key_bytes": len(data),
+                    "required_record_key_bytes": (
+                        decoded.prefix_length + key_side_length
+                    ),
+                }
+            )
             return self._invalid(
                 expected_record_type,
                 BITCOIN_RECORD_PUBKEY_LENGTH_INVALID,
@@ -134,6 +154,12 @@ class RawBitcoinRecordKeySideValidator:
             return self._invalid(expected_record_type, mapped, evidence)
 
         evidence["compressed"] = validation.evidence["compressed"]
+        public_key_start = length.encoded_length
+        public_key_end = public_key_start + length.value
+        public_key = exact.remaining_key[public_key_start:public_key_end]
+        evidence["safe_pubkey_fingerprint"] = hashlib.sha256(
+            public_key
+        ).hexdigest()
         return RawBitcoinRecordKeySideValidation(
             record_type=expected_record_type,
             valid=True,

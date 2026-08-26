@@ -16,6 +16,13 @@ from bfrs.validators.candidate_policy import CandidatePolicy
 
 COMPRESSED_PUBLIC_KEY = encode_sec_public_key(GENERATOR, compressed=True)
 UNCOMPRESSED_PUBLIC_KEY = encode_sec_public_key(GENERATOR, compressed=False)
+ADATA_FALSE_POSITIVE_KEY_SIDES = (
+    ("wkey", b"\x0c" + b"x" * 12),
+    ("ckey", b"\xbd" + b"x" * 70),
+    ("key", b"\x51" + b"x" * 70),
+    ("key", b"\x07" + b"x" * 7),
+    ("key", b"\x62bd_event" + b"x" * 70),
+)
 
 
 def framed(record_type: str, suffix: bytes) -> bytes:
@@ -36,13 +43,7 @@ def validate(record_type: str, suffix: bytes):
 
 @pytest.mark.parametrize(
     ("record_type", "suffix"),
-    [
-        ("wkey", b"\x0c" + b"x" * 12),
-        ("ckey", b"\xbd" + b"x" * 70),
-        ("key", b"\x51" + b"x" * 70),
-        ("key", b"\x07" + b"x" * 7),
-        ("key", b"\x62bd_event" + b"x" * 70),
-    ],
+    ADATA_FALSE_POSITIVE_KEY_SIDES,
     ids=("adata-wkey-12", "adata-ckey-189", "adata-key-81",
          "adata-key-7", "adata-keybd-event-98"),
 )
@@ -108,13 +109,10 @@ def test_sec_prefix_is_validated_before_curve_membership() -> None:
 
 @pytest.mark.parametrize(
     ("record_type", "suffix", "hit_type"),
-    [
-        ("wkey", b"\x0c" + b"x" * 12, "bitcoin_wkey"),
-        ("ckey", b"\xbd" + b"x" * 70, "bitcoin_ckey"),
-        ("key", b"\x51" + b"x" * 70, "bitcoin_key"),
-        ("key", b"\x07" + b"x" * 7, "bitcoin_key"),
-        ("key", b"\x62bd_event" + b"x" * 70, "bitcoin_key"),
-    ],
+    tuple(
+        (record_type, suffix, f"bitcoin_{record_type}")
+        for record_type, suffix in ADATA_FALSE_POSITIVE_KEY_SIDES
+    ),
 )
 def test_rejected_raw_hit_is_accounted_but_cannot_admit_a_hotspot(
     tmp_path,

@@ -25,6 +25,10 @@ from bfrs.scanners.target_registry import (
     build_target_selection,
     parse_targets,
 )
+from bfrs.tools.revalidate_wallet_records import (
+    revalidate_wallet_records,
+    write_wallet_record_revalidation_report,
+)
 from bfrs.validators.candidate_policy import CandidatePolicy
 from bfrs.version import APP_NAME, VERSION
 
@@ -151,6 +155,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", required=True, type=Path, help="source image path")
     parser.add_argument("--output", required=True, type=Path, help="JSON report path")
+    parser.add_argument(
+        "--revalidate-wallet-records",
+        type=Path,
+        metavar="OLD_REPORT_JSON",
+        help=("revalidate wallet_record offsets from an existing BFRS report "
+              "without a full image scan"),
+    )
     parser.add_argument("--start", type=_integer, default=0, help="inclusive byte offset")
     parser.add_argument("--end", type=_integer, help="exclusive byte offset")
     parser.add_argument("--chunk-mib", type=_integer, default=DEFAULT_CHUNK_MIB)
@@ -197,6 +208,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
+    if arguments.revalidate_wallet_records is not None:
+        if any((
+            arguments.targets,
+            arguments.electrum_only,
+            arguments.seed_scan_only,
+            arguments.skip_mnemonic,
+            arguments.checkpoint,
+            arguments.resume_checkpoint,
+            arguments.start != 0,
+            arguments.end is not None,
+        )):
+            parser.error(
+                "--revalidate-wallet-records cannot be combined with scan modes, "
+                "targets, checkpoints, --start, or --end"
+            )
     if arguments.targets and (arguments.electrum_only or arguments.seed_scan_only):
         parser.error("--targets cannot be combined with legacy only-mode flags")
     if arguments.electrum_only and arguments.seed_scan_only:
@@ -268,6 +294,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
     _validate_arguments(parser, arguments)
+    if arguments.revalidate_wallet_records is not None:
+        try:
+            old_report = json.loads(
+                arguments.revalidate_wallet_records.read_text(
+                    encoding="utf-8-sig"
+                )
+            )
+            if not isinstance(old_report, dict):
+                raise ValueError("report root must be an object")
+            payload = revalidate_wallet_records(
+                old_report,
+                arguments.input,
+                source_report=arguments.revalidate_wallet_records,
+            )
+        except (OSError, UnicodeError, ValueError) as error:
+            print(f"wallet-record revalidation error: {error}", file=sys.stderr)
+            return 3
+        try:
+            report_path = write_wallet_record_revalidation_report(
+                payload, arguments.output
+            )
+        except OSError as error:
+            print(f"report error: {error}", file=sys.stderr)
+            return 4
+        print(f"source: {payload['source_image']}")
+        print(f"source report: {payload['source_report']}")
+        print(f"wallet_record findings: {payload['findings_input_count']}")
+        print(f"unique offsets: {payload['unique_offsets_count']}")
+        print(f"duplicate offsets: {payload['duplicate_offset_count']}")
+        print(f"valid key sides: {payload['valid_key_side_count']}")
+        print(f"invalid key sides: {payload['invalid_key_side_count']}")
+        print(f"source bytes read: {payload['source_bytes_read']}")
+        print(f"report path: {report_path}")
+        return 0
+
     selection = _selection(parser, arguments)
     try:
         file_size = arguments.input.stat().st_size

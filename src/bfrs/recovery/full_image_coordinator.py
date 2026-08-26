@@ -108,6 +108,7 @@ from bfrs.validators.berkeley_page import PAGE_HEADER_SIZE, BerkeleyPageValidato
 from bfrs.validators.candidate_policy import CandidatePolicy
 from bfrs.validators.bitcoin_record_key import (
     BITCOIN_RECORD_KEY_SIDE_VALID,
+    MAX_RAW_KEY_SIDE_BYTES,
     RAW_KEY_SIDE_RECORD_TYPES,
     RawBitcoinRecordKeySideValidator,
 )
@@ -117,7 +118,6 @@ _RAW_KEY_SIDE_HIT_TYPES = {
     f"bitcoin_{record_type}": record_type
     for record_type in RAW_KEY_SIDE_RECORD_TYPES
 }
-_MAX_RAW_KEY_SIDE_BYTES = 5 + 9 + 65
 
 
 @dataclass(frozen=True, slots=True)
@@ -815,7 +815,7 @@ class FullImageRecoveryCoordinator:
                     continue
                 source.seek(hit.start_offset)
                 data = source.read(
-                    min(_MAX_RAW_KEY_SIDE_BYTES, range_end - hit.start_offset)
+                    min(MAX_RAW_KEY_SIDE_BYTES, range_end - hit.start_offset)
                 )
                 validation = validator.validate(
                     data,
