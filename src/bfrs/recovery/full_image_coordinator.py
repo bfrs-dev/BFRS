@@ -106,6 +106,18 @@ from bfrs.validators.berkeley_metadata import (
 )
 from bfrs.validators.berkeley_page import PAGE_HEADER_SIZE, BerkeleyPageValidator
 from bfrs.validators.candidate_policy import CandidatePolicy
+from bfrs.validators.bitcoin_record_key import (
+    BITCOIN_RECORD_KEY_SIDE_VALID,
+    RAW_KEY_SIDE_RECORD_TYPES,
+    RawBitcoinRecordKeySideValidator,
+)
+
+
+_RAW_KEY_SIDE_HIT_TYPES = {
+    f"bitcoin_{record_type}": record_type
+    for record_type in RAW_KEY_SIDE_RECORD_TYPES
+}
+_MAX_RAW_KEY_SIDE_BYTES = 5 + 9 + 65
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,8 +336,26 @@ class FullImageRecoveryCoordinator:
                 historical_contexts
             ),
         ).run_hits(electrum_hits, range_start=start, range_end=range_end)
-        hits = tuple(recovery_hits)
-        hotspots = self._range_hotspots(hits, start, range_end)
+        hits = self._assess_raw_key_side_hits(
+            reader.path, tuple(recovery_hits), range_end
+        )
+        assessed_by_identity = {
+            (hit.start_offset, hit.end_offset, hit.hit_type): hit
+            for hit in hits
+        }
+        target_findings = [
+            assessed_by_identity.get(
+                (hit.start_offset, hit.end_offset, hit.hit_type), hit
+            )
+            for hit in target_findings
+        ]
+        admission_hits = tuple(
+            hit
+            for hit in hits
+            if hit.hit_type not in _RAW_KEY_SIDE_HIT_TYPES
+            or hit.validation_status == BITCOIN_RECORD_KEY_SIDE_VALID
+        )
+        hotspots = self._range_hotspots(admission_hits, start, range_end)
 
         decisions = tuple(
             (hotspot, self._candidate_policy.evaluate(hotspot))
@@ -421,7 +451,7 @@ class FullImageRecoveryCoordinator:
                 )
         accepted_hits = tuple(
             hit
-            for hit in hits
+            for hit in admission_hits
             if any(
                 context.start_offset
                 <= hit.start_offset
@@ -768,6 +798,54 @@ class FullImageRecoveryCoordinator:
             )
             for item in relative_hotspots
         )
+
+    @staticmethod
+    def _assess_raw_key_side_hits(
+        path: Path,
+        hits: tuple[RawHit, ...],
+        range_end: int,
+    ) -> tuple[RawHit, ...]:
+        validator = RawBitcoinRecordKeySideValidator()
+        assessed: list[RawHit] = []
+        with path.open("rb") as source:
+            for hit in hits:
+                record_type = _RAW_KEY_SIDE_HIT_TYPES.get(hit.hit_type)
+                if record_type is None:
+                    assessed.append(hit)
+                    continue
+                source.seek(hit.start_offset)
+                data = source.read(
+                    min(_MAX_RAW_KEY_SIDE_BYTES, range_end - hit.start_offset)
+                )
+                validation = validator.validate(
+                    data,
+                    expected_record_type=record_type,
+                )
+                assessed.append(
+                    replace(
+                        hit,
+                        structural_status=(
+                            "ANCHOR_ONLY" if validation.valid else "REJECTED"
+                        ),
+                        validation_status=(
+                            BITCOIN_RECORD_KEY_SIDE_VALID
+                            if validation.valid
+                            else "BITCOIN_RECORD_KEY_SIDE_REJECTED"
+                        ),
+                        reason_codes=validation.reason_codes,
+                        correlated_evidence=(
+                            ("CANONICAL_COMPACTSIZE", "SECP256K1_POINT")
+                            if validation.valid
+                            else ()
+                        ),
+                        safe_metadata={
+                            **hit.safe_metadata,
+                            "record_type": validation.record_type,
+                            **validation.evidence,
+                        },
+                    )
+                )
+        return tuple(assessed)
 
     @staticmethod
     def _metadata_candidates(

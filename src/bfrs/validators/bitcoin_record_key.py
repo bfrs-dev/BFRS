@@ -6,6 +6,7 @@ from typing import Any
 from bfrs.core.secp256k1 import FIELD_PRIME, decode_sec_public_key
 from bfrs.validators.bitcoin_record_type import (
     BitcoinRecordType,
+    BitcoinRecordTypeDecoder,
     decode_compact_size,
 )
 
@@ -13,6 +14,15 @@ from bfrs.validators.bitcoin_record_type import (
 SECP256K1_FIELD_PRIME = FIELD_PRIME
 _PUBLIC_KEY_RECORD_TYPES = frozenset({"key", "wkey", "ckey", "keymeta"})
 _SUPPORTED_RECORD_TYPES = _PUBLIC_KEY_RECORD_TYPES | {"mkey", "defaultkey"}
+RAW_KEY_SIDE_RECORD_TYPES = frozenset({"key", "wkey", "ckey"})
+
+BITCOIN_RECORD_KEY_SIDE_VALID = "BITCOIN_RECORD_KEY_SIDE_VALID"
+BITCOIN_RECORD_KEY_COMPACTSIZE_INVALID = (
+    "BITCOIN_RECORD_KEY_COMPACTSIZE_INVALID"
+)
+BITCOIN_RECORD_PUBKEY_LENGTH_INVALID = "BITCOIN_RECORD_PUBKEY_LENGTH_INVALID"
+BITCOIN_RECORD_PUBKEY_PREFIX_INVALID = "BITCOIN_RECORD_PUBKEY_PREFIX_INVALID"
+BITCOIN_RECORD_PUBKEY_NOT_ON_CURVE = "BITCOIN_RECORD_PUBKEY_NOT_ON_CURVE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +40,119 @@ class _SecPublicKeyValidation:
     valid: bool
     compressed: bool
     reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RawBitcoinRecordKeySideValidation:
+    """Safe admission result for a raw framed ``key``/``ckey``/``wkey`` hit."""
+
+    record_type: str
+    valid: bool
+    reason_codes: tuple[str, ...]
+    evidence: dict[str, Any]
+
+
+class RawBitcoinRecordKeySideValidator:
+    """Qualify raw record-name hits without changing legacy record semantics.
+
+    Raw scanning deliberately matches only the framed name.  This adapter
+    requires canonical writer framing for the following CPubKey and delegates
+    the SEC point validation to :class:`BitcoinRecordKeyValidator`.
+    """
+
+    def __init__(self) -> None:
+        self._decoder = BitcoinRecordTypeDecoder(RAW_KEY_SIDE_RECORD_TYPES)
+        self._record_key_validator = BitcoinRecordKeyValidator()
+
+    def validate(
+        self,
+        data: bytes,
+        *,
+        expected_record_type: str,
+    ) -> RawBitcoinRecordKeySideValidation:
+        if expected_record_type not in RAW_KEY_SIDE_RECORD_TYPES:
+            raise ValueError("raw key-side validation supports key, ckey, and wkey")
+
+        decoded = self._decoder.decode(data)
+        if decoded is None or decoded.name != expected_record_type:
+            return self._invalid(
+                expected_record_type,
+                BITCOIN_RECORD_KEY_COMPACTSIZE_INVALID,
+                {},
+            )
+
+        length = decode_compact_size(decoded.remaining_key)
+        if length is None or not length.canonical:
+            return self._invalid(
+                expected_record_type,
+                BITCOIN_RECORD_KEY_COMPACTSIZE_INVALID,
+                {
+                    "pubkey_framing_canonical": (
+                        None if length is None else length.canonical
+                    ),
+                },
+            )
+
+        evidence: dict[str, Any] = {
+            "pubkey_length": length.value,
+            "pubkey_framing_canonical": True,
+        }
+        if length.value not in (33, 65):
+            return self._invalid(
+                expected_record_type,
+                BITCOIN_RECORD_PUBKEY_LENGTH_INVALID,
+                evidence,
+            )
+
+        key_side_length = length.encoded_length + length.value
+        if len(decoded.remaining_key) < key_side_length:
+            return self._invalid(
+                expected_record_type,
+                BITCOIN_RECORD_PUBKEY_LENGTH_INVALID,
+                evidence,
+            )
+
+        exact_end = decoded.prefix_length + key_side_length
+        exact = self._decoder.decode(data[:exact_end])
+        if exact is None or exact.name != expected_record_type:
+            return self._invalid(
+                expected_record_type,
+                BITCOIN_RECORD_KEY_COMPACTSIZE_INVALID,
+                evidence,
+            )
+        validation = self._record_key_validator.validate(exact)
+        if not validation.valid:
+            reason = validation.reasons[0] if validation.reasons else None
+            mapped = {
+                "key_suffix_truncated": BITCOIN_RECORD_PUBKEY_LENGTH_INVALID,
+                "pubkey_length_invalid": BITCOIN_RECORD_PUBKEY_LENGTH_INVALID,
+                "pubkey_prefix_invalid": BITCOIN_RECORD_PUBKEY_PREFIX_INVALID,
+                "pubkey_point_invalid": BITCOIN_RECORD_PUBKEY_NOT_ON_CURVE,
+            }.get(reason)
+            if mapped is None:
+                raise RuntimeError("unexpected Bitcoin record key rejection reason")
+            return self._invalid(expected_record_type, mapped, evidence)
+
+        evidence["compressed"] = validation.evidence["compressed"]
+        return RawBitcoinRecordKeySideValidation(
+            record_type=expected_record_type,
+            valid=True,
+            reason_codes=(BITCOIN_RECORD_KEY_SIDE_VALID,),
+            evidence=evidence,
+        )
+
+    @staticmethod
+    def _invalid(
+        record_type: str,
+        reason: str,
+        evidence: dict[str, Any],
+    ) -> RawBitcoinRecordKeySideValidation:
+        return RawBitcoinRecordKeySideValidation(
+            record_type=record_type,
+            valid=False,
+            reason_codes=(reason,),
+            evidence=evidence,
+        )
 
 
 class BitcoinRecordKeyValidator:

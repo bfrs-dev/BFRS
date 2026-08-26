@@ -197,7 +197,15 @@ def test_default_policy_false_framed_ckey_remains_rejected(tmp_path):
     assert main(["--input", str(source), "--output", str(report)]) == 0
     payload = json.loads(report.read_text(encoding="utf-8"))
     assert payload["raw_hit_count"] == 1
-    assert payload["accepted_hotspot_count"] == 1
+    assert payload["raw_hit_counts_by_signature"] == {"bitcoin_ckey": 1}
+    assert payload["accepted_hotspot_count"] == 0
+    finding = next(
+        item
+        for item in payload["target_findings"]
+        if item["artifact_kind"] == "wallet_record"
+    )
+    assert finding["validation_status"] == "BITCOIN_RECORD_KEY_SIDE_REJECTED"
+    assert finding["reason_codes"] == ["BITCOIN_RECORD_PUBKEY_LENGTH_INVALID"]
     assert payload["status"] == "rejected"
     assert payload["structural_result_count"] == 0
     assert payload["fragment_result_count"] == 0
