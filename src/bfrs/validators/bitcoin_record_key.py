@@ -156,6 +156,7 @@ class RawBitcoinRecordKeySideValidator:
         evidence["compressed"] = validation.evidence["compressed"]
         public_key_start = length.encoded_length
         public_key_end = public_key_start + length.value
+        evidence["public_key_offset"] = decoded.prefix_length + public_key_start
         public_key = exact.remaining_key[public_key_start:public_key_end]
         evidence["safe_pubkey_fingerprint"] = hashlib.sha256(
             public_key

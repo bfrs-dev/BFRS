@@ -29,8 +29,10 @@ from bfrs.recovery.orphan_private_key_der import (
     HISTORICAL_EC_PRIVATE_KEY_DER_ANCHOR,
     HISTORICAL_EC_PRIVATE_KEY_DER_SIGNATURE,
 )
-from bfrs.scanners.fast_scanner import Signature, SignatureAssessment
+from bfrs.scanners.bitcoin_context import BitcoinTextContextChunkDetector
+from bfrs.scanners.fast_scanner import ChunkDetector, Signature, SignatureAssessment
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
+from bfrs.validators.bitcoin_encoding import decode_base58check
 
 
 TARGET_BITCOIN_CORE = "bitcoin-core"
@@ -393,20 +395,7 @@ class MnemonicChunkDetector:
         self.scanner.close()
 
 
-_BASE58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_BASE58_INDEX = {value: index for index, value in enumerate(_BASE58_ALPHABET)}
 _WIF_FINGERPRINT_DOMAIN = b"BFRS-WIF-FINGERPRINT-V1\0"
-
-
-def _base58_decode(value: bytes) -> bytes | None:
-    number = 0
-    try:
-        for character in value:
-            number = number * 58 + _BASE58_INDEX[character]
-    except KeyError:
-        return None
-    body = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
-    return b"\x00" * (len(value) - len(value.lstrip(b"1"))) + body
 
 
 class ValidatedSecretChunkDetector:
@@ -421,13 +410,11 @@ class ValidatedSecretChunkDetector:
             start = chunk.offset + match.start()
             if not ownership_start <= start < ownership_end:
                 continue
-            decoded = _base58_decode(match.group(0))
-            if decoded is None or len(decoded) not in {37, 38} or decoded[0] != 0x80:
+            payload = decode_base58check(match.group(0))
+            if payload is None or len(payload) not in {33, 34} or payload[0] != 0x80:
                 continue
-            payload, checksum = decoded[:-4], decoded[-4:]
-            expected = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
             compressed = len(payload) == 34 and payload[-1] == 1
-            if checksum != expected or (len(payload) == 34 and not compressed):
+            if len(payload) == 34 and not compressed:
                 continue
             private = payload[1:33]
             scalar = int.from_bytes(private, "big")
@@ -451,7 +438,7 @@ class ValidatedSecretChunkDetector:
 class TargetSelection:
     targets: frozenset[str]
     signatures: tuple[Signature, ...]
-    chunk_detectors: tuple[MnemonicChunkDetector, ...]
+    chunk_detectors: tuple[ChunkDetector, ...]
 
 
 _SHARED_NTFS_SIGNATURES = (
@@ -568,5 +555,7 @@ def build_target_selection(targets: frozenset[str], *,
             standards, workers=mnemonic_workers))
     if TARGET_SECRETS in targets:
         detectors.append(ValidatedSecretChunkDetector())
+    if TARGET_BITCOIN_CORE in targets:
+        detectors.append(BitcoinTextContextChunkDetector())
     return TargetSelection(
         targets, tuple(unique.values()), tuple(detectors))

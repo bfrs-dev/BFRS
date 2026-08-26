@@ -91,6 +91,10 @@ from bfrs.scanners.fast_scanner import (
     ScanProgress,
     Signature,
 )
+from bfrs.scanners.bitcoin_context import (
+    BITCOIN_CONTEXT_ARTIFACT_KINDS,
+    scan_bitcoin_context_for_sec_pubkeys,
+)
 from bfrs.scanners.target_registry import TARGET_ARMORY, TARGET_MULTIBIT
 from bfrs.scanners.hotspot_builder import (
     DEFAULT_CLUSTER_GAP,
@@ -291,7 +295,8 @@ class FullImageRecoveryCoordinator:
                             "filesystem_index"}):
                     target_findings.append(hit)
                 if (hit.target in {TARGET_MULTIBIT, TARGET_ARMORY} or
-                        hit.artifact_kind == "mnemonic"):
+                        hit.artifact_kind == "mnemonic" or
+                        hit.artifact_kind in BITCOIN_CONTEXT_ARTIFACT_KINDS):
                     continue
                 if hit.hit_type == NTFS_FILE_RECORD_SIGNATURE:
                     detached_file_offsets.append(hit.start_offset)
@@ -336,7 +341,7 @@ class FullImageRecoveryCoordinator:
                 historical_contexts
             ),
         ).run_hits(electrum_hits, range_start=start, range_end=range_end)
-        hits = self._assess_raw_key_side_hits(
+        hits, binary_context_findings = self._assess_raw_key_side_hits(
             reader.path, tuple(recovery_hits), range_end
         )
         assessed_by_identity = {
@@ -349,6 +354,7 @@ class FullImageRecoveryCoordinator:
             )
             for hit in target_findings
         ]
+        target_findings.extend(binary_context_findings)
         admission_hits = tuple(
             hit
             for hit in hits
@@ -804,9 +810,10 @@ class FullImageRecoveryCoordinator:
         path: Path,
         hits: tuple[RawHit, ...],
         range_end: int,
-    ) -> tuple[RawHit, ...]:
+    ) -> tuple[tuple[RawHit, ...], tuple[RawHit, ...]]:
         validator = RawBitcoinRecordKeySideValidator()
         assessed: list[RawHit] = []
+        context_findings: list[RawHit] = []
         with path.open("rb") as source:
             for hit in hits:
                 record_type = _RAW_KEY_SIDE_HIT_TYPES.get(hit.hit_type)
@@ -821,6 +828,27 @@ class FullImageRecoveryCoordinator:
                     data,
                     expected_record_type=record_type,
                 )
+                if validation.valid:
+                    public_key_offset = validation.evidence.get(
+                        "public_key_offset"
+                    )
+                    public_key_length = validation.evidence.get("pubkey_length")
+                    if not isinstance(public_key_offset, int) or not isinstance(
+                        public_key_length, int
+                    ):
+                        raise RuntimeError(
+                            "key-side validator omitted public key location"
+                        )
+                    context_findings.extend(
+                        scan_bitcoin_context_for_sec_pubkeys(
+                            data[
+                                public_key_offset:
+                                public_key_offset + public_key_length
+                            ],
+                            hit.start_offset + public_key_offset,
+                            source=hit.source,
+                        )
+                    )
                 assessed.append(
                     replace(
                         hit,
@@ -845,7 +873,18 @@ class FullImageRecoveryCoordinator:
                         },
                     )
                 )
-        return tuple(assessed)
+        unique_context_findings = {
+            (
+                finding.start_offset,
+                finding.end_offset,
+                finding.safe_fingerprint,
+            ): finding
+            for finding in context_findings
+        }
+        return tuple(assessed), tuple(
+            unique_context_findings[identity]
+            for identity in sorted(unique_context_findings)
+        )
 
     @staticmethod
     def _metadata_candidates(

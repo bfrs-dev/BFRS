@@ -1071,6 +1071,97 @@ def _electrum_raw_recovery(result) -> dict[str, Any]:
     }
 
 
+def _bitcoin_context_evidence(result: FullImageRecoveryResult) -> dict[str, Any]:
+    addresses = tuple(
+        item for item in result.target_findings
+        if item.artifact_kind == "bitcoin_address"
+    )
+    public_keys = tuple(
+        item for item in result.target_findings
+        if item.artifact_kind == "bitcoin_public_key"
+    )
+    valid_addresses = tuple(
+        item for item in addresses
+        if item.validation_status == "CHECKSUM_VALID"
+    )
+    textual_candidates = tuple(
+        item for item in public_keys
+        if item.safe_metadata.get("representation") == "TEXT_HEX"
+    )
+    valid_textual = tuple(
+        item for item in textual_candidates
+        if item.validation_status == "SECP256K1_VALID"
+    )
+    binary_context = tuple(
+        item for item in public_keys
+        if item.safe_metadata.get("representation") == "BINARY_SEC"
+        and item.validation_status == "SECP256K1_VALID"
+    )
+    address_occurrences: dict[tuple[str, str], list[int]] = {}
+    for item in valid_addresses:
+        address = item.safe_metadata.get("address")
+        address_type = item.safe_metadata.get("address_type")
+        if isinstance(address, str) and isinstance(address_type, str):
+            address_occurrences.setdefault((address, address_type), []).append(
+                item.start_offset
+            )
+    address_groups = [
+        {
+            "address": address,
+            "address_type": address_type,
+            "occurrence_count": len(offsets),
+            "physical_starts": sorted(offsets),
+        }
+        for (address, address_type), offsets in sorted(address_occurrences.items())
+    ]
+    valid_fingerprints = {
+        item.safe_fingerprint
+        for item in (*valid_textual, *binary_context)
+        if item.safe_fingerprint is not None
+    }
+    type_counts = {
+        name: sum(
+            item.safe_metadata.get("address_type") == name
+            for item in valid_addresses
+        )
+        for name in ("P2PKH", "P2SH", "P2WPKH", "P2WSH", "P2TR", "OTHER_WITNESS")
+    }
+    return {
+        "validation_scope": "BITCOIN_CONTEXT_EVIDENCE_ONLY",
+        "structural_wallet_confirmation": "NOT_EVALUATED",
+        "bitcoin_address_candidate_count": len(addresses),
+        "bitcoin_address_valid_count": len(valid_addresses),
+        "p2pkh_count": type_counts["P2PKH"],
+        "p2sh_count": type_counts["P2SH"],
+        "p2wpkh_count": type_counts["P2WPKH"],
+        "p2wsh_count": type_counts["P2WSH"],
+        "p2tr_count": type_counts["P2TR"],
+        "other_witness_count": type_counts["OTHER_WITNESS"],
+        "bech32_count": sum(
+            item.safe_metadata.get("encoding") == "BECH32"
+            for item in valid_addresses
+        ),
+        "bech32m_count": sum(
+            item.safe_metadata.get("encoding") == "BECH32M"
+            for item in valid_addresses
+        ),
+        "textual_pubkey_candidate_count": len(textual_candidates),
+        "textual_pubkey_valid_count": len(valid_textual),
+        "compressed_pubkey_count": sum(
+            item.safe_metadata.get("compressed") is True
+            for item in valid_textual
+        ),
+        "uncompressed_pubkey_count": sum(
+            item.safe_metadata.get("compressed") is False
+            for item in valid_textual
+        ),
+        "binary_context_pubkey_count": len(binary_context),
+        "unique_address_count": len(address_occurrences),
+        "unique_pubkey_fingerprint_count": len(valid_fingerprints),
+        "address_groups": address_groups,
+    }
+
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -1174,6 +1265,7 @@ def serialize_full_image_result(
             result.electrum_raw_recovery
         ),
         "target_findings": [item.safe_dict() for item in result.target_findings],
+        "bitcoin_context_evidence": _bitcoin_context_evidence(result),
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())
         ),
