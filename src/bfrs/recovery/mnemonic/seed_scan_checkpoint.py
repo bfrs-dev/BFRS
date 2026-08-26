@@ -19,9 +19,10 @@ from .raw_mnemonic_scanner import (
 # Completed units bypass validation during resume, so every scanner-semantic
 # change must use a new format.  V2 introduced contiguous BIP39, V3 added the
 # separately identified strict Electrum V1 standard, and V4 makes Electrum 2+
-# tokenization contiguous.  V5 scans both byte phases for each UTF-16 endian.
+# tokenization contiguous.  V5 scans both byte phases for each UTF-16 endian;
+# V6 records results produced by the bytes-prefiltered candidate-window scanner.
 # Older completed units can contain invalid hits or omit newly covered hits.
-FORMAT = "BFRS_SEED_SCAN_CHECKPOINT_V5"
+FORMAT = "BFRS_SEED_SCAN_CHECKPOINT_V6"
 IDENTITY_BYTES = 64 * 1024
 
 
@@ -52,6 +53,11 @@ def _serialize_result(result: RawMnemonicScanResult) -> dict[str, object]:
         "anchors_found": result.anchors_found,
         "checksum_invalid": result.checksum_invalid,
         "failures": list(result.failures),
+        "prefilter_windows": result.prefilter_windows,
+        "expensive_validations": result.expensive_validations,
+        "bip39_validations": result.bip39_validations,
+        "electrum_validations": result.electrum_validations,
+        "electrum_v1_validations": result.electrum_v1_validations,
         "occurrences": [item.candidate.safe_dict() for item in result.occurrences],
     }
 
@@ -73,6 +79,11 @@ def _restore_result(payload: dict[str, object]) -> RawMnemonicScanResult:
         anchors_found=int(payload.get("anchors_found", 0)),
         checksum_invalid=int(payload.get("checksum_invalid", 0)),
         failures=tuple(str(item) for item in payload.get("failures", [])),
+        prefilter_windows=int(payload.get("prefilter_windows", 0)),
+        expensive_validations=int(payload.get("expensive_validations", 0)),
+        bip39_validations=int(payload.get("bip39_validations", 0)),
+        electrum_validations=int(payload.get("electrum_validations", 0)),
+        electrum_v1_validations=int(payload.get("electrum_v1_validations", 0)),
     )
 
 

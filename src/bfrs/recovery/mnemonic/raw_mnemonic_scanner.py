@@ -26,7 +26,35 @@ _DECODE_PASSES = (("utf-8", 0), ("utf-16-le", 0), ("utf-16-le", 1),
                   ("utf-16-be", 0), ("utf-16-be", 1))
 _DOMAIN = b"BFRS-MNEMONIC-FINGERPRINT-V1\0"
 _MAX_PARALLEL_OWNERSHIP = 16 * 1024 * 1024
+_PREFILTER_MIN_RUN = 10
+_PREFILTER_CONTEXT = 4096
+_UNICODE_WHITESPACE = (
+    " ",
+    "\x09", "\x0a", "\x0b", "\x0c", "\x0d", "\x1c", "\x1d", "\x1e", "\x1f",
+    "\x85", "\xa0", "\u1680", "\u2000", "\u2001", "\u2002", "\u2003", "\u2004",
+    "\u2005", "\u2006", "\u2007", "\u2008", "\u2009", "\u200a", "\u2028", "\u2029",
+    "\u202f", "\u205f", "\u3000",
+)
 _WORKER_SCANNER: RawMnemonicScanner | None = None
+
+
+def _two_byte_prefix_pattern(values: set[bytes]) -> re.Pattern[bytes]:
+    followers: dict[int, set[int]] = {}
+    singles: set[int] = set()
+    for value in values:
+        if len(value) == 1:
+            singles.add(value[0])
+        elif value:
+            followers.setdefault(value[0], set()).add(value[1])
+    branches = [
+        re.escape(bytes((first,))) + b"[" +
+        b"".join(re.escape(bytes((second,))) for second in sorted(seconds)) + b"]"
+        for first, seconds in sorted(followers.items())
+    ]
+    if singles:
+        branches.append(b"[" + b"".join(
+            re.escape(bytes((byte,))) for byte in sorted(singles)) + b"]")
+    return re.compile(b"(?:" + b"|".join(branches) + b")")
 
 
 def resolve_worker_count(workers: int) -> int:
@@ -60,6 +88,11 @@ class RawMnemonicScanResult:
     anchors_found: int
     checksum_invalid: int
     failures: tuple[str, ...]
+    prefilter_windows: int = 0
+    expensive_validations: int = 0
+    bip39_validations: int = 0
+    electrum_validations: int = 0
+    electrum_v1_validations: int = 0
 
 
 def _initialize_worker(chunk_size: int, overlap: int) -> None:
@@ -129,6 +162,31 @@ class RawMnemonicScanner:
                             for word, masks in membership.items()}
         self._max_token_chars = max(map(len, self._membership))
         self._normalize_token = lru_cache(maxsize=8192)(self._normalize_token_uncached)
+        self._whitespace_patterns = {
+            encoding: re.compile(
+                b"(?:" + b"|".join(
+                    re.escape(character.encode(encoding))
+                    for character in sorted(
+                        _UNICODE_WHITESPACE,
+                        key=lambda item: len(item.encode(encoding)),
+                        reverse=True,
+                    )
+                ) + b")+"
+            )
+            for encoding in {item[0] for item in _DECODE_PASSES}
+        }
+        self._max_encoded_token = {
+            encoding: max(len(word.encode(encoding)) for word in self._membership)
+            for encoding in self._whitespace_patterns
+        }
+        self._word_prefix_patterns = {
+            encoding: _two_byte_prefix_pattern({
+                form.encode(encoding)[:2]
+                for word in self._membership
+                for form in (word, unicodedata.normalize("NFC", word), word.upper())
+            })
+            for encoding in self._whitespace_patterns
+        }
 
     @staticmethod
     def _normalize_token_uncached(token: str) -> tuple[str, str]:
@@ -240,11 +298,17 @@ class RawMnemonicScanner:
     @staticmethod
     def _merge_results(results: list[tuple[int, RawMnemonicScanResult]]) -> RawMnemonicScanResult:
         occurrences: dict[tuple[str, int, int, str], MnemonicOccurrence] = {}
-        anchors = invalid = 0
+        anchors = invalid = windows = validations = 0
+        bip39_validations = electrum_validations = electrum_v1_validations = 0
         failures: list[str] = []
         for _, result in results:
             anchors += result.anchors_found
             invalid += result.checksum_invalid
+            windows += result.prefilter_windows
+            validations += result.expensive_validations
+            bip39_validations += result.bip39_validations
+            electrum_validations += result.electrum_validations
+            electrum_v1_validations += result.electrum_v1_validations
             failures.extend(result.failures)
             for occurrence in result.occurrences:
                 item = occurrence.candidate
@@ -253,7 +317,88 @@ class RawMnemonicScanner:
                 occurrences[key] = occurrence
         ordered = tuple(occurrences[key] for key in sorted(occurrences))
         return RawMnemonicScanResult(ordered, anchors, invalid,
-                                     tuple(sorted(set(failures))))
+                                     tuple(sorted(set(failures))), windows, validations,
+                                     bip39_validations, electrum_validations,
+                                     electrum_v1_validations)
+
+    def _prefilter_member(self, field: bytes, encoding: str) -> bool:
+        """Cheap exact-word test used only to nominate a bounded validation region."""
+        if not field or len(field) > self._max_encoded_token[encoding]:
+            return False
+        if encoding == "utf-8" and field.isascii():
+            if not field.isalpha():
+                return False
+            return field.lower().decode("ascii") in self._membership
+        try:
+            original = field.decode(encoding, errors="strict")
+        except UnicodeError:
+            return False
+        if _TOKEN.fullmatch(original) is None or len(original) > self._max_token_chars:
+            return False
+        word, electrum_word = self._normalize_token(original)
+        membership = self._membership.get(word, (0, 0, 0))
+        return bool(membership[0] or membership[2] or membership[1] or
+                    self._membership.get(electrum_word, (0, 0, 0))[1])
+
+    def _prefilter_regions(self, encoded_data: bytes, encoding: str
+                           ) -> tuple[tuple[int, int], ...]:
+        """Find conservative byte regions which can contain at least 12 words.
+
+        In a 12-word phrase, at least the ten interior whitespace-delimited
+        fields are exact words even when punctuation touches both outer words.
+        Context is one full overlap on each side, and overlapping triggers are
+        merged before any Unicode tokenization or cryptographic validation.
+        """
+        if self._word_prefix_patterns[encoding].search(encoded_data) is None:
+            return ()
+        delimiters = self._whitespace_patterns[encoding]
+        run: deque[tuple[int, int]] = deque(maxlen=_PREFILTER_MIN_RUN)
+        regions: list[tuple[int, int]] = []
+        field_start = 0
+
+        def aligned_separators():
+            if encoding == "utf-8":
+                yield from delimiters.finditer(encoded_data)
+                return
+            search_start = 0
+            while True:
+                separator = delimiters.search(encoded_data, search_start)
+                while separator is not None and separator.start() % 2:
+                    separator = delimiters.search(encoded_data, separator.start() + 1)
+                if separator is None:
+                    return
+                yield separator
+                search_start = separator.end()
+
+        for separator in aligned_separators():
+            field_end = separator.start()
+            if self._prefilter_member(encoded_data[field_start:field_end], encoding):
+                run.append((field_start, field_end))
+                if len(run) == _PREFILTER_MIN_RUN:
+                    start = max(0, run[0][0] - _PREFILTER_CONTEXT)
+                    end = min(len(encoded_data), field_end + _PREFILTER_CONTEXT)
+                    if encoding != "utf-8":
+                        start -= start % 2
+                        end -= end % 2
+                    if regions and start <= regions[-1][1]:
+                        regions[-1] = (regions[-1][0], max(regions[-1][1], end))
+                    else:
+                        regions.append((start, end))
+            else:
+                run.clear()
+            field_start = separator.end()
+        field_end = len(encoded_data)
+        if self._prefilter_member(encoded_data[field_start:field_end], encoding):
+            run.append((field_start, field_end))
+            if len(run) == _PREFILTER_MIN_RUN:
+                start = max(0, run[0][0] - _PREFILTER_CONTEXT)
+                if encoding != "utf-8":
+                    start -= start % 2
+                if regions and start <= regions[-1][1]:
+                    regions[-1] = (regions[-1][0], field_end)
+                else:
+                    regions.append((start, field_end))
+        return tuple(regions)
 
     def scan_bytes(self, data: bytes, *, source: str = "<memory>",
                    base_offset: int = 0, source_kind: str = "RAW_BYTES",
@@ -261,6 +406,7 @@ class RawMnemonicScanner:
                    ownership_end: int | None = None,
                    phase_progress: Callable[[str], None] | None = None,
                    decode_passes: tuple[tuple[str, int], ...] = _DECODE_PASSES,
+                   _prefiltered: bool = False,
                    ) -> RawMnemonicScanResult:
         if self.phase_workers > 1 and len(decode_passes) > 1:
             return self._scan_bytes_parallel_phases(
@@ -274,7 +420,8 @@ class RawMnemonicScanner:
                 decode_passes=decode_passes,
             )
         found: dict[tuple[str, int, int, str], MnemonicOccurrence] = {}
-        anchors = invalid = 0
+        anchors = invalid = prefilter_windows = expensive_validations = 0
+        bip39_validations = electrum_validations = electrum_v1_validations = 0
         failures: list[str] = []
         # UTF-16 code units may begin at either byte phase within a raw chunk.
         # UTF-8 is deliberately scanned once; each UTF-16 endian is scanned at
@@ -287,6 +434,35 @@ class RawMnemonicScanner:
                 phase_data = data[phase_offset:]
                 encoded_data = (phase_data if encoding == "utf-8" else
                                 phase_data[:len(phase_data) // 2 * 2])
+                if not _prefiltered:
+                    regions = self._prefilter_regions(encoded_data, encoding)
+                    prefilter_windows += len(regions)
+                    for region_start, region_end in regions:
+                        result = self.scan_bytes(
+                            encoded_data[region_start:region_end],
+                            source=source,
+                            base_offset=(base_offset + phase_offset + region_start),
+                            source_kind=source_kind,
+                            ownership_start=ownership_start,
+                            ownership_end=ownership_end,
+                            decode_passes=((encoding, 0),),
+                            _prefiltered=True,
+                        )
+                        anchors += result.anchors_found
+                        invalid += result.checksum_invalid
+                        expensive_validations += result.expensive_validations
+                        bip39_validations += result.bip39_validations
+                        electrum_validations += result.electrum_validations
+                        electrum_v1_validations += result.electrum_v1_validations
+                        failures.extend(result.failures)
+                        for occurrence in result.occurrences:
+                            candidate = occurrence.candidate
+                            key = (candidate.encoding or "",
+                                   candidate.physical_start or 0,
+                                   candidate.physical_end or 0,
+                                   candidate.mnemonic_standard)
+                            found[key] = occurrence
+                    continue
                 error_mode = "surrogateescape" if encoding == "utf-8" else "surrogatepass"
                 text = encoded_data.decode(encoding, errors=error_mode)
                 # Token boundaries are mapped in one monotonic pass.  Each span is
@@ -417,6 +593,13 @@ class RawMnemonicScanner:
                                               if electrum_languages & (1 << bit))
                             validations.append(("ELECTRUM", self.electrum.validate_words(
                                 words, normalized=normalized, languages=languages)))
+                        expensive_validations += len(validations)
+                        bip39_validations += sum(
+                            standard == "BIP39" for standard, _ in validations)
+                        electrum_validations += sum(
+                            standard == "ELECTRUM" for standard, _ in validations)
+                        electrum_v1_validations += sum(
+                            standard == "ELECTRUM_V1" for standard, _ in validations)
                         for standard, validation in validations:
                             valid = validation.status in {
                                 "BIP39_VALID", "ELECTRUM_SEED_VALID",
@@ -457,7 +640,10 @@ class RawMnemonicScanner:
             except (UnicodeError, ValueError) as error:
                 failures.append(f"{encoding}:{type(error).__name__}")
         return RawMnemonicScanResult(tuple(found.values()), anchors, invalid,
-                                     tuple(dict.fromkeys(failures)))
+                                     tuple(dict.fromkeys(failures)),
+                                     prefilter_windows, expensive_validations,
+                                     bip39_validations, electrum_validations,
+                                     electrum_v1_validations)
 
     def _scan_bytes_parallel_phases(
         self,
@@ -507,11 +693,17 @@ class RawMnemonicScanner:
         results: list[RawMnemonicScanResult],
     ) -> RawMnemonicScanResult:
         found: dict[tuple[str, int, int, str], MnemonicOccurrence] = {}
-        anchors = invalid = 0
+        anchors = invalid = windows = validations = 0
+        bip39_validations = electrum_validations = electrum_v1_validations = 0
         failures: list[str] = []
         for result in results:
             anchors += result.anchors_found
             invalid += result.checksum_invalid
+            windows += result.prefilter_windows
+            validations += result.expensive_validations
+            bip39_validations += result.bip39_validations
+            electrum_validations += result.electrum_validations
+            electrum_v1_validations += result.electrum_v1_validations
             failures.extend(result.failures)
             for occurrence in result.occurrences:
                 candidate = occurrence.candidate
@@ -524,7 +716,8 @@ class RawMnemonicScanner:
                 found[key] = occurrence
         return RawMnemonicScanResult(
             tuple(found.values()), anchors, invalid,
-            tuple(dict.fromkeys(failures)),
+            tuple(dict.fromkeys(failures)), windows, validations,
+            bip39_validations, electrum_validations, electrum_v1_validations,
         )
 
     def close(self) -> None:
