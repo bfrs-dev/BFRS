@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 from concurrent.futures import Future
@@ -8,13 +9,17 @@ from functools import lru_cache
 from pathlib import Path
 import re
 import sys
+import unicodedata
 import zipfile
 
 import pytest
 
 from bfrs.cli import main
 from bfrs.recovery.mnemonic.bip39_validator import BIP39Validator
-from bfrs.recovery.mnemonic.document_seed_recovery import DocumentSeedRecovery
+from bfrs.recovery.mnemonic.document_seed_recovery import (
+    DocumentSeedRecovery,
+    PLAIN_EXTENSIONS,
+)
 from bfrs.recovery.mnemonic.electrum_seed_validator import ElectrumSeedValidator
 from bfrs.recovery.mnemonic.mnemonic_recovery_pipeline import MnemonicRecoveryPipeline
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import RawMnemonicScanner
@@ -49,6 +54,18 @@ def test_bip39_all_standard_lengths(entropy_bits):
 @pytest.mark.parametrize("language", BIP39Validator().wordlists)
 def test_bip39_all_official_languages(language):
     assert BIP39Validator().validate(bip39_phrase(language)).status == "BIP39_VALID"
+
+
+@pytest.mark.parametrize("language", BIP39Validator().wordlists)
+@pytest.mark.parametrize("form", ["NFKD", "NFC"])
+def test_raw_bip39_all_official_languages_and_unicode_forms(language, form):
+    phrase = unicodedata.normalize(form, bip39_phrase(language))
+    matches = [item for item in RawMnemonicScanner(
+        chunk_size=8192, overlap=4096).scan_bytes(phrase.encode("utf-8")).occurrences
+               if item.candidate.mnemonic_standard == "BIP39" and
+               item.candidate.encoding == "utf-8"]
+    assert len(matches) == 1
+    assert matches[0].candidate.language == language
 
 
 def test_bip39_rejects_checksum_and_mixed_language():
@@ -98,7 +115,7 @@ def electrum_phrase(word_count: int = 12, language: str = "english") -> str:
     for number in range(100_000):
         phrase = " ".join([words[(number // len(words)) % len(words)]] * (word_count - 1) +
                           [words[number % len(words)]])
-        if validator.validate_words(tuple(phrase.split()), normalized=phrase,
+        if validator.validate_words(tuple(phrase.split()),
                                     languages=(language,)).status == "ELECTRUM_SEED_VALID":
             return phrase
     raise AssertionError("deterministic Electrum fixture not found")
@@ -127,6 +144,49 @@ def test_electrum_version_prefix_and_normalization():
     assert validator.validate(phrase.upper()).status == "ELECTRUM_SEED_VALID"
     assert phrase not in repr(validator.validate(phrase))
     assert validator.validate("ordinary prose cannot be an electrum seed phrase here today").status == "REJECTED"
+
+
+def test_raw_bip39_is_case_sensitive_but_electrum_normalization_is_not():
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+    bip39 = bip39_phrase("english")
+    assert not [item for item in scanner.scan_bytes(bip39.upper().encode()).occurrences
+                if item.candidate.mnemonic_standard == "BIP39"]
+    electrum = electrum_phrase()
+    matches = [item for item in scanner.scan_bytes(electrum.upper().encode()).occurrences
+               if item.candidate.mnemonic_standard == "ELECTRUM"]
+    assert len(matches) == 1
+
+
+@pytest.mark.parametrize("seed_type,prefix", [
+    ("standard", "01"),
+    ("segwit", "100"),
+    ("2fa", "101"),
+    ("2fa_segwit", "102"),
+])
+def test_all_modern_electrum_seed_version_prefixes(seed_type, prefix):
+    validator = ElectrumSeedValidator()
+    words = tuple(sorted(validator.wordlists["english"]))
+    phrase = None
+    for number in range(1_000_000):
+        candidate = " ".join(
+            [words[(number // len(words)) % len(words)]] * 11 +
+            [words[number % len(words)]])
+        digest = hmac.new(b"Seed version", candidate.encode(), hashlib.sha512).hexdigest()
+        if digest.startswith(prefix):
+            phrase = candidate
+            break
+    assert phrase is not None
+    result = validator.validate(phrase)
+    assert result.status == "ELECTRUM_SEED_VALID"
+    assert result.seed_type == seed_type
+
+
+@pytest.mark.parametrize("language", ElectrumSeedValidator().wordlists)
+def test_modern_electrum_all_bundled_wordlists(language):
+    phrase = electrum_phrase(language=language)
+    result = ElectrumSeedValidator().validate(phrase)
+    assert result.status == "ELECTRUM_SEED_VALID"
+    assert result.language in {language, "ambiguous"}
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-16-le", "utf-16-be"])
@@ -216,7 +276,9 @@ def test_raw_scanner_boundary_offsets_all_encodings(tmp_path, encoding):
     assert candidate.physical_end == start + len(encoded)
 
 
-@pytest.mark.parametrize("delimiter", ["    ", "\t", "\r\n", "\n", " \r\n\t "])
+@pytest.mark.parametrize("delimiter", [
+    "    ", "\t", "\r\n", "\n", " \r\n\t ", "\u00a0", "\u2003", "\u3000",
+])
 def test_raw_scanner_accepts_whitespace_delimiters(delimiter):
     phrase = bip39_phrase("english")
     decorated = delimiter.join(phrase.split()).encode()
@@ -225,13 +287,57 @@ def test_raw_scanner_accepts_whitespace_delimiters(delimiter):
                for item in result.occurrences)
 
 
-@pytest.mark.parametrize("delimiter", [",", " ; ", " / ", "-", "<b>"])
+@pytest.mark.parametrize("delimiter", [
+    ",", " ; ", " : ", " / ", " \\ ", "-", "–", "—", "<b>",
+    ") (", "] [", "} {", "\"", "'",
+])
 def test_raw_scanner_rejects_non_whitespace_bip39_delimiters(delimiter):
     phrase = bip39_phrase("english")
     result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(
         delimiter.join(phrase.split()).encode())
     assert not [item for item in result.occurrences
                 if item.candidate.mnemonic_standard == "BIP39"]
+
+
+@pytest.mark.parametrize("intruder", ["-", "'", "_", "/", "\\", "–", "—"])
+def test_punctuation_inside_a_word_is_never_stripped(intruder):
+    words = bip39_phrase("english").split()
+    word = words[5]
+    words[5] = word[:len(word) // 2] + intruder + word[len(word) // 2:]
+    result = RawMnemonicScanner(chunk_size=8192, overlap=4096).scan_bytes(
+        " ".join(words).encode())
+    assert not [item for item in result.occurrences
+                if item.candidate.mnemonic_standard == "BIP39"]
+
+
+@pytest.mark.parametrize("prefix,suffix", [
+    ("(", ")"), ("[", "]"), ("{", "}"), ('"', '"'), ("'", "'"),
+    ("seed: ", ";"), ("path/", "\\tail"), ("—", "—"),
+    ("<seed>", "</seed>"), ('{"seed":"', '"}'),
+])
+def test_punctuation_around_whole_phrase_preserves_bip39(prefix, suffix):
+    phrase = bip39_phrase("english")
+    payload = (prefix + phrase + suffix).encode()
+    matches = [item for item in RawMnemonicScanner(
+        chunk_size=8192, overlap=4096).scan_bytes(payload).occurrences
+               if item.candidate.mnemonic_standard == "BIP39" and
+               item.candidate.encoding == "utf-8"]
+    assert len(matches) == 1
+    candidate = matches[0].candidate
+    assert payload[candidate.physical_start:candidate.physical_end] == phrase.encode()
+
+
+@pytest.mark.parametrize("suffix", sorted(PLAIN_EXTENSIONS))
+def test_all_declared_plain_text_contexts_use_strict_validated_scanner(suffix):
+    phrase = bip39_phrase("english")
+    payload = ('{"seed":"' + phrase + '"}').encode()
+    result = DocumentSeedRecovery(RawMnemonicScanner(
+        chunk_size=8192, overlap=4096)).scan_bytes(
+            payload, source=f"fixture{suffix}", suffix=suffix)
+    matches = [item for item in result.occurrences
+               if item.candidate.mnemonic_standard == "BIP39"]
+    assert len(matches) == 1
+    assert matches[0].candidate.source_kind == "KNOWN_FILE_CONTENT"
 
 
 def test_raw_scanner_rejects_false_true_csv_false_positive():
@@ -910,7 +1016,9 @@ def test_checkpoint_rejects_wrong_source_size_and_corruption(tmp_path):
 @pytest.mark.parametrize("old_format", ["BFRS_SEED_SCAN_CHECKPOINT_V1",
                                          "BFRS_SEED_SCAN_CHECKPOINT_V2",
                                          "BFRS_SEED_SCAN_CHECKPOINT_V3",
-                                         "BFRS_SEED_SCAN_CHECKPOINT_V4"])
+                                         "BFRS_SEED_SCAN_CHECKPOINT_V4",
+                                         "BFRS_SEED_SCAN_CHECKPOINT_V5",
+                                         "BFRS_SEED_SCAN_CHECKPOINT_V6"])
 def test_checkpoint_rejects_pre_current_scanner_results(tmp_path, old_format):
     source = tmp_path / "source.bin"
     source.write_bytes(b"a" * 10_000)
@@ -999,7 +1107,10 @@ def test_seed_only_cli_safe_report_and_explicit_export(tmp_path, capsys):
                  "--seed-scan-only", "--chunk-mib", "1", "--overlap-kib", "4"]) == 0
     serialized = report.read_text(encoding="utf-8")
     assert phrase not in serialized
-    assert json.loads(serialized)["mnemonic_recovery"]["bip39_valid"] == 1
+    summary = json.loads(serialized)["mnemonic_recovery"]
+    assert summary["bip39_valid"] == 1
+    assert summary["electrum_2_plus_valid"] == 0
+    assert summary["electrum_v1_valid"] == 0
     secret = tmp_path / "seeds.txt"
     assert export_main(["--input", str(source), "--output", str(secret),
                         "--overlap-kib", "4"]) == 2

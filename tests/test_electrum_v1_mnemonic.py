@@ -16,6 +16,7 @@ OFFICIAL_WORDS = (
     "hardly point goal hallway patience key stone difference ready caught listen fact")
 INVALID_33_HEX = (
     "hurry idiot prefer sunset mention mist jaw inhale impossible kingdom rare squeeze")
+V1_V2_COLLISION = "able able able able able able able able able able able goose"
 
 
 def _scanner() -> RawMnemonicScanner:
@@ -180,6 +181,9 @@ def test_electrum_v1_deduplicates_same_secret_without_cross_standard_identity(tm
                   if item.mnemonic_standard == "ELECTRUM_V1"]
     assert len(candidates) == 1
     assert candidates[0].duplicate_count == 2
+    assert result.recovery.electrum_v1_valid == 1
+    assert result.recovery.electrum_2_plus_valid == 0
+    assert result.recovery.electrum_valid == 1
     assert result.recovery.duplicate_occurrences >= 1
 
 
@@ -198,3 +202,14 @@ def test_standard_interactions_remain_independent():
     invalid_result = _scanner().scan_bytes(INVALID_33_HEX.encode())
     assert not {"ELECTRUM_V1", "BIP39"} & {
         item.candidate.mnemonic_standard for item in invalid_result.occurrences}
+
+
+def test_strict_v1_has_deterministic_precedence_over_modern_hmac_collision():
+    v1 = ElectrumV1Validator().validate(V1_V2_COLLISION)
+    modern = ElectrumSeedValidator().validate(V1_V2_COLLISION)
+    assert v1.status == "ELECTRUM_V1_STRICT_VALID"
+    assert modern.status == "ELECTRUM_SEED_VALID"
+
+    result = _scanner().scan_bytes(V1_V2_COLLISION.encode())
+    standards = {item.candidate.mnemonic_standard for item in result.occurrences}
+    assert standards == {"ELECTRUM_V1"}

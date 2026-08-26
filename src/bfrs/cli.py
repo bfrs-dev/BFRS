@@ -408,6 +408,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"mnemonic candidates: {summary.candidates_total}")
         print(f"BIP39 valid: {summary.bip39_valid}")
         print(f"Electrum valid: {summary.electrum_valid}")
+        print(f"Electrum 2+ valid: {summary.electrum_2_plus_valid}")
+        print(f"Electrum V1 valid: {summary.electrum_v1_valid}")
         print(f"duplicate occurrences: {summary.duplicate_occurrences}")
         print(f"report path: {arguments.output.resolve()}")
         return 0

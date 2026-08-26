@@ -19,6 +19,28 @@ SHA-256 fingerprint used for deduplication.
   `mn_encode`/`mn_decode` codec. Twelve-word seeds require a strict 32-hex
   round-trip; 24-word compatibility seeds require a strict 64-hex round-trip.
 
+The stable report value `ELECTRUM` means Electrum 2+; `seed_type` distinguishes
+`standard`, `segwit`, `2fa`, and `2fa_segwit`. It is intentionally separate
+from `ELECTRUM_V1`. BIP39 words are case-sensitive after NFKD, while Electrum
+uses its upstream lowercase/accent/CJK normalization. `UNKNOWN_MNEMONIC_LIKE`
+is not promoted to a candidate: unversioned, checksum-invalid, partial, or
+otherwise merely wordlist-like text remains diagnostic/non-evidence so that it
+cannot increase forensic confidence.
+
+## Historical format classification
+
+| Format | Classification in mnemonic recovery | Route |
+|---|---|---|
+| BIP39 | SUPPORTED | `BIP39` |
+| Electrum 2+ | SUPPORTED | stable report value `ELECTRUM` |
+| Electrum V1 | SUPPORTED | `ELECTRUM_V1` |
+| Brainwallet prose | NOT A MNEMONIC | validated-secret/text-context paths |
+| Armory wallets and paper backups | NOT A MNEMONIC | Armory structural/document detectors |
+| MultiBit Classic/export | NOT A MNEMONIC | MultiBit structural detectors |
+| MultiBit HD mnemonic recovery | NOT SUPPORTED | marker is reported out of scope |
+| Bitcoin Core HD seed/key records | NOT A MNEMONIC | Bitcoin Core record validators |
+| Other historical deterministic-wallet phrases | NOT SUPPORTED | no heuristic promotion |
+
 Primary sources: Bitcoin BIPs `bip-0039.mediawiki` and its wordlists; Electrum
 `electrum/mnemonic.py`, `electrum/version.py`, and `electrum/wordlist/` in the
 official `spesmilo/electrum` repository. BIP39 declares the MIT License and
@@ -39,6 +61,13 @@ PDF candidates record the one-based page number and extraction method, use
 `PDF_TEXT` provenance, and never claim physical byte offsets. Documents and
 extracted text are each limited to 64 MiB, and PDFs are limited to 10,000 pages.
 No OCR, JavaScript, macros, embedded programs, or external processes are executed.
+
+Words inside a complete phrase must be separated by bounded whitespace only
+(ordinary spaces, repeated spaces, tabs, CR/LF, and Unicode whitespace).
+Punctuation, quotes, brackets, markup, JSON/XML delimiters, slashes, and dashes
+may surround the complete phrase, but are never stripped from inside words and
+never used as internal word separators. This preserves standalone strings and
+clipboard/text dumps without manufacturing phrases from prose or structured data.
 
 `--seed-scan-only` bypasses Bitcoin Core and Electrum wallet recovery paths.
 Normal reports are safe to handle. Secret export is a separate rescan command

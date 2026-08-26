@@ -16,10 +16,15 @@ def _is_cjk(character: str) -> bool:
     ))
 
 
-def electrum_normalize(text: str) -> str:
+def electrum_normalize_words(text: str) -> str:
+    """Normalize Electrum text while retaining mnemonic word boundaries."""
     value = unicodedata.normalize("NFKD", text).lower()
     value = "".join(char for char in value if not unicodedata.combining(char))
-    value = " ".join(value.split())
+    return " ".join(value.split())
+
+
+def electrum_normalize(text: str) -> str:
+    value = electrum_normalize_words(text)
     return "".join(char for index, char in enumerate(value)
                    if not (char in string.whitespace and index > 0
                            and index + 1 < len(value)

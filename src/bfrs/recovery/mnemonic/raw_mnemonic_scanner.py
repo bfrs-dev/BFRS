@@ -21,7 +21,15 @@ from .mnemonic_normalizer import electrum_normalize
 from .mnemonic_candidate import MnemonicCandidate
 
 
-_TOKEN = re.compile(r"[^\W\d_]+", re.UNICODE)
+# Python's ``\w`` does not include combining marks.  BIP39 wordlists are NFKD,
+# so an already-decomposed accented word must remain one source token.  Marks
+# cannot start a token and punctuation is deliberately excluded.
+_COMBINING_MARK = (
+    r"\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff"
+    r"\u20d0-\u20ff\ufe20-\ufe2f\u3099\u309a"
+)
+_TOKEN = re.compile(
+    rf"[^\W\d_](?:[^\W\d_]|[{_COMBINING_MARK}])*", re.UNICODE)
 _DECODE_PASSES = (("utf-8", 0), ("utf-16-le", 0), ("utf-16-le", 1),
                   ("utf-16-be", 0), ("utf-16-be", 1))
 _DOMAIN = b"BFRS-MNEMONIC-FINGERPRINT-V1\0"
@@ -35,26 +43,13 @@ _UNICODE_WHITESPACE = (
     "\u2005", "\u2006", "\u2007", "\u2008", "\u2009", "\u200a", "\u2028", "\u2029",
     "\u202f", "\u205f", "\u3000",
 )
+_ASCII_WHITESPACE_TRANSLATION = bytes.maketrans(
+    bytes(range(256)),
+    bytes(0x20 if byte in b" \t\n\v\f\r\x1c\x1d\x1e\x1f" else byte
+          for byte in range(256)),
+)
+_PREFILTER_BATCH = 1024 * 1024
 _WORKER_SCANNER: RawMnemonicScanner | None = None
-
-
-def _two_byte_prefix_pattern(values: set[bytes]) -> re.Pattern[bytes]:
-    followers: dict[int, set[int]] = {}
-    singles: set[int] = set()
-    for value in values:
-        if len(value) == 1:
-            singles.add(value[0])
-        elif value:
-            followers.setdefault(value[0], set()).add(value[1])
-    branches = [
-        re.escape(bytes((first,))) + b"[" +
-        b"".join(re.escape(bytes((second,))) for second in sorted(seconds)) + b"]"
-        for first, seconds in sorted(followers.items())
-    ]
-    if singles:
-        branches.append(b"[" + b"".join(
-            re.escape(bytes((byte,))) for byte in sorted(singles)) + b"]")
-    return re.compile(b"(?:" + b"|".join(branches) + b")")
 
 
 def resolve_worker_count(workers: int) -> int:
@@ -162,31 +157,35 @@ class RawMnemonicScanner:
                             for word, masks in membership.items()}
         self._max_token_chars = max(map(len, self._membership))
         self._normalize_token = lru_cache(maxsize=8192)(self._normalize_token_uncached)
-        self._whitespace_patterns = {
-            encoding: re.compile(
-                b"(?:" + b"|".join(
-                    re.escape(character.encode(encoding))
-                    for character in sorted(
-                        _UNICODE_WHITESPACE,
-                        key=lambda item: len(item.encode(encoding)),
-                        reverse=True,
-                    )
-                ) + b")+"
-            )
-            for encoding in {item[0] for item in _DECODE_PASSES}
+        encodings = {item[0] for item in _DECODE_PASSES}
+        self._encoded_whitespace = {
+            encoding: tuple(character.encode(encoding)
+                            for character in _UNICODE_WHITESPACE)
+            for encoding in encodings
         }
         self._max_encoded_token = {
             encoding: max(len(word.encode(encoding)) for word in self._membership)
-            for encoding in self._whitespace_patterns
+            for encoding in encodings
         }
-        self._word_prefix_patterns = {
-            encoding: _two_byte_prefix_pattern({
-                form.encode(encoding)[:2]
+        self._encoded_membership = {
+            encoding: frozenset(
+                form.encode(encoding)
                 for word in self._membership
                 for form in (word, unicodedata.normalize("NFC", word), word.upper())
-            })
-            for encoding in self._whitespace_patterns
+            )
+            for encoding in encodings
         }
+        self._encoded_word_index = {}
+        for encoding, words in self._encoded_membership.items():
+            mutable_index: dict[int, dict[int, set[bytes]]] = {}
+            for word in words:
+                mutable_index.setdefault(word[0], {}).setdefault(
+                    len(word), set()).add(word)
+            self._encoded_word_index[encoding] = {
+                first: {length: frozenset(bucket)
+                        for length, bucket in lengths.items()}
+                for first, lengths in mutable_index.items()
+            }
 
     @staticmethod
     def _normalize_token_uncached(token: str) -> tuple[str, str]:
@@ -325,20 +324,93 @@ class RawMnemonicScanner:
         """Cheap exact-word test used only to nominate a bounded validation region."""
         if not field or len(field) > self._max_encoded_token[encoding]:
             return False
-        if encoding == "utf-8" and field.isascii():
-            if not field.isalpha():
-                return False
-            return field.lower().decode("ascii") in self._membership
+        bucket = self._encoded_word_index[encoding].get(field[0], {}).get(len(field))
+        if bucket is None:
+            return False
+        if field in bucket:
+            return True
         try:
             original = field.decode(encoding, errors="strict")
         except UnicodeError:
             return False
-        if _TOKEN.fullmatch(original) is None or len(original) > self._max_token_chars:
+        if not original.isalpha() or len(original) > self._max_token_chars:
             return False
         word, electrum_word = self._normalize_token(original)
         membership = self._membership.get(word, (0, 0, 0))
         return bool(membership[0] or membership[2] or membership[1] or
                     self._membership.get(electrum_word, (0, 0, 0))[1])
+
+    @staticmethod
+    def _merge_prefilter_region(regions: list[tuple[int, int]], start: int,
+                                end: int) -> None:
+        if regions and start <= regions[-1][1]:
+            regions[-1] = (regions[-1][0], max(regions[-1][1], end))
+        else:
+            regions.append((start, end))
+
+    def _prefilter_stream(self, transformed: bytes, encoding: str,
+                          delimiter: bytes) -> tuple[tuple[int, int], ...]:
+        """Nominate runs from an equal-length byte transform of the source."""
+        run: deque[tuple[int, int]] = deque(maxlen=_PREFILTER_MIN_RUN)
+        regions: list[tuple[int, int]] = []
+        max_token = self._max_encoded_token[encoding]
+
+        def process_field(field: bytes, field_start: int) -> None:
+            if not field:
+                return
+            if not self._prefilter_member(field, encoding):
+                run.clear()
+                return
+            field_end = field_start + len(field)
+            run.append((field_start, field_end))
+            if len(run) != _PREFILTER_MIN_RUN:
+                return
+            start = max(0, run[0][0] - _PREFILTER_CONTEXT)
+            end = min(len(transformed), field_end + _PREFILTER_CONTEXT)
+            if encoding != "utf-8":
+                start -= start % 2
+                end -= end % 2
+            self._merge_prefilter_region(regions, start, end)
+
+        carry = b""
+        carry_start = 0
+        in_long_field = False
+        delimiter_length = len(delimiter)
+        for block_start in range(0, len(transformed), _PREFILTER_BATCH):
+            block = transformed[block_start:block_start + _PREFILTER_BATCH]
+            parts = block.split(delimiter)
+            if len(parts) == 1:
+                if not in_long_field:
+                    if len(carry) + len(block) <= max_token:
+                        carry += block
+                    else:
+                        carry = b""
+                        in_long_field = True
+                        run.clear()
+                continue
+
+            first = parts[0]
+            if in_long_field:
+                run.clear()
+            elif carry:
+                process_field(carry + first, carry_start)
+            else:
+                process_field(first, block_start)
+
+            cursor = block_start + len(first) + delimiter_length
+            for field in parts[1:-1]:
+                process_field(field, cursor)
+                cursor += len(field) + delimiter_length
+
+            carry = parts[-1]
+            carry_start = cursor
+            in_long_field = len(carry) > max_token
+            if in_long_field:
+                carry = b""
+                run.clear()
+        if carry and not in_long_field:
+            process_field(carry, carry_start)
+        return tuple(regions)
 
     def _prefilter_regions(self, encoded_data: bytes, encoding: str
                            ) -> tuple[tuple[int, int], ...]:
@@ -349,56 +421,29 @@ class RawMnemonicScanner:
         Context is one full overlap on each side, and overlapping triggers are
         merged before any Unicode tokenization or cryptographic validation.
         """
-        if self._word_prefix_patterns[encoding].search(encoded_data) is None:
-            return ()
-        delimiters = self._whitespace_patterns[encoding]
-        run: deque[tuple[int, int]] = deque(maxlen=_PREFILTER_MIN_RUN)
-        regions: list[tuple[int, int]] = []
-        field_start = 0
+        if encoding == "utf-8":
+            transformed = encoded_data.lower()
+            for whitespace in self._encoded_whitespace[encoding]:
+                if len(whitespace) > 1:
+                    transformed = transformed.replace(
+                        whitespace, b" " * len(whitespace))
+            transformed = transformed.translate(_ASCII_WHITESPACE_TRANSLATION)
+            return self._prefilter_stream(transformed, encoding, b" ")
 
-        def aligned_separators():
-            if encoding == "utf-8":
-                yield from delimiters.finditer(encoded_data)
-                return
+        # Both bytes are nonzero so delimiter matching cannot begin on the
+        # trailing NUL of an adjacent ASCII UTF-16 code unit.
+        marker = b"\xff\xfe"
+        transformed = bytearray(encoded_data)
+        for whitespace in self._encoded_whitespace[encoding]:
             search_start = 0
             while True:
-                separator = delimiters.search(encoded_data, search_start)
-                while separator is not None and separator.start() % 2:
-                    separator = delimiters.search(encoded_data, separator.start() + 1)
-                if separator is None:
-                    return
-                yield separator
-                search_start = separator.end()
-
-        for separator in aligned_separators():
-            field_end = separator.start()
-            if self._prefilter_member(encoded_data[field_start:field_end], encoding):
-                run.append((field_start, field_end))
-                if len(run) == _PREFILTER_MIN_RUN:
-                    start = max(0, run[0][0] - _PREFILTER_CONTEXT)
-                    end = min(len(encoded_data), field_end + _PREFILTER_CONTEXT)
-                    if encoding != "utf-8":
-                        start -= start % 2
-                        end -= end % 2
-                    if regions and start <= regions[-1][1]:
-                        regions[-1] = (regions[-1][0], max(regions[-1][1], end))
-                    else:
-                        regions.append((start, end))
-            else:
-                run.clear()
-            field_start = separator.end()
-        field_end = len(encoded_data)
-        if self._prefilter_member(encoded_data[field_start:field_end], encoding):
-            run.append((field_start, field_end))
-            if len(run) == _PREFILTER_MIN_RUN:
-                start = max(0, run[0][0] - _PREFILTER_CONTEXT)
-                if encoding != "utf-8":
-                    start -= start % 2
-                if regions and start <= regions[-1][1]:
-                    regions[-1] = (regions[-1][0], field_end)
-                else:
-                    regions.append((start, field_end))
-        return tuple(regions)
+                position = encoded_data.find(whitespace, search_start)
+                if position < 0:
+                    break
+                if position % 2 == 0:
+                    transformed[position:position + 2] = marker
+                search_start = position + 1
+        return self._prefilter_stream(bytes(transformed), encoding, marker)
 
     def scan_bytes(self, data: bytes, *, source: str = "<memory>",
                    base_offset: int = 0, source_kind: str = "RAW_BYTES",
@@ -555,8 +600,8 @@ class RawMnemonicScanner:
                             span_text = span_bytes.decode(encoding, errors=error_mode)
                             span_parts = span_text.split()
                             normalized_parts = tuple(
-                                ((part.casefold(), part.casefold())
-                                 if part.isascii() else self._normalize_token(part))
+                                (unicodedata.normalize("NFKD", part),
+                                 electrum_normalize(part))
                                 for part in span_parts
                             )
                             bip39_span_integrity = (
@@ -578,21 +623,24 @@ class RawMnemonicScanner:
                             validations.append(("BIP39", self.bip39.validate_words(
                                 words, normalized=normalized, languages=languages)))
                         if (count in {12, 24} and v1_run_length == count and
-                                contiguous_source and bip39_span_integrity and
-                                all(item[1] in self.electrum_v1.indices for item in selected)):
-                            words = tuple(item[1] for item in selected)
+                                contiguous_source and electrum_span_integrity and
+                                all(item[2] in self.electrum_v1.indices for item in selected)):
+                            words = tuple(item[2] for item in selected)
                             normalized = " ".join(words)
                             validations.append(("ELECTRUM_V1",
                                                 self.electrum_v1.validate_words(
                                                     words, normalized=normalized)))
+                        strict_v1 = any(
+                            standard == "ELECTRUM_V1" and validation.status in {
+                                "ELECTRUM_V1_STRICT_VALID", "ELECTRUM_V1_COMPAT_VALID"}
+                            for standard, validation in validations)
                         if (electrum_languages and contiguous_source and
-                                electrum_span_integrity):
+                                electrum_span_integrity and not strict_v1):
                             words = tuple(item[2] for item in selected)
-                            normalized = " ".join(words)
                             languages = tuple(name for bit, name in enumerate(self.electrum.wordlists)
                                               if electrum_languages & (1 << bit))
                             validations.append(("ELECTRUM", self.electrum.validate_words(
-                                words, normalized=normalized, languages=languages)))
+                                words, languages=languages)))
                         expensive_validations += len(validations)
                         bip39_validations += sum(
                             standard == "BIP39" for standard, _ in validations)

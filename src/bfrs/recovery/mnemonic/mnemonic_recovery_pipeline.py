@@ -85,6 +85,10 @@ class MnemonicRecoveryPipeline:
             bip39_valid=sum(item.mnemonic_standard == "BIP39" for item in candidates),
             electrum_valid=sum(item.mnemonic_standard in {"ELECTRUM", "ELECTRUM_V1"}
                                for item in candidates),
+            electrum_2_plus_valid=sum(
+                item.mnemonic_standard == "ELECTRUM" for item in candidates),
+            electrum_v1_valid=sum(
+                item.mnemonic_standard == "ELECTRUM_V1" for item in candidates),
             structural_fragments=0, checksum_invalid=raw.checksum_invalid,
             known_file_candidates=sum(any(provenance["source_kind"] == "KNOWN_FILE_CONTENT"
                                           for provenance in item.provenance) for item in candidates),

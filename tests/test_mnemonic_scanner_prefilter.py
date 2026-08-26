@@ -1,9 +1,11 @@
 """Correctness and instrumentation tests for the bytes-level mnemonic prefilter."""
 
 import hashlib
+import pytest
 
 from bfrs.recovery.mnemonic.bip39_validator import BIP39Validator
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import RawMnemonicScanner
+from bfrs.tools.benchmark_seed_scanner import binary_fixture, container_like_fixture
 
 
 def _bip39_phrase(entropy_bytes: int) -> str:
@@ -76,3 +78,36 @@ def test_long_wordlist_run_has_bounded_candidate_only_validation_work():
     assert not result.occurrences
     assert result.prefilter_windows == 1
     assert result.expensive_validations < 5_000
+
+
+@pytest.mark.parametrize("encoding,phase", [
+    ("utf-8", 0),
+    ("utf-16-le", 0),
+    ("utf-16-le", 1),
+    ("utf-16-be", 0),
+    ("utf-16-be", 1),
+])
+def test_fast_gate_never_rejects_valid_candidate(encoding, phase):
+    phrase = _bip39_phrase(16).encode(encoding)
+    payload = b"\xff" * phase + phrase
+    phase_data = payload[phase:]
+    if encoding != "utf-8":
+        phase_data = phase_data[:len(phase_data) // 2 * 2]
+
+    regions = RawMnemonicScanner()._prefilter_regions(phase_data, encoding)
+
+    assert regions
+    assert any(start == 0 and end >= len(phrase) for start, end in regions)
+
+
+@pytest.mark.parametrize("payload", [
+    bytes(32 * 1024),
+    binary_fixture(32 * 1024),
+    container_like_fixture(32 * 1024, b"\xff\xd8\xff\xe0JFIF\x00", 4096),
+    container_like_fixture(32 * 1024, b"\x00\x00\x01\xba\x44\x00", 2048),
+], ids=("zero", "binary", "jpeg-like", "mpeg-like"))
+def test_fast_gate_rejects_non_text_fixtures_without_candidate_windows(payload):
+    result = RawMnemonicScanner().scan_bytes(payload)
+
+    assert result.prefilter_windows == 0
+    assert result.expensive_validations == 0

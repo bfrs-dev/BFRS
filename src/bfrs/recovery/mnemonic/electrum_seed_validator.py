@@ -8,7 +8,7 @@ import hmac
 from pathlib import Path
 import unicodedata
 
-from .mnemonic_normalizer import electrum_normalize
+from .mnemonic_normalizer import electrum_normalize, electrum_normalize_words
 
 
 PREFIXES = (("2fa_segwit", "102"), ("2fa", "101"),
@@ -40,8 +40,8 @@ class ElectrumSeedValidator:
             self.wordlists[language] = words
 
     def validate(self, phrase: str) -> ElectrumSeedValidation:
-        normalized = electrum_normalize(phrase)
-        return self.validate_words(tuple(normalized.split()), normalized=normalized)
+        word_text = electrum_normalize_words(phrase)
+        return self.validate_words(tuple(word_text.split()))
 
     def validate_words(self, words: tuple[str, ...], *, normalized: str | None = None,
                        languages: tuple[str, ...] | None = None) -> ElectrumSeedValidation:
@@ -51,7 +51,7 @@ class ElectrumSeedValidator:
         if not languages or not 12 <= len(words) <= 24:
             return ElectrumSeedValidation("REJECTED", None, None, len(words),
                                           normalized, ("ELECTRUM_WORD_STRUCTURE_INVALID",))
-        digest = hmac.new(b"Seed version", normalized.encode("utf-8"),
+        digest = hmac.new(b"Seed version", electrum_normalize(normalized).encode("utf-8"),
                           hashlib.sha512).hexdigest()
         seed_type = next((name for name, prefix in PREFIXES
                           if digest.startswith(prefix)), None)

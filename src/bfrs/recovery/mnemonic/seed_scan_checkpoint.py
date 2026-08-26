@@ -21,8 +21,10 @@ from .raw_mnemonic_scanner import (
 # separately identified strict Electrum V1 standard, and V4 makes Electrum 2+
 # tokenization contiguous.  V5 scans both byte phases for each UTF-16 endian;
 # V6 records results produced by the bytes-prefiltered candidate-window scanner.
-# Older completed units can contain invalid hits or omit newly covered hits.
-FORMAT = "BFRS_SEED_SCAN_CHECKPOINT_V6"
+# V7 enforces exact-case BIP39 NFKD tokens and upstream Electrum CJK
+# normalization.  Older completed units can contain invalid hits or omit newly
+# covered hits.
+FORMAT = "BFRS_SEED_SCAN_CHECKPOINT_V7"
 IDENTITY_BYTES = 64 * 1024
 
 

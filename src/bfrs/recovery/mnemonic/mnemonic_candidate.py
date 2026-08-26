@@ -43,6 +43,8 @@ class MnemonicRecovery:
     high_confidence_candidates: int
     bip39_valid: int
     electrum_valid: int
+    electrum_2_plus_valid: int
+    electrum_v1_valid: int
     structural_fragments: int
     checksum_invalid: int
     known_file_candidates: int

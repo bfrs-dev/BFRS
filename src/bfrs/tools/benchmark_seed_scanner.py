@@ -54,6 +54,13 @@ def binary_fixture(size: int) -> bytes:
     return random.Random(0xBFD5).randbytes(size)
 
 
+def container_like_fixture(size: int, header: bytes, interval: int) -> bytes:
+    data = bytearray(binary_fixture(size))
+    for offset in range(0, size, interval):
+        data[offset:offset + len(header)] = header
+    return bytes(data)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mib", type=int, default=8)
@@ -61,14 +68,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--work-mib", type=int, default=1)
     parser.add_argument("--memory", action="store_true",
                         help="enable tracemalloc (substantially distorts wall time)")
-    parser.add_argument("--fixture", choices=("controls", "prose", "binary"),
-                        default="controls")
+    parser.add_argument(
+        "--fixture",
+        choices=("controls", "prose", "binary", "zero", "jpeg", "mpeg"),
+        default="controls",
+    )
     parser.add_argument("--sample-process-tree", action="store_true",
                         help="sample parent/worker RSS; adds measurable Windows overhead")
     arguments = parser.parse_args(argv)
     size = arguments.mib * 1024 * 1024
-    data = (binary_fixture(size) if arguments.fixture == "binary" else
-            synthetic_fixture(size, controls=arguments.fixture == "controls"))
+    if arguments.fixture == "binary":
+        data = binary_fixture(size)
+    elif arguments.fixture == "zero":
+        data = bytes(size)
+    elif arguments.fixture == "jpeg":
+        data = container_like_fixture(size, b"\xff\xd8\xff\xe0JFIF\x00", 64 * 1024)
+    elif arguments.fixture == "mpeg":
+        data = container_like_fixture(size, b"\x00\x00\x01\xba\x44\x00\x04\x00", 4096)
+    else:
+        data = synthetic_fixture(size, controls=arguments.fixture == "controls")
     scanner = RawMnemonicScanner(chunk_size=arguments.work_mib * 2**20,
                                  overlap=64 * 2**10)
     if arguments.memory:
