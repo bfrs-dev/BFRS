@@ -1,7 +1,7 @@
 """Generic single-pass scanner for public chunk detectors."""
 
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -142,6 +142,9 @@ class FastScanner:
         end: int | None = None,
         *,
         progress: Callable[[ScanProgress], None] | None = None,
+        resume_results: Mapping[tuple[int, int], tuple[RawHit, ...]] | None = None,
+        unit_complete: Callable[[tuple[int, int], tuple[RawHit, ...], int, int], None]
+        | None = None,
     ) -> Iterator[RawHit]:
         file_size = reader.file_size
         range_end = file_size if end is None else end
@@ -165,37 +168,91 @@ class FastScanner:
         findings_total = 0
         anchors_total = 0
         emitted_progress = False
+        resumed = dict(resume_results or {})
+        used_resumed: set[tuple[int, int]] = set()
+        process_backed_detector = next((
+            detector for detector in self.detectors
+            if callable(getattr(detector, "submit_chunk", None))
+        ), None)
+        branch_enabled = (
+            process_backed_detector is not None
+            and len(self.detectors) > 1
+            and range_end - start > reader.chunk_size)
+        if not resumed and unit_complete is None:
+            units = (
+                (
+                    chunk.offset,
+                    (range_end if chunk.end_offset >= range_end else
+                     min(chunk.offset + reader.chunk_size - reader.overlap,
+                         range_end)),
+                    chunk,
+                )
+                for chunk in reader.iter_chunks(start=start, end=range_end)
+            )
+        else:
+            units = reader.iter_owned_chunks(
+                start=start, end=range_end,
+                skip_ownership_ranges=resumed)
         try:
-            for chunk in reader.iter_chunks(start=start, end=range_end):
-                ownership_end = (range_end if chunk.end_offset >= range_end else
-                                 min(chunk.offset + reader.chunk_size - reader.overlap,
-                                     range_end))
-                for detector in self.detectors:
+            for ownership_start, ownership_end, chunk in units:
+                unit_key = (ownership_start, ownership_end)
+                if chunk is None:
+                    unit_hits = resumed[unit_key]
+                    used_resumed.add(unit_key)
+                else:
                     def report_stage(stage: str) -> None:
                         if progress is not None:
                             progress(ScanProgress(
-                                scanned_bytes=max(0, chunk.offset - start),
+                                scanned_bytes=max(0, ownership_start - start),
                                 total_bytes=range_end - start,
                                 findings_total=findings_total,
                                 findings_by_target=dict(findings_by_target),
                                 anchors_total=anchors_total,
                                 stage=stage,
                             ))
-                    for hit in detector.detect_chunk(
-                            chunk, source=source, ownership_start=chunk.offset,
-                            ownership_end=ownership_end, status=report_stage):
-                        identity = (
-                            hit.target, hit.artifact_kind,
-                            hit.start_offset, hit.end_offset)
-                        if identity in seen:
+
+                    def run_detector(detector: ChunkDetector) -> tuple[RawHit, ...]:
+                        return tuple(detector.detect_chunk(
+                            chunk, source=source, ownership_start=ownership_start,
+                            ownership_end=ownership_end, status=report_stage))
+
+                    branch_future = (
+                        process_backed_detector.submit_chunk(
+                            chunk, source=source, ownership_start=ownership_start,
+                            ownership_end=ownership_end)
+                        if branch_enabled else None)
+                    detector_hits: dict[int, tuple[RawHit, ...]] = {}
+                    for index, detector in enumerate(self.detectors):
+                        if detector is process_backed_detector and branch_future is not None:
                             continue
-                        seen.add(identity)
-                        if hit.target == "internal":
-                            anchors_total += 1
-                        else:
-                            findings_total += 1
-                            findings_by_target[hit.target] += 1
-                        yield hit
+                        detector_hits[index] = run_detector(detector)
+                    if branch_future is not None:
+                        index = self.detectors.index(process_backed_detector)
+                        detector_hits[index] = branch_future.result()
+                    ordered_hits = (
+                        (hit.start_offset, index, ordinal, hit)
+                        for index in range(len(self.detectors))
+                        for ordinal, hit in enumerate(detector_hits[index]))
+                    unit_hits = tuple(
+                        item[3] for item in sorted(
+                            ordered_hits,
+                            key=lambda item: (item[0], item[1], item[2])))
+                    if unit_complete is not None:
+                        unit_complete(unit_key, unit_hits,
+                                      ownership_end - start, range_end - start)
+                for hit in unit_hits:
+                    identity = (
+                        hit.target, hit.artifact_kind,
+                        hit.start_offset, hit.end_offset)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    if hit.target == "internal":
+                        anchors_total += 1
+                    else:
+                        findings_total += 1
+                        findings_by_target[hit.target] += 1
+                    yield hit
                 if progress is not None:
                     scanned_bytes = max(0, ownership_end - start)
                     progress(ScanProgress(
@@ -207,6 +264,9 @@ class FastScanner:
                         complete=ownership_end >= range_end,
                     ))
                     emitted_progress = True
+            unexpected = set(resumed) - used_resumed
+            if unexpected:
+                raise ValueError("checkpoint contains incompatible ownership ranges")
         finally:
             for detector in self.detectors:
                 close = getattr(detector, "close", None)

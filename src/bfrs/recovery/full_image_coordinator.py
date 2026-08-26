@@ -1,7 +1,7 @@
 """Coordinate conservative Bitcoin wallet recovery over an image range."""
 
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -221,6 +221,11 @@ class FullImageRecoveryCoordinator:
     ) -> None:
         collected = tuple(signatures)
         self._scanner = FastScanner(collected, chunk_detectors=chunk_detectors)
+        self._mnemonic_standards = frozenset(
+            standard
+            for detector in chunk_detectors
+            for standard in getattr(detector, "standards", ())
+        )
         if not isinstance(candidate_policy, CandidatePolicy):
             raise ValueError("candidate_policy must be CandidatePolicy")
         if chunk_size <= 0:
@@ -243,6 +248,9 @@ class FullImageRecoveryCoordinator:
         electrum_only: bool = False,
         targets: frozenset[str] | None = None,
         progress: Callable[[ScanProgress], None] | None = None,
+        resume_results: Mapping[tuple[int, int], tuple[RawHit, ...]] | None = None,
+        unit_complete: Callable[[tuple[int, int], tuple[RawHit, ...], int, int], None]
+        | None = None,
     ) -> FullImageRecoveryResult:
         reader = ChunkReader(path, chunk_size=self._chunk_size, overlap=self._overlap)
         range_end = reader.file_size if end is None else end
@@ -252,6 +260,7 @@ class FullImageRecoveryCoordinator:
             return self._scan_electrum_only(
                 reader, start, range_end, ntfs_locator,
                 ntfs_bitcoin_artifact_index, progress,
+                resume_results, unit_complete,
             )
         ntfs_directory_index_artifact_recovery = (
             NTFSDirectoryIndexArtifactRecoveryPipeline(
@@ -287,7 +296,8 @@ class FullImageRecoveryCoordinator:
         raw_hit_counts: Counter[str] = Counter()
         try:
             for hit in self._scanner.scan(
-                    reader, start=start, end=range_end, progress=progress):
+                    reader, start=start, end=range_end, progress=progress,
+                    resume_results=resume_results, unit_complete=unit_complete):
                 raw_hit_counts[hit.hit_type] += 1
                 if (hit.target != "unknown" and
                         hit.artifact_kind not in {
@@ -341,6 +351,8 @@ class FullImageRecoveryCoordinator:
                 historical_contexts
             ),
         ).run_hits(electrum_hits, range_start=start, range_end=range_end)
+        key_side_reads = tuple(
+            hit for hit in recovery_hits if hit.hit_type in _RAW_KEY_SIDE_HIT_TYPES)
         hits, binary_context_findings = self._assess_raw_key_side_hits(
             reader.path, tuple(recovery_hits), range_end
         )
@@ -532,6 +544,18 @@ class FullImageRecoveryCoordinator:
             status = ValidationStatus.REJECTED
             reasons = ("no_confirmed_bitcoin_wallet_evidence",)
 
+        secondary_key_bytes = sum(
+            min(MAX_RAW_KEY_SIDE_BYTES, range_end - hit.start_offset)
+            for hit in key_side_reads)
+        secondary_hotspot_bytes = sum(
+            hotspot.end_offset - hotspot.start_offset for hotspot in accepted)
+        ntfs_record_bytes = (
+            ntfs_bitcoin_artifact_index.mft_records_scanned *
+            (ntfs_bitcoin_artifact_index.mft_record_size or 0))
+        secondary_read_count = (
+            len(key_side_reads) + len(accepted) +
+            ntfs_bitcoin_artifact_index.mft_records_scanned)
+        target_findings_tuple = tuple(target_findings)
         return FullImageRecoveryResult(
             source=str(reader.path.resolve()),
             start_offset=start,
@@ -562,7 +586,7 @@ class FullImageRecoveryCoordinator:
             ntfs_detached_metadata_recovery=ntfs_detached_metadata_recovery,
             ntfs_historical_wallet_recovery=ntfs_historical_wallet_recovery,
             electrum_raw_recovery=electrum_raw_recovery,
-            target_findings=tuple(target_findings),
+            target_findings=target_findings_tuple,
             structural_wallet_count=structural_count,
             fragment_wallet_count=fragment_count,
             reasons=reasons,
@@ -612,6 +636,21 @@ class FullImageRecoveryCoordinator:
                     sorted(raw_hit_counts.items())
                 ),
                 "selected_targets": tuple(sorted(targets or ())),
+                "mnemonic_coverage": {
+                    "performed": bool(self._mnemonic_standards),
+                    "standards": tuple(sorted(self._mnemonic_standards)),
+                },
+                "mnemonic_recovery": self._mnemonic_summary(target_findings_tuple),
+                "io_metrics": {
+                    "full_image_linear_pass_count": 1 if range_end > start else 0,
+                    "linear_pass_count": 1 if range_end > start else 0,
+                    "linear_bytes_read": range_end - start,
+                    "physical_linear_bytes_read": reader.linear_bytes_read,
+                    "linear_read_count": reader.linear_read_count,
+                    "secondary_read_count": secondary_read_count,
+                    "secondary_bytes_read": (
+                        secondary_key_bytes + secondary_hotspot_bytes + ntfs_record_bytes),
+                },
             },
         )
 
@@ -623,6 +662,9 @@ class FullImageRecoveryCoordinator:
         ntfs_locator: NTFSBitcoinArtifactLocator,
         ntfs_index: NTFSBitcoinArtifactIndex,
         progress: Callable[[ScanProgress], None] | None,
+        resume_results: Mapping[tuple[int, int], tuple[RawHit, ...]] | None,
+        unit_complete: Callable[[tuple[int, int], tuple[RawHit, ...], int, int], None]
+        | None,
     ) -> FullImageRecoveryResult:
         """Run only raw Electrum validation and required NTFS correlation."""
         detached_pipeline = NTFSDetachedVolumeDiscoveryPipeline(
@@ -633,7 +675,8 @@ class FullImageRecoveryCoordinator:
         electrum_hits: list[RawHit] = []
         raw_hit_counts: Counter[str] = Counter()
         for hit in self._scanner.scan(
-                reader, start=start, end=range_end, progress=progress):
+                reader, start=start, end=range_end, progress=progress,
+                resume_results=resume_results, unit_complete=unit_complete):
             raw_hit_counts[hit.hit_type] += 1
             if hit.hit_type == NTFS_BOOT_SECTOR_SIGNATURE:
                 detached_pipeline.process_hit(hit)
@@ -706,11 +749,46 @@ class FullImageRecoveryCoordinator:
                 "raw_hit_counts_by_signature": tuple(
                     sorted(raw_hit_counts.items())
                 ),
+                "mnemonic_coverage": {
+                    "performed": bool(self._mnemonic_standards),
+                    "standards": tuple(sorted(self._mnemonic_standards)),
+                },
+                "mnemonic_recovery": self._mnemonic_summary(()),
+                "io_metrics": {
+                    "full_image_linear_pass_count": 1 if range_end > start else 0,
+                    "linear_pass_count": 1 if range_end > start else 0,
+                    "linear_bytes_read": range_end - start,
+                    "physical_linear_bytes_read": reader.linear_bytes_read,
+                    "linear_read_count": reader.linear_read_count,
+                    "secondary_read_count": ntfs_index.mft_records_scanned,
+                    "secondary_bytes_read": (
+                        ntfs_index.mft_records_scanned *
+                        (ntfs_index.mft_record_size or 0)),
+                },
             },
             ntfs_bitcoin_artifact_index=ntfs_index,
             ntfs_detached_volume_discovery=discovery,
             electrum_raw_recovery=electrum,
         )
+
+    @staticmethod
+    def _mnemonic_summary(findings: tuple[RawHit, ...]) -> dict[str, object]:
+        candidates = tuple(
+            item for item in findings if item.artifact_kind == "mnemonic")
+        fingerprints = {item.safe_fingerprint for item in candidates
+                        if item.safe_fingerprint is not None}
+        count = lambda standard: sum(
+            item.safe_metadata.get("mnemonic_standard") == standard
+            for item in candidates)
+        return {
+            "candidates_total": len(candidates),
+            "unique_secret_fingerprints": len(fingerprints),
+            "bip39_valid": count("BIP39"),
+            "electrum_2_plus_valid": count("ELECTRUM"),
+            "electrum_v1_valid": count("ELECTRUM_V1"),
+            "electrum_valid": count("ELECTRUM") + count("ELECTRUM_V1"),
+            "candidates": tuple(item.safe_dict() for item in candidates),
+        }
 
     @staticmethod
     def _empty_bitcoin_results(source: str):

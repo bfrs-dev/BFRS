@@ -1,6 +1,6 @@
 """Chunked binary file reading for large forensic sources."""
 
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,12 +35,27 @@ class ChunkReader:
         self.path = Path(path)
         self.chunk_size = chunk_size
         self.overlap = overlap
+        self.linear_pass_count = 0
+        self.linear_bytes_read = 0
+        self.linear_read_count = 0
 
     @property
     def file_size(self) -> int:
         return self.path.stat().st_size
 
     def iter_chunks(self, start: int = 0, end: int | None = None) -> Iterator[Chunk]:
+        for _, _, chunk in self.iter_owned_chunks(start=start, end=end):
+            if chunk is not None:
+                yield chunk
+
+    def iter_owned_chunks(
+        self,
+        start: int = 0,
+        end: int | None = None,
+        *,
+        skip_ownership_ranges: Collection[tuple[int, int]] = (),
+    ) -> Iterator[tuple[int, int, Chunk | None]]:
+        """Yield planned ownership units, omitting I/O for completed ranges."""
         file_size = self.file_size
         range_end = file_size if end is None else end
 
@@ -55,18 +70,34 @@ class ChunkReader:
             return
 
         step = self.chunk_size - self.overlap
+        plans: list[tuple[int, int, int]] = []
         offset = start
+        while offset < range_end:
+            scan_end = min(offset + self.chunk_size, range_end)
+            ownership_end = (range_end if scan_end >= range_end else
+                             min(offset + step, range_end))
+            plans.append((offset, scan_end, ownership_end))
+            offset = ownership_end
 
-        with self.path.open("rb") as source:
-            while offset < range_end:
+        skipped = set(skip_ownership_ranges)
+        pending = any((offset, ownership_end) not in skipped
+                      for offset, _, ownership_end in plans)
+        source = self.path.open("rb") if pending else None
+        if source is not None:
+            self.linear_pass_count += 1
+        try:
+            for offset, scan_end, ownership_end in plans:
+                if (offset, ownership_end) in skipped:
+                    yield offset, ownership_end, None
+                    continue
+                assert source is not None
                 source.seek(offset)
-                data = source.read(min(self.chunk_size, range_end - offset))
+                data = source.read(scan_end - offset)
+                self.linear_read_count += 1
+                self.linear_bytes_read += len(data)
                 if not data:
                     break
-
-                chunk = Chunk(offset=offset, data=data)
-                yield chunk
-
-                if chunk.end_offset >= range_end:
-                    break
-                offset += step
+                yield offset, ownership_end, Chunk(offset=offset, data=data)
+        finally:
+            if source is not None:
+                source.close()

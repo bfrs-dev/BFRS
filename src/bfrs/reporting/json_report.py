@@ -1179,6 +1179,7 @@ def serialize_full_image_result(
             "minimum_hits",
             "minimum_distinct_types",
             "electrum_only",
+            "include_mnemonic",
             "skip_mnemonic",
             "targets",
             "signature_set",
@@ -1266,6 +1267,19 @@ def serialize_full_image_result(
         ),
         "target_findings": [item.safe_dict() for item in result.target_findings],
         "bitcoin_context_evidence": _bitcoin_context_evidence(result),
+        "mnemonic_coverage": dict(result.evidence.get("mnemonic_coverage", {
+            "performed": False, "standards": (),
+        })),
+        "mnemonic_recovery": dict(result.evidence.get("mnemonic_recovery", {
+            "candidates_total": 0,
+            "unique_secret_fingerprints": 0,
+            "bip39_valid": 0,
+            "electrum_2_plus_valid": 0,
+            "electrum_v1_valid": 0,
+            "electrum_valid": 0,
+            "candidates": (),
+        })),
+        "io_metrics": dict(result.evidence.get("io_metrics", {})),
         "raw_hit_counts_by_signature": dict(
             result.evidence.get("raw_hit_counts_by_signature", ())
         ),

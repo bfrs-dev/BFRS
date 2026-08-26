@@ -14,6 +14,10 @@ from bfrs.recovery.mnemonic.seed_scan_checkpoint import (
     CheckpointError,
     SeedScanCheckpoint,
 )
+from bfrs.recovery.unified_scan_checkpoint import (
+    UnifiedCheckpointError,
+    UnifiedScanCheckpoint,
+)
 from bfrs.reporting.json_report import write_json_report
 from bfrs.reporting.json_report import serialize_full_image_result
 from bfrs.scanners.fast_scanner import ScanProgress
@@ -181,6 +185,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="run only BIP39/Electrum mnemonic raw and document recovery",
     )
     parser.add_argument(
+        "--include-mnemonic",
+        action="store_true",
+        help=("include BIP39/Electrum mnemonic detection in the shared target "
+              "scan and final report"),
+    )
+    parser.add_argument(
         "--skip-mnemonic",
         action="store_true",
         help=("skip raw BIP39/Electrum mnemonic detection while keeping all "
@@ -190,9 +200,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help=("mnemonic worker processes; target scans parallelize "
                               "encoding phases; 0 selects up to 4 automatically"))
     parser.add_argument("--checkpoint", type=Path,
-                        help="create a new seed-scan checkpoint (must not exist)")
+                        help="create a new scan checkpoint (must not exist)")
     parser.add_argument("--resume-checkpoint", type=Path,
-                        help="load and continue a compatible seed-scan checkpoint")
+                        help="load and continue a compatible scan checkpoint")
     parser.add_argument("--cluster-mib", type=_integer, default=DEFAULT_CLUSTER_MIB)
     parser.add_argument("--padding-mib", type=_integer, default=DEFAULT_PADDING_MIB)
     parser.add_argument(
@@ -229,10 +239,12 @@ def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
         parser.error("--electrum-only and --seed-scan-only are mutually exclusive")
     if arguments.seed_scan_only and arguments.skip_mnemonic:
         parser.error("--skip-mnemonic cannot be combined with --seed-scan-only")
+    if arguments.include_mnemonic and arguments.skip_mnemonic:
+        parser.error("--include-mnemonic and --skip-mnemonic are mutually exclusive")
+    if arguments.include_mnemonic and arguments.seed_scan_only:
+        parser.error("--include-mnemonic is redundant with --seed-scan-only")
     if arguments.checkpoint and arguments.resume_checkpoint:
         parser.error("--checkpoint and --resume-checkpoint are mutually exclusive")
-    if (arguments.checkpoint or arguments.resume_checkpoint) and not arguments.seed_scan_only:
-        parser.error("checkpoint options require --seed-scan-only")
     if arguments.start < 0:
         parser.error("--start must be nonnegative")
     if arguments.end is not None and arguments.end <= arguments.start:
@@ -264,7 +276,8 @@ def _selection(parser: argparse.ArgumentParser, arguments):
     return build_target_selection(
         targets,
         include_mnemonics=(
-            arguments.targets is not None and not arguments.skip_mnemonic),
+            (arguments.include_mnemonic or arguments.targets is not None)
+            and not arguments.skip_mnemonic),
         mnemonic_workers=arguments.workers,
     )
 
@@ -283,6 +296,7 @@ def _configuration(arguments, selection=None) -> dict[str, object]:
         "minimum_distinct_types": arguments.minimum_distinct_types,
         "electrum_only": arguments.electrum_only,
         "seed_scan_only": arguments.seed_scan_only,
+        "include_mnemonic": arguments.include_mnemonic,
         "skip_mnemonic": arguments.skip_mnemonic,
         "workers": arguments.workers,
         "targets": sorted(selection.targets),
@@ -427,6 +441,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         cluster_gap=arguments.cluster_mib * 1024 * 1024,
         hotspot_padding=arguments.padding_mib * 1024 * 1024,
     )
+    range_end = file_size if arguments.end is None else arguments.end
+    unified_checkpoint = None
+    scanner_identity = {
+        "targets": sorted(selection.targets),
+        "signatures": [signature.name for signature in selection.signatures],
+        "mnemonic_enabled": bool(
+            (arguments.include_mnemonic or arguments.targets is not None)
+            and not arguments.skip_mnemonic),
+    }
+    try:
+        if arguments.resume_checkpoint:
+            unified_checkpoint = UnifiedScanCheckpoint.resume(
+                arguments.resume_checkpoint, arguments.input,
+                start=arguments.start, end=range_end,
+                chunk_size=arguments.chunk_mib * 1024 * 1024,
+                overlap=arguments.overlap_kib * 1024,
+                scanner_identity=scanner_identity)
+        elif arguments.checkpoint:
+            unified_checkpoint = UnifiedScanCheckpoint.create(
+                arguments.checkpoint, arguments.input,
+                start=arguments.start, end=range_end,
+                chunk_size=arguments.chunk_mib * 1024 * 1024,
+                overlap=arguments.overlap_kib * 1024,
+                scanner_identity=scanner_identity)
+    except (OSError, UnifiedCheckpointError) as error:
+        print(f"checkpoint error: {error}", file=sys.stderr)
+        return 3
     scan_progress = _ProgressLine("Target scan", targets=selection.targets)
     try:
         result = coordinator.scan(
@@ -436,12 +477,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             electrum_only=arguments.electrum_only,
             targets=selection.targets,
             progress=scan_progress,
+            resume_results=(unified_checkpoint.completed_results
+                            if unified_checkpoint else None),
+            unit_complete=(unified_checkpoint.record
+                           if unified_checkpoint else None),
         )
+    except KeyboardInterrupt:
+        if unified_checkpoint is not None:
+            unified_checkpoint.save(force=True)
+        scan_progress.finish()
+        print("scan interrupted by user", file=sys.stderr)
+        return 130
     except OSError as error:
         scan_progress.finish()
         print(f"input error: {error}", file=sys.stderr)
         return 3
     scan_progress.finish()
+    if unified_checkpoint is not None:
+        unified_checkpoint.mark_complete()
 
     try:
         report_path = write_json_report(
@@ -462,6 +515,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"reconstructed results: {len(result.reconstructed_wallet_results)}")
     print(f"structural results: {result.structural_wallet_count}")
     print(f"fragment results: {result.fragment_wallet_count}")
+    coverage = result.evidence.get("mnemonic_coverage", {})
+    io_metrics = result.evidence.get("io_metrics", {})
+    print(f"mnemonic coverage: {'performed' if coverage.get('performed') else 'skipped'}")
+    print(f"linear passes: {io_metrics.get('linear_pass_count', 0)}")
+    print(f"linear bytes read: {io_metrics.get('linear_bytes_read', 0)}")
+    print(f"secondary reads: {io_metrics.get('secondary_read_count', 0)}")
+    print(f"secondary bytes read: {io_metrics.get('secondary_bytes_read', 0)}")
     if arguments.electrum_only:
         electrum = result.electrum_raw_recovery
         print(f"electrum candidates: {electrum.candidates_total}")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import re
@@ -64,6 +65,64 @@ MULTIBIT_HD_MARKERS = (b"mbhd.wallet.aes", b"org.multibit.hd", b"MultiBit HD")
 MULTIBIT_LEGACY_MARKERS = (b"com.google.bitcoin", b"org.multibit.wallet")
 ARMORY_PAPER_MARKERS = (b"Armory Paper Backup", b"ARMORY PAPER BACKUP")
 _WIF = re.compile(rb"(?<![1-9A-HJ-NP-Za-km-z])[5KL][1-9A-HJ-NP-Za-km-z]{50,51}(?![1-9A-HJ-NP-Za-km-z])")
+
+
+_MNEMONIC_BRANCH_SCANNER: RawMnemonicScanner | None = None
+_MNEMONIC_BRANCH_STANDARDS: frozenset[str] = frozenset()
+
+
+def _initialize_mnemonic_branch(standards: frozenset[str]) -> None:
+    """Initialize a byte-only worker; it never receives an input path."""
+    global _MNEMONIC_BRANCH_SCANNER, _MNEMONIC_BRANCH_STANDARDS
+    _MNEMONIC_BRANCH_SCANNER = RawMnemonicScanner(overlap=4096, phase_workers=1)
+    _MNEMONIC_BRANCH_STANDARDS = standards
+
+
+def _mnemonic_hits(result, standards: frozenset[str], source: str) -> tuple[RawHit, ...]:
+    hits: list[RawHit] = []
+    for occurrence in result.occurrences:
+        candidate = occurrence.candidate
+        if candidate.mnemonic_standard not in standards:
+            continue
+        start = candidate.physical_start
+        end = candidate.physical_end
+        if start is None or end is None:
+            continue
+        target = (TARGET_ELECTRUM if
+                  candidate.mnemonic_standard.startswith("ELECTRUM") else
+                  TARGET_SECRETS)
+        hits.append(RawHit(
+            start, end, f"mnemonic_{candidate.mnemonic_standard.casefold()}",
+            0.85 if candidate.confidence == "HIGH" else 0.65, source,
+            {"category": "validated_mnemonic"}, target=target,
+            artifact_kind="mnemonic", structural_status="COMPLETE",
+            validation_status=candidate.validation_status,
+            reason_codes=tuple(candidate.reason_codes),
+            correlated_evidence=(candidate.encoding or "unknown",),
+            safe_fingerprint=candidate.fingerprint,
+            safe_metadata={
+                "mnemonic_standard": candidate.mnemonic_standard,
+                "seed_type": candidate.seed_type,
+                "word_count": candidate.word_count,
+                "language": candidate.language,
+                "encoding": candidate.encoding,
+                "checksum_valid": candidate.checksum_valid,
+                "completeness": candidate.completeness,
+                "confidence": candidate.confidence,
+            },
+            recommended_recovery_action="MNEMONIC_CONTEXT_REVIEW"))
+    return tuple(hits)
+
+
+def _scan_mnemonic_branch(
+    unit: tuple[bytes, str, int, int, int],
+) -> tuple[RawHit, ...]:
+    data, source, offset, ownership_start, ownership_end = unit
+    assert _MNEMONIC_BRANCH_SCANNER is not None
+    result = _MNEMONIC_BRANCH_SCANNER.scan_bytes(
+        data, source=source, base_offset=offset,
+        ownership_start=ownership_start, ownership_end=ownership_end)
+    return _mnemonic_hits(result, _MNEMONIC_BRANCH_STANDARDS, source)
 
 
 def _bounded(chunk: Chunk, local_offset: int, before: int = 512,
@@ -351,8 +410,10 @@ class MnemonicChunkDetector:
 
     def __init__(self, standards: frozenset[str], *, workers: int = 1) -> None:
         self.standards = standards
+        self.branch_workers = workers
         self.scanner = RawMnemonicScanner(
             overlap=self.required_overlap, phase_workers=workers)
+        self._branch_executor: ProcessPoolExecutor | None = None
 
     def detect_chunk(self, chunk: Chunk, *, source: str,
                      ownership_start: int,
@@ -362,36 +423,23 @@ class MnemonicChunkDetector:
             chunk.data, source=source, base_offset=chunk.offset,
             ownership_start=ownership_start, ownership_end=ownership_end,
             phase_progress=status)
-        for occurrence in result.occurrences:
-            candidate = occurrence.candidate
-            if candidate.mnemonic_standard not in self.standards:
-                continue
-            start = candidate.physical_start
-            end = candidate.physical_end
-            if start is None or end is None:
-                continue
-            target = (TARGET_ELECTRUM if
-                      candidate.mnemonic_standard.startswith("ELECTRUM") else
-                      TARGET_SECRETS)
-            yield RawHit(
-                start, end, f"mnemonic_{candidate.mnemonic_standard.casefold()}",
-                0.85 if candidate.confidence == "HIGH" else 0.65, source,
-                {"category": "validated_mnemonic"}, target=target,
-                artifact_kind="mnemonic",
-                structural_status="COMPLETE",
-                validation_status=candidate.validation_status,
-                reason_codes=tuple(candidate.reason_codes),
-                correlated_evidence=(candidate.encoding or "unknown",),
-                safe_fingerprint=candidate.fingerprint,
-                safe_metadata={
-                    "mnemonic_standard": candidate.mnemonic_standard,
-                    "word_count": candidate.word_count,
-                    "language": candidate.language,
-                    "encoding": candidate.encoding,
-                },
-                recommended_recovery_action="MNEMONIC_CONTEXT_REVIEW")
+        yield from _mnemonic_hits(result, self.standards, source)
+
+    def submit_chunk(self, chunk: Chunk, *, source: str,
+                     ownership_start: int,
+                     ownership_end: int) -> Future[tuple[RawHit, ...]]:
+        """Submit one already-read chunk to the isolated mnemonic branch."""
+        if self._branch_executor is None:
+            self._branch_executor = ProcessPoolExecutor(
+                max_workers=1, initializer=_initialize_mnemonic_branch,
+                initargs=(self.standards,))
+        return self._branch_executor.submit(_scan_mnemonic_branch, (
+            chunk.data, source, chunk.offset, ownership_start, ownership_end))
 
     def close(self) -> None:
+        if self._branch_executor is not None:
+            self._branch_executor.shutdown(wait=True, cancel_futures=True)
+            self._branch_executor = None
         self.scanner.close()
 
 
