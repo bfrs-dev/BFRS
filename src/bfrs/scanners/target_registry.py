@@ -577,6 +577,7 @@ def parse_targets(value: str) -> frozenset[str]:
 
 def build_target_selection(targets: frozenset[str], *,
                            include_mnemonics: bool = True,
+                           include_bitcoin_context: bool = False,
                            mnemonic_workers: int = 1) -> TargetSelection:
     signatures: list[Signature] = []
     if targets & {TARGET_BITCOIN_CORE, TARGET_ELECTRUM}:
@@ -603,7 +604,7 @@ def build_target_selection(targets: frozenset[str], *,
             standards, workers=mnemonic_workers))
     if TARGET_SECRETS in targets:
         detectors.append(ValidatedSecretChunkDetector())
-    if TARGET_BITCOIN_CORE in targets:
+    if include_bitcoin_context and TARGET_BITCOIN_CORE in targets:
         detectors.append(BitcoinTextContextChunkDetector())
     return TargetSelection(
         targets, tuple(unique.values()), tuple(detectors))

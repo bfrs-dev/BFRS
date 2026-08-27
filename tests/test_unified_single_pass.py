@@ -67,13 +67,21 @@ def _fixture() -> tuple[bytes, dict[str, int]]:
 
 
 def _selection():
-    return build_target_selection(LEGACY_TARGETS, include_mnemonics=True)
+    return build_target_selection(
+        LEGACY_TARGETS,
+        include_mnemonics=True,
+        include_bitcoin_context=True,
+    )
 
 
 def _coordinator(selection, *, workers: int = 1):
     if workers != 1:
         selection = build_target_selection(
-            LEGACY_TARGETS, include_mnemonics=True, mnemonic_workers=workers)
+            LEGACY_TARGETS,
+            include_mnemonics=True,
+            include_bitcoin_context=True,
+            mnemonic_workers=workers,
+        )
     return FullImageRecoveryCoordinator(
         selection.signatures,
         CandidatePolicy(min_hits=1, min_distinct_types=1),

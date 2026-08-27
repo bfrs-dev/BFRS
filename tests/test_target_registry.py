@@ -199,6 +199,30 @@ def test_individual_target_selection_does_not_enable_other_wallet_families():
     assert {item.target for item in armory.signatures} == {TARGET_ARMORY}
 
 
+def test_bitcoin_text_context_is_opt_in_without_changing_other_targets():
+    targets = parse_targets("all")
+    fast = build_target_selection(
+        targets,
+        include_mnemonics=False,
+        include_bitcoin_context=False,
+    )
+    contextual = build_target_selection(
+        targets,
+        include_mnemonics=False,
+        include_bitcoin_context=True,
+    )
+
+    assert fast.targets == contextual.targets == targets
+    assert fast.signatures == contextual.signatures
+    assert [type(item).__name__ for item in fast.chunk_detectors] == [
+        "ValidatedSecretChunkDetector"
+    ]
+    assert [type(item).__name__ for item in contextual.chunk_detectors] == [
+        "ValidatedSecretChunkDetector",
+        "BitcoinTextContextChunkDetector",
+    ]
+
+
 def _base58check(payload):
     alphabet = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
     raw = payload + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]

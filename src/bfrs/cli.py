@@ -215,6 +215,12 @@ def build_parser() -> argparse.ArgumentParser:
               "scan and final report"),
     )
     parser.add_argument(
+        "--include-bitcoin-context",
+        action="store_true",
+        help=("include textual Bitcoin Base58/Bech32 address and SEC public-key "
+              "context detection in the shared target scan"),
+    )
+    parser.add_argument(
         "--skip-mnemonic",
         action="store_true",
         help=("skip raw BIP39/Electrum mnemonic detection while keeping all "
@@ -302,6 +308,7 @@ def _selection(parser: argparse.ArgumentParser, arguments):
         include_mnemonics=(
             (arguments.include_mnemonic or arguments.targets is not None)
             and not arguments.skip_mnemonic),
+        include_bitcoin_context=arguments.include_bitcoin_context,
         mnemonic_workers=arguments.workers,
     )
 
@@ -473,6 +480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "mnemonic_enabled": bool(
             (arguments.include_mnemonic or arguments.targets is not None)
             and not arguments.skip_mnemonic),
+        "bitcoin_context_enabled": arguments.include_bitcoin_context,
     }
     try:
         if arguments.resume_checkpoint:

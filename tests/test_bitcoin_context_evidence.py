@@ -323,7 +323,8 @@ def test_context_evidence_summary_is_deterministic_and_not_structural(tmp_path) 
         encoding="ascii",
     )
     selection = build_target_selection(
-        frozenset({TARGET_BITCOIN_CORE}), include_mnemonics=False
+        frozenset({TARGET_BITCOIN_CORE}), include_mnemonics=False,
+        include_bitcoin_context=True,
     )
     result = FullImageRecoveryCoordinator(
         selection.signatures,

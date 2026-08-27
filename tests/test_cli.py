@@ -304,6 +304,7 @@ def test_cli_defaults_and_signature_set_are_explicit():
     )
     assert arguments.minimum_hits == 1
     assert arguments.minimum_distinct_types == 1
+    assert arguments.include_bitcoin_context is False
     stricter = parser.parse_args(
         [
             "--input",
@@ -716,6 +717,34 @@ def test_cli_targets_all_runs_mnemonic_by_default(tmp_path, monkeypatch):
     assert calls == 1
 
 
+def test_cli_bitcoin_text_context_requires_explicit_flag(tmp_path, monkeypatch):
+    calls = 0
+    original = target_registry_module.BitcoinTextContextChunkDetector.detect_chunk
+
+    def tracked(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        yield from original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        target_registry_module.BitcoinTextContextChunkDetector,
+        "detect_chunk",
+        tracked,
+    )
+    source = tmp_path / "bitcoin-context.txt"
+    source.write_bytes(b"ordinary text without a Bitcoin context token")
+
+    assert main(basic_arguments(source, tmp_path / "fast.json") + [
+        "--targets", "all", "--skip-mnemonic",
+    ]) == 0
+    assert calls == 0
+
+    assert main(basic_arguments(source, tmp_path / "context.json") + [
+        "--targets", "all", "--skip-mnemonic", "--include-bitcoin-context",
+    ]) == 0
+    assert calls == 1
+
+
 def test_cli_skip_mnemonic_keeps_all_other_target_detectors(
     tmp_path, monkeypatch, capsys,
 ):
@@ -728,7 +757,7 @@ def test_cli_skip_mnemonic_keeps_all_other_target_detectors(
     armory = armory_wallet()
     source = tmp_path / "skip-mnemonic.img"
     source.write_bytes(
-        b"\x04ckey-invalid--" + multibit + b"--" + armory +
+        structural_metadata() + b"--\x04ckey-invalid--" + multibit + b"--" + armory +
         b"--BIE1--" + valid_wif())
     report = tmp_path / "skip-mnemonic.json"
 
@@ -741,6 +770,13 @@ def test_cli_skip_mnemonic_keeps_all_other_target_detectors(
     assert {"bitcoin-core", "multibit", "armory", "electrum", "secrets"} <= families
     assert any(item["artifact_kind"] == "WIF_PRIVATE_KEY"
                for item in payload["target_findings"])
+    raw_counts = payload["raw_hit_counts_by_signature"]
+    assert raw_counts["berkeley_metadata_little_endian"] >= 1
+    assert raw_counts["bitcoin_ckey"] == 1
+    assert raw_counts["multibit_network_anchor"] == 1
+    assert raw_counts["armory_wallet_header"] == 1
+    assert raw_counts["electrum_bie1_raw_anchor"] == 1
+    assert raw_counts["validated_wif"] == 1
     assert "phase=mnemonic" not in capsys.readouterr().err
 
 
