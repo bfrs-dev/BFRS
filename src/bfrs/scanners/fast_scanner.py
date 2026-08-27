@@ -15,8 +15,12 @@ class ScanProgress:
 
     scanned_bytes: int
     total_bytes: int
-    findings_total: int
-    findings_by_target: dict[str, int] = field(default_factory=dict)
+    raw_hits: int
+    raw_by_target: dict[str, int] = field(default_factory=dict)
+    rejected_by_target: dict[str, int] = field(default_factory=dict)
+    pending_validation_by_target: dict[str, int] = field(default_factory=dict)
+    validated_occurrences_by_target: dict[str, int] = field(default_factory=dict)
+    validated_unique_by_target: dict[str, int] = field(default_factory=dict)
     anchors_total: int = 0
     stage: str | None = None
     complete: bool = False
@@ -164,8 +168,12 @@ class FastScanner:
 
         source = str(reader.path.resolve())
         seen: set[tuple[str, str, int, int]] = set()
-        findings_by_target: Counter[str] = Counter()
-        findings_total = 0
+        raw_by_target: Counter[str] = Counter()
+        rejected_by_target: Counter[str] = Counter()
+        pending_by_target: Counter[str] = Counter()
+        validated_by_target: Counter[str] = Counter()
+        validated_fingerprints: dict[str, set[str]] = {}
+        raw_hits = 0
         anchors_total = 0
         emitted_progress = False
         resumed = dict(resume_results or {})
@@ -205,8 +213,17 @@ class FastScanner:
                             progress(ScanProgress(
                                 scanned_bytes=max(0, ownership_start - start),
                                 total_bytes=range_end - start,
-                                findings_total=findings_total,
-                                findings_by_target=dict(findings_by_target),
+                                raw_hits=raw_hits,
+                                raw_by_target=dict(raw_by_target),
+                                rejected_by_target=dict(rejected_by_target),
+                                pending_validation_by_target=dict(pending_by_target),
+                                validated_occurrences_by_target=dict(
+                                    validated_by_target),
+                                validated_unique_by_target={
+                                    target: len(fingerprints)
+                                    for target, fingerprints
+                                    in validated_fingerprints.items()
+                                },
                                 anchors_total=anchors_total,
                                 stage=stage,
                             ))
@@ -247,19 +264,35 @@ class FastScanner:
                     if identity in seen:
                         continue
                     seen.add(identity)
+                    raw_hits += 1
+                    raw_by_target[hit.target] += 1
                     if hit.target == "internal":
                         anchors_total += 1
+                    elif (hit.validation_status == "REJECTED" or
+                          hit.structural_status == "REJECTED"):
+                        rejected_by_target[hit.target] += 1
+                    elif hit.validation_status == "UNVALIDATED":
+                        pending_by_target[hit.target] += 1
                     else:
-                        findings_total += 1
-                        findings_by_target[hit.target] += 1
+                        validated_by_target[hit.target] += 1
+                        if hit.safe_fingerprint is not None:
+                            validated_fingerprints.setdefault(
+                                hit.target, set()).add(hit.safe_fingerprint)
                     yield hit
                 if progress is not None:
                     scanned_bytes = max(0, ownership_end - start)
                     progress(ScanProgress(
                         scanned_bytes=scanned_bytes,
                         total_bytes=range_end - start,
-                        findings_total=findings_total,
-                        findings_by_target=dict(findings_by_target),
+                        raw_hits=raw_hits,
+                        raw_by_target=dict(raw_by_target),
+                        rejected_by_target=dict(rejected_by_target),
+                        pending_validation_by_target=dict(pending_by_target),
+                        validated_occurrences_by_target=dict(validated_by_target),
+                        validated_unique_by_target={
+                            target: len(fingerprints)
+                            for target, fingerprints in validated_fingerprints.items()
+                        },
                         anchors_total=anchors_total,
                         complete=ownership_end >= range_end,
                     ))
@@ -276,6 +309,6 @@ class FastScanner:
             progress(ScanProgress(
                 scanned_bytes=0,
                 total_bytes=0,
-                findings_total=0,
+                raw_hits=0,
                 complete=True,
             ))

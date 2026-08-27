@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from bfrs.core.chunk_reader import Chunk, ChunkReader
+from bfrs.core.models import RawHit
 from bfrs.scanners.fast_scanner import FastScanner, ScanProgress, Signature
 
 
@@ -222,8 +223,9 @@ def test_progress_reports_exact_owned_bytes_and_percent(tmp_path: Path) -> None:
     assert [update.scanned_bytes for update in updates] == [6, 12, 20]
     assert all(update.total_bytes == 20 for update in updates)
     assert [update.percent_complete for update in updates] == [30.0, 60.0, 100.0]
-    assert updates[-1].findings_total == 1
-    assert updates[-1].findings_by_target == {"bitcoin-core": 1}
+    assert updates[-1].raw_hits == 1
+    assert updates[-1].raw_by_target == {"bitcoin-core": 1}
+    assert updates[-1].pending_validation_by_target == {"bitcoin-core": 1}
 
 
 def test_progress_finishes_at_100_percent(tmp_path: Path) -> None:
@@ -247,6 +249,45 @@ def test_empty_scan_progress_avoids_division_by_zero(tmp_path: Path) -> None:
 
     assert updates == [ScanProgress(0, 0, 0, complete=True)]
     assert updates[0].percent_complete == 100.0
+
+
+def test_progress_separates_raw_rejected_pending_validated_and_unique(tmp_path):
+    class MixedDetector:
+        required_overlap = 0
+
+        def detect_chunk(self, chunk, *, source, ownership_start,
+                         ownership_end, status=None):
+            for index in range(100):
+                yield RawHit(
+                    index, index + 26, "bitcoin_address_candidate", 0.0, source,
+                    target="bitcoin-core", artifact_kind="bitcoin_address",
+                    structural_status="REJECTED", validation_status="REJECTED",
+                    reason_codes=("BITCOIN_ADDRESS_CHECKSUM_INVALID",))
+            for index in (200, 300):
+                yield RawHit(
+                    index, index + 80, "mnemonic_electrum", 0.65, source,
+                    target="electrum", artifact_kind="mnemonic",
+                    structural_status="COMPLETE",
+                    validation_status="ELECTRUM_SEED_VALID",
+                    safe_fingerprint="same-safe-fingerprint")
+            yield RawHit(
+                400, 404, "electrum_bie2_raw_anchor", 0.0, source,
+                target="electrum", artifact_kind="electrum_wallet_anchor",
+                structural_status="ANCHOR_ONLY", validation_status="UNVALIDATED")
+
+    path = write_source(tmp_path, b"x" * 512)
+    updates = []
+    hits = list(FastScanner([], chunk_detectors=(MixedDetector(),)).scan(
+        ChunkReader(path, chunk_size=1024), progress=updates.append))
+
+    assert len(hits) == 103
+    final = updates[-1]
+    assert final.raw_hits == 103
+    assert final.raw_by_target == {"bitcoin-core": 100, "electrum": 3}
+    assert final.rejected_by_target == {"bitcoin-core": 100}
+    assert final.pending_validation_by_target == {"electrum": 1}
+    assert final.validated_occurrences_by_target == {"electrum": 2}
+    assert final.validated_unique_by_target == {"electrum": 1}
 
 
 def test_small_input_emits_one_complete_progress_update(tmp_path: Path) -> None:

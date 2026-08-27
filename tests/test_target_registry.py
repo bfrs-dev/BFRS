@@ -263,8 +263,10 @@ def test_filesystem_anchors_are_internal_but_remain_streamed_downstream(tmp_path
         "ntfs_file_record_anchor", "ntfs_indx_record_anchor"}
     assert {item.target for item in filesystem} == {TARGET_INTERNAL}
     assert updates[-1].anchors_total == 2
-    assert updates[-1].findings_total == 1
-    assert updates[-1].findings_by_target == {TARGET_BITCOIN_CORE: 1}
+    assert updates[-1].raw_hits == 3
+    assert updates[-1].raw_by_target == {
+        TARGET_INTERNAL: 2, TARGET_BITCOIN_CORE: 1}
+    assert updates[-1].pending_validation_by_target == {TARGET_BITCOIN_CORE: 1}
 
 
 def test_shared_boot_anchor_owner_is_stable_across_target_combinations():

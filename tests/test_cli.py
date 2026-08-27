@@ -664,7 +664,8 @@ def test_public_electrum_historical_fixtures(
     assert recovery["anchors_found"] == len(wallet_anchors)
     assert len({(item["physical_start"], item["physical_end"])
                 for item in wallet_anchors}) == len(wallet_anchors)
-    progress_counts = re.findall(r"electrum=(\d+)", capsys.readouterr().err)
+    progress_counts = re.findall(
+        r"raw_by_target\[[^\]]*electrum=(\d+)", capsys.readouterr().err)
     assert progress_counts and int(progress_counts[-1]) == len(target_findings)
     assert recovery["structural_status"] == expected_status
     assert payload["status"] == {
@@ -755,9 +756,12 @@ def test_cli_targets_all_reports_sparse_complete_progress(tmp_path, capsys):
     assert "7/7 bytes" in stderr
     assert "MiB/s" in stderr
     assert "ETA 00:00:00" in stderr
-    assert "findings=0" in stderr
-    for target in ("bitcoin-core", "multibit", "armory", "electrum", "secrets"):
-        assert f"{target}=0" in stderr
+    assert "raw_hits=0" in stderr
+    assert "raw_by_target[none]" in stderr
+    assert "rejected_by_target[none]" in stderr
+    assert "pending_validation_by_target[none]" in stderr
+    assert "validated_occurrences_by_target[none]" in stderr
+    assert "validated_unique_by_target[none]" in stderr
     assert stderr.count("\rTarget scan") <= 2
 
 

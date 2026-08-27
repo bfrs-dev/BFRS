@@ -71,8 +71,13 @@ class _ProgressLine:
         self.update(
             update.scanned_bytes,
             update.total_bytes,
-            findings_total=update.findings_total,
-            findings_by_target=update.findings_by_target,
+            raw_hits=update.raw_hits,
+            raw_by_target=update.raw_by_target,
+            rejected_by_target=update.rejected_by_target,
+            pending_validation_by_target=update.pending_validation_by_target,
+            validated_occurrences_by_target=(
+                update.validated_occurrences_by_target),
+            validated_unique_by_target=update.validated_unique_by_target,
             anchors_total=update.anchors_total,
             stage=update.stage,
             complete=update.complete,
@@ -83,8 +88,12 @@ class _ProgressLine:
         processed: int,
         total: int,
         *,
-        findings_total: int | None = None,
-        findings_by_target: dict[str, int] | None = None,
+        raw_hits: int | None = None,
+        raw_by_target: dict[str, int] | None = None,
+        rejected_by_target: dict[str, int] | None = None,
+        pending_validation_by_target: dict[str, int] | None = None,
+        validated_occurrences_by_target: dict[str, int] | None = None,
+        validated_unique_by_target: dict[str, int] | None = None,
         anchors_total: int | None = None,
         stage: str | None = None,
         complete: bool | None = None,
@@ -110,17 +119,32 @@ class _ProgressLine:
             hours, remainder = divmod(int(remaining), 3600)
             minutes, seconds = divmod(remainder, 60)
             eta = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-        target_counts = " ".join(
-            f"{target}={(findings_by_target or {}).get(target, 0)}"
-            for target in self._targets
-        )
+        def target_counts(values: dict[str, int] | None) -> str:
+            rendered = " ".join(
+                f"{target}={values.get(target, 0)}"
+                for target in self._targets
+                if values and values.get(target, 0)
+            )
+            return rendered or "none"
+
         details = []
-        if findings_total is not None:
-            details.append(f"findings={findings_total}")
+        if raw_hits is not None:
+            details.append(f"raw_hits={raw_hits}")
         if anchors_total is not None:
             details.append(f"anchors={anchors_total}")
-        if target_counts:
-            details.append(target_counts)
+        if raw_by_target is not None:
+            details.append(f"raw_by_target[{target_counts(raw_by_target)}]")
+            details.append(
+                f"rejected_by_target[{target_counts(rejected_by_target)}]")
+            details.append(
+                "pending_validation_by_target["
+                f"{target_counts(pending_validation_by_target)}]")
+            details.append(
+                "validated_occurrences_by_target["
+                f"{target_counts(validated_occurrences_by_target)}]")
+            details.append(
+                "validated_unique_by_target["
+                f"{target_counts(validated_unique_by_target)}]")
         if self._workers is not None:
             details.append(f"workers={self._workers}")
         if stage is not None:
