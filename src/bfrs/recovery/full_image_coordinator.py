@@ -49,6 +49,14 @@ from bfrs.recovery.ntfs_detached_metadata import (
     NTFSDetachedMetadataRecovery,
     NTFSDetachedMetadataRecoveryPipeline,
 )
+from bfrs.recovery.mnemonic.mnemonic_correlation import (
+    CONTEXT_REVIEW,
+    INDEPENDENT_CANDIDATE,
+    LIKELY_WORDLIST_FALSE_POSITIVE,
+    CorrelationOccurrence,
+    correlate_mnemonic_occurrences,
+    correlation_statistics,
+)
 from bfrs.recovery.ntfs_historical_wallet_recovery import (
     NtfsHistoricalWalletRecovery,
     NtfsHistoricalWalletRecoveryPipeline,
@@ -248,6 +256,7 @@ class FullImageRecoveryCoordinator:
         electrum_only: bool = False,
         targets: frozenset[str] | None = None,
         progress: Callable[[ScanProgress], None] | None = None,
+        electrum_progress: Callable[[int, int, float], None] | None = None,
         resume_results: Mapping[tuple[int, int], tuple[RawHit, ...]] | None = None,
         unit_complete: Callable[[tuple[int, int], tuple[RawHit, ...], int, int], None]
         | None = None,
@@ -260,7 +269,7 @@ class FullImageRecoveryCoordinator:
             return self._scan_electrum_only(
                 reader, start, range_end, ntfs_locator,
                 ntfs_bitcoin_artifact_index, progress,
-                resume_results, unit_complete,
+                electrum_progress, resume_results, unit_complete,
             )
         ntfs_directory_index_artifact_recovery = (
             NTFSDirectoryIndexArtifactRecoveryPipeline(
@@ -350,7 +359,10 @@ class FullImageRecoveryCoordinator:
             known_artifacts=known_electrum_artifacts_from_contexts(
                 historical_contexts
             ),
-        ).run_hits(electrum_hits, range_start=start, range_end=range_end)
+        ).run_hits(
+            electrum_hits, range_start=start, range_end=range_end,
+            progress=electrum_progress,
+        )
         key_side_reads = tuple(
             hit for hit in recovery_hits if hit.hit_type in _RAW_KEY_SIDE_HIT_TYPES)
         hits, binary_context_findings = self._assess_raw_key_side_hits(
@@ -555,7 +567,8 @@ class FullImageRecoveryCoordinator:
         secondary_read_count = (
             len(key_side_reads) + len(accepted) +
             ntfs_bitcoin_artifact_index.mft_records_scanned)
-        target_findings_tuple = tuple(target_findings)
+        target_findings_tuple = self._correlate_mnemonic_findings(
+            tuple(target_findings))
         return FullImageRecoveryResult(
             source=str(reader.path.resolve()),
             start_offset=start,
@@ -662,6 +675,7 @@ class FullImageRecoveryCoordinator:
         ntfs_locator: NTFSBitcoinArtifactLocator,
         ntfs_index: NTFSBitcoinArtifactIndex,
         progress: Callable[[ScanProgress], None] | None,
+        electrum_progress: Callable[[int, int, float], None] | None,
         resume_results: Mapping[tuple[int, int], tuple[RawHit, ...]] | None,
         unit_complete: Callable[[tuple[int, int], tuple[RawHit, ...], int, int], None]
         | None,
@@ -699,7 +713,10 @@ class FullImageRecoveryCoordinator:
         electrum = ElectrumRawRecoveryPipeline(
             source=reader.path,
             known_artifacts=known_electrum_artifacts_from_contexts(contexts),
-        ).run_hits(electrum_hits, range_start=start, range_end=range_end)
+        ).run_hits(
+            electrum_hits, range_start=start, range_end=range_end,
+            progress=electrum_progress,
+        )
         if detached_contexts.failures:
             electrum = replace(
                 electrum,
@@ -772,9 +789,56 @@ class FullImageRecoveryCoordinator:
         )
 
     @staticmethod
+    def _correlate_mnemonic_findings(
+        findings: tuple[RawHit, ...],
+    ) -> tuple[RawHit, ...]:
+        positions = [index for index, item in enumerate(findings)
+                     if item.artifact_kind == "mnemonic"]
+        mnemonic_items = [findings[index] for index in positions]
+        inputs = tuple(CorrelationOccurrence(
+            item.start_offset,
+            item.end_offset,
+            item.safe_fingerprint or "",
+            str(item.safe_metadata.get("mnemonic_standard", "UNKNOWN")),
+            int(item.safe_metadata.get("word_count", 0)),
+            item.safe_metadata.get("language"),
+            item.safe_metadata.get("encoding"),
+        ) for item in mnemonic_items)
+        annotations = correlate_mnemonic_occurrences(inputs)
+        correlated = list(findings)
+        actions = {
+            INDEPENDENT_CANDIDATE: "MNEMONIC_CONTEXT_REVIEW",
+            CONTEXT_REVIEW: "MNEMONIC_OVERLAP_CONTEXT_REVIEW",
+            LIKELY_WORDLIST_FALSE_POSITIVE: "MNEMONIC_WORDLIST_FALSE_POSITIVE_REVIEW",
+        }
+        for position, item, annotation in zip(positions, mnemonic_items, annotations):
+            correlated[position] = replace(
+                item,
+                reason_codes=tuple(dict.fromkeys(
+                    item.reason_codes + annotation.reason_codes)),
+                safe_metadata={
+                    **item.safe_metadata,
+                    **annotation.safe_metadata(),
+                },
+                recommended_recovery_action=actions[annotation.recovery_relevance],
+            )
+        return tuple(correlated)
+
+    @staticmethod
     def _mnemonic_summary(findings: tuple[RawHit, ...]) -> dict[str, object]:
-        candidates = tuple(
-            item for item in findings if item.artifact_kind == "mnemonic")
+        findings = FullImageRecoveryCoordinator._correlate_mnemonic_findings(findings)
+        candidates = tuple(item for item in findings
+                           if item.artifact_kind == "mnemonic")
+        inputs = tuple(CorrelationOccurrence(
+            item.start_offset,
+            item.end_offset,
+            item.safe_fingerprint or "",
+            str(item.safe_metadata.get("mnemonic_standard", "UNKNOWN")),
+            int(item.safe_metadata.get("word_count", 0)),
+            item.safe_metadata.get("language"),
+            item.safe_metadata.get("encoding"),
+        ) for item in candidates)
+        annotations = correlate_mnemonic_occurrences(inputs)
         fingerprints = {item.safe_fingerprint for item in candidates
                         if item.safe_fingerprint is not None}
         count = lambda standard: sum(
@@ -787,6 +851,7 @@ class FullImageRecoveryCoordinator:
             "electrum_2_plus_valid": count("ELECTRUM"),
             "electrum_v1_valid": count("ELECTRUM_V1"),
             "electrum_valid": count("ELECTRUM") + count("ELECTRUM_V1"),
+            **correlation_statistics(inputs, annotations),
             "candidates": tuple(item.safe_dict() for item in candidates),
         }
 

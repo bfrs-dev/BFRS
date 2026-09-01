@@ -10,6 +10,7 @@ from bfrs.recovery.electrum_raw_recovery import (
     ELECTRUM_BIE1_BASE64_SIGNATURE,
     ELECTRUM_SIGNATURE_NAMES,
     ELECTRUM_SIGNATURE_PATTERNS,
+    MAX_SCANNER_CANDIDATE_WINDOW,
     ElectrumCandidateAssembler,
     ElectrumRawRecoveryPipeline,
     KnownElectrumArtifact,
@@ -390,3 +391,129 @@ def test_anchor_set_requires_structural_validation():
     assert names == ELECTRUM_SIGNATURE_NAMES
     assert all(pattern not in (b"seed", b"wallet", b"electrum", b"keystore")
                for _, pattern in ELECTRUM_SIGNATURE_PATTERNS)
+
+
+def _anchored_json(data: bytes, anchor: int, *, stats=None):
+    return tuple(ElectrumCandidateAssembler._json_objects_containing(
+        data, anchor, scan_stats=stats))
+
+
+def test_anchored_json_finds_wallet_containing_anchor_with_nested_objects():
+    wallet = _plaintext(addresses={"receiving": [{"label": "nested"}]})
+    data = b'{"unrelated":true}\x00' + wallet + b'\x00{"after":true}'
+    anchor = data.index(b'"seed_version"')
+    objects = _anchored_json(data, anchor)
+    assert [(start, end) for start, end, _ in objects] == [
+        (data.index(wallet), data.index(wallet) + len(wallet))]
+    candidates = ElectrumCandidateAssembler().analyze_bytes(
+        data, source="disk.img", required_anchor_offset=anchor)
+    assert len(candidates) == 1
+    assert candidates[0].serialization_type == "ELECTRUM_JSON"
+
+
+def test_anchored_json_handles_braces_quotes_and_backslashes_in_strings():
+    wallet = _plaintext(note='literal { and } with quote " and slash \\\\')
+    prefix = b'{"noise":"{not an object}"}\x00'
+    data = prefix + wallet + b'\x00{"tail":"}"}'
+    anchor = data.index(b'"wallet_type"', len(prefix))
+    anchored = _anchored_json(data, anchor)
+    old_filtered = tuple(
+        item for item in ElectrumCandidateAssembler._json_objects(data)
+        if item[0] <= anchor < item[1]
+    )
+    assert tuple((a, b, value) for a, b, value in anchored) == old_filtered
+
+
+def test_anchored_json_excludes_objects_before_and_after_anchor():
+    before = b'{"before":true}'
+    after = b'{"after":true}'
+    wallet = _plaintext()
+    data = before + b"\x00" + wallet + b"\x00" + after
+    anchor = data.index(b'"keystore"')
+    spans = [(start, end) for start, end, _ in _anchored_json(data, anchor)]
+    assert spans == [(len(before) + 1, len(before) + 1 + len(wallet))]
+
+
+def test_anchored_json_ignores_many_unrelated_objects_on_both_sides():
+    wallet = _plaintext()
+    noise = b'{"noise":{}}\x00' * 2000
+    data = noise + wallet + noise
+    anchor = len(noise) + wallet.index(b'"seed_version"')
+    objects = _anchored_json(data, anchor)
+    assert len(objects) == 1
+    assert data[objects[0][0]:objects[0][1]] == wallet
+
+
+@pytest.mark.parametrize("data", (
+    b'{"seed_version":71,"wallet_type":"standard","keystore":{',
+    b'\x00\xffrandom{binary\x80data without json',
+    b'{"before":true}\x00anchor\x00{"after":true}',
+))
+def test_anchored_json_rejects_truncated_random_and_non_containing_data(data):
+    anchor = data.find(b"anchor")
+    if anchor < 0:
+        anchor = min(len(data) - 1, max(0, len(data) // 2))
+    assert not _anchored_json(data, anchor)
+
+
+def test_anchored_json_matches_previous_results_for_valid_nested_wallets():
+    inner = json.loads(_plaintext())
+    outer = json.dumps({"wrapper": inner, "seed_version": 999,
+                        "wallet_type": "standard",
+                        "keystore": {"type": "bip32", "xpub": "outer"}},
+                       separators=(",", ":")).encode()
+    anchor = outer.index(b'"wallet_type"')
+    old = tuple(
+        (start, end, value)
+        for start, end, value in ElectrumCandidateAssembler._json_objects(outer)
+        if start <= anchor < end
+    )
+    assert _anchored_json(outer, anchor) == old
+
+
+def test_anchored_json_matches_previous_spans_at_every_anchor_position():
+    wallet = _plaintext(note='BIE1 { quoted } and escaped " \\\\ value')
+    data = (b'junk {broken " prefix\x00' + b'{"ordinary":{"nested":1}}\x00'
+            + wallet + b'\x00{"after":"{brace}"}')
+    old_objects = tuple(ElectrumCandidateAssembler._json_objects(data))
+    for anchor in range(len(data)):
+        expected = tuple(
+            item for item in old_objects if item[0] <= anchor < item[1])
+        assert _anchored_json(data, anchor) == expected, anchor
+
+
+def test_anchored_json_boundary_scan_is_linear_on_maximum_window():
+    wallet = _plaintext()
+    opening_count = 2048
+    anchor_position = MAX_SCANNER_CANDIDATE_WINDOW // 2
+    prefix = b"{" * opening_count
+    prefix += b"X" * (anchor_position - len(prefix))
+    suffix_size = MAX_SCANNER_CANDIDATE_WINDOW - len(prefix) - len(wallet)
+    data = prefix + wallet + b"}" * opening_count
+    data += b"Z" * (suffix_size - opening_count)
+    anchor = data.index(b'"seed_version"')
+    stats = {}
+    objects = _anchored_json(data, anchor, stats=stats)
+    assert any(data[start:end] == wallet for start, end, _ in objects)
+    assert stats["boundary_bytes"] <= 5 * len(data)
+    legacy_minimum_byte_visits = opening_count * (anchor - opening_count)
+    assert legacy_minimum_byte_visits > 100 * stats["boundary_bytes"]
+
+
+def test_run_hits_reports_throttled_secret_free_progress(tmp_path):
+    wallet = _plaintext()
+    path = tmp_path / "progress.img"
+    path.write_bytes(wallet)
+    offset = wallet.index(b'"seed_version"')
+    hits = (RawHit(offset, offset + len(b'"seed_version"'),
+                   "electrum_seed_version_anchor", 0.0, str(path), {}),)
+    updates = []
+    result = ElectrumRawRecoveryPipeline(source=path).run_hits(
+        hits, progress=lambda completed, total, elapsed:
+        updates.append((completed, total, elapsed)),
+    )
+    assert result.complete_candidates == 1
+    assert updates[0] == (0, 1, 0.0)
+    assert updates[-1][0:2] == (1, 1)
+    assert SYNTHETIC_SEED not in repr(updates)
+    assert SYNTHETIC_XPRV not in repr(updates)

@@ -24,6 +24,8 @@ class MnemonicCandidate:
     physical_start: int | None
     physical_end: int | None
     encoding: str | None
+    recovery_relevance: str = "INDEPENDENT_CANDIDATE"
+    correlation_cluster_id: str | None = None
     mft_record_number: int | None = None
     path: str | None = None
     allocation_state: str = "UNKNOWN_ALLOCATION"
@@ -53,6 +55,12 @@ class MnemonicRecovery:
     document_candidates: int
     unique_secret_fingerprints: int
     duplicate_occurrences: int
+    crypto_valid_occurrences: int
+    independent_candidate_occurrences: int
+    overlap_cluster_occurrences: int
+    likely_wordlist_occurrences: int
+    likely_wordlist_unique_fingerprints: int
+    review_required_unique_fingerprints: int
     failures: tuple[str, ...]
     candidates: tuple[MnemonicCandidate, ...]
 

@@ -1272,7 +1272,13 @@ def serialize_full_image_result(
         })),
         "mnemonic_recovery": dict(result.evidence.get("mnemonic_recovery", {
             "candidates_total": 0,
+            "crypto_valid_occurrences": 0,
             "unique_secret_fingerprints": 0,
+            "independent_candidate_occurrences": 0,
+            "overlap_cluster_occurrences": 0,
+            "likely_wordlist_occurrences": 0,
+            "likely_wordlist_unique_fingerprints": 0,
+            "review_required_unique_fingerprints": 0,
             "bip39_valid": 0,
             "electrum_2_plus_valid": 0,
             "electrum_v1_valid": 0,

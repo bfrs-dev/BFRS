@@ -169,6 +169,28 @@ class _ProgressLine:
             self._rendered = False
 
 
+class _ElectrumProgressLine:
+    """Render secret-free progress for Electrum hit postprocessing."""
+
+    def __call__(self, completed: int, total: int, elapsed: float) -> None:
+        percent = 100.0 if total == 0 else min(100.0, completed * 100.0 / total)
+        if completed >= total:
+            eta = "00:00:00"
+        elif completed == 0 or elapsed <= 0:
+            eta = "calculating..."
+        else:
+            remaining = max(0.0, elapsed * (total - completed) / completed)
+            hours, remainder = divmod(int(remaining), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            eta = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        print(
+            f"\rElectrum recovery {completed}/{total}  {percent:5.1f}%  ETA {eta}",
+            end="\n" if completed >= total else "",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def _integer(value: str) -> int:
     try:
         return int(value, 0)
@@ -456,6 +478,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Electrum 2+ valid: {summary.electrum_2_plus_valid}")
         print(f"Electrum V1 valid: {summary.electrum_v1_valid}")
         print(f"duplicate occurrences: {summary.duplicate_occurrences}")
+        print(f"crypto-valid occurrences: {summary.crypto_valid_occurrences}")
+        print("mnemonic independent candidates: "
+              f"{summary.independent_candidate_occurrences}")
+        print("mnemonic overlap-cluster occurrences: "
+              f"{summary.overlap_cluster_occurrences}")
+        print("mnemonic likely-wordlist occurrences: "
+              f"{summary.likely_wordlist_occurrences}")
         print(f"report path: {arguments.output.resolve()}")
         return 0
 
@@ -501,6 +530,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"checkpoint error: {error}", file=sys.stderr)
         return 3
     scan_progress = _ProgressLine("Target scan", targets=selection.targets)
+    electrum_progress = _ElectrumProgressLine()
     try:
         result = coordinator.scan(
             arguments.input,
@@ -509,6 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             electrum_only=arguments.electrum_only,
             targets=selection.targets,
             progress=scan_progress,
+            electrum_progress=electrum_progress,
             resume_results=(unified_checkpoint.completed_results
                             if unified_checkpoint else None),
             unit_complete=(unified_checkpoint.record

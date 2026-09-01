@@ -14,6 +14,7 @@ from bfrs.cli import (
     DEFAULT_MINIMUM_HITS,
     DEFAULT_OVERLAP_KIB,
     DEFAULT_PADDING_MIB,
+    _ElectrumProgressLine,
     build_parser,
     main,
 )
@@ -815,6 +816,15 @@ def test_cli_progress_handles_empty_input_without_division_by_zero(
     assert "0/0 bytes" in stderr
     assert "0.0 MiB/s" in stderr
     assert "ETA 00:00:00" in stderr
+
+
+def test_electrum_recovery_progress_has_count_percent_and_eta(capsys):
+    progress = _ElectrumProgressLine()
+    progress(32, 100, 8.0)
+    progress(100, 100, 25.0)
+    stderr = capsys.readouterr().err
+    assert "Electrum recovery 32/100   32.0%  ETA 00:00:17" in stderr
+    assert "Electrum recovery 100/100  100.0%  ETA 00:00:00" in stderr
 
 
 def test_cli_targets_validate_unknown_and_legacy_mode_conflicts(tmp_path):

@@ -9,7 +9,8 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any, Iterable
+import time
+from typing import Any, Callable, Iterable
 
 from bfrs.core.models import RawHit
 from bfrs.recovery.ntfs_mft_data import NtfsMftRecordError
@@ -363,10 +364,12 @@ class ElectrumCandidateAssembler:
             )
             if candidate is not None:
                 candidates[(start, end, candidate.serialization_type)] = candidate
-        for start, end, value in self._json_objects(data):
-            if required_anchor_offset is not None and not (
-                    start <= required_anchor_offset < end):
-                continue
+        json_objects = (
+            self._json_objects(data)
+            if required_anchor_offset is None else
+            self._json_objects_containing(data, required_anchor_offset)
+        )
+        for start, end, value in json_objects:
             candidate = self.validator.validate_plaintext(
                 data[start:end], source=source,
                 physical_start=physical_start + start, anchors=anchors,
@@ -437,6 +440,150 @@ class ElectrumCandidateAssembler:
                             yield start, end + 1, value
                         break
 
+    @classmethod
+    def _json_objects_containing(cls, data: bytes, anchor: int, *,
+                                 scan_stats: dict[str, int] | None = None):
+        """Yield only JSON object spans containing ``anchor``.
+
+        The two lexical passes cover anchors both inside and outside a JSON
+        string.  Candidate starts are found backwards and all corresponding
+        ends are resolved in one forward pass, so unrelated braces elsewhere
+        in the window do not each trigger another scan to the end.
+        """
+        if not 0 <= anchor < len(data):
+            return
+        spans: set[tuple[int, int]] = set()
+        if data[anchor] == 0x7B:
+            end = cls._json_end_from_start(data, anchor, scan_stats)
+            if end is not None:
+                spans.add((anchor, end))
+        for anchor_in_string in (False, True):
+            starts = cls._json_starts_before_anchor(
+                data, anchor, anchor_in_string, scan_stats)
+            if not starts:
+                continue
+            ends = cls._json_ends_after_anchor(
+                data, anchor, anchor_in_string, len(starts), scan_stats)
+            for depth, start in enumerate(starts, 1):
+                end = ends.get(depth)
+                if end is not None:
+                    spans.add((start, end))
+        for start, end in sorted(spans):
+            next_index = start + 1
+            while next_index < end and data[next_index] in b" \t\r\n":
+                next_index += 1
+            if next_index >= end or data[next_index] not in (0x22, 0x7D):
+                continue
+            raw = data[start:end]
+            try:
+                value = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                yield start, end, value
+
+    @staticmethod
+    def _json_end_from_start(data: bytes, start: int,
+                             scan_stats: dict[str, int] | None):
+        depth, in_string, escaped = 0, False, False
+        for index in range(start, len(data)):
+            if scan_stats is not None:
+                scan_stats["boundary_bytes"] = (
+                    scan_stats.get("boundary_bytes", 0) + 1)
+            current = data[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif current == 0x5C:
+                    escaped = True
+                elif current == 0x22:
+                    in_string = False
+                continue
+            if current == 0x22:
+                in_string = True
+            elif current == 0x7B:
+                depth += 1
+            elif current == 0x7D:
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+        return None
+
+    @staticmethod
+    def _json_starts_before_anchor(data: bytes, anchor: int,
+                                   anchor_in_string: bool,
+                                   scan_stats: dict[str, int] | None):
+        starts: list[int] = []
+        reverse_depth = 0
+        in_string = anchor_in_string
+        index = anchor - 1
+        while index >= 0:
+            if scan_stats is not None:
+                scan_stats["boundary_bytes"] = (
+                    scan_stats.get("boundary_bytes", 0) + 1)
+            current = data[index]
+            if current == 0x22:
+                backslashes = 0
+                previous = index - 1
+                while previous >= 0 and data[previous] == 0x5C:
+                    backslashes += 1
+                    previous -= 1
+                    if scan_stats is not None:
+                        scan_stats["boundary_bytes"] += 1
+                if backslashes % 2 == 0:
+                    in_string = not in_string
+                index = previous
+                continue
+            if not in_string:
+                if current == 0x7D:
+                    reverse_depth += 1
+                elif current == 0x7B:
+                    if reverse_depth:
+                        reverse_depth -= 1
+                    else:
+                        starts.append(index)
+            index -= 1
+        return starts
+
+    @staticmethod
+    def _json_ends_after_anchor(data: bytes, anchor: int,
+                                anchor_in_string: bool, required_depth: int,
+                                scan_stats: dict[str, int] | None):
+        ends: dict[int, int] = {}
+        delta = 0
+        in_string = anchor_in_string
+        escaped = False
+        if in_string:
+            previous = anchor - 1
+            while previous >= 0 and data[previous] == 0x5C:
+                escaped = not escaped
+                previous -= 1
+        for index in range(anchor, len(data)):
+            if scan_stats is not None:
+                scan_stats["boundary_bytes"] = (
+                    scan_stats.get("boundary_bytes", 0) + 1)
+            current = data[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif current == 0x5C:
+                    escaped = True
+                elif current == 0x22:
+                    in_string = False
+                continue
+            if current == 0x22:
+                in_string = True
+            elif current == 0x7B:
+                delta += 1
+            elif current == 0x7D:
+                delta -= 1
+                depth = -delta
+                if 1 <= depth <= required_depth and depth not in ends:
+                    ends[depth] = index + 1
+                    if len(ends) == required_depth:
+                        break
+        return ends
+
     def _fragment(self, data, source, physical_start, required, anchors, provenance):
         anchor_count = sum(pattern in data for _, pattern in
                            ELECTRUM_SIGNATURE_PATTERNS)
@@ -485,14 +632,22 @@ class ElectrumRawRecoveryPipeline:
         self.assembler = ElectrumCandidateAssembler()
 
     def run_hits(self, hits: Iterable[RawHit], *, range_start: int = 0,
-                 range_end: int | None = None) -> ElectrumRawRecovery:
+                 range_end: int | None = None,
+                 progress: Callable[[int, int, float], None] | None = None,
+                 progress_interval: float = 0.5,
+                 progress_hit_interval: int = 32) -> ElectrumRawRecovery:
         relevant = tuple(hit for hit in hits if hit.hit_type in ELECTRUM_SIGNATURE_NAMES)
         end = self.path.stat().st_size if range_end is None else range_end
         found: dict[tuple[int, int, str], ElectrumRawCandidate] = {}
         failures = []
         legacy_names = {name for name, _ in LEGACY_ELECTRUM_SIGNATURE_PATTERNS}
+        total = len(relevant)
+        started = time.monotonic()
+        last_progress = started
+        if progress is not None:
+            progress(0, total, 0.0)
         with self.path.open("rb") as image:
-            for hit in relevant:
+            for completed, hit in enumerate(relevant, 1):
                 window_start = max(range_start, hit.start_offset - MAX_BACKWARD_CONTEXT)
                 window_end = min(end, window_start + MAX_SCANNER_CANDIDATE_WINDOW)
                 try:
@@ -500,6 +655,13 @@ class ElectrumRawRecoveryPipeline:
                     data = image.read(window_end - window_start)
                 except OSError as exc:
                     failures.append(f"electrum_candidate_read_failure:{type(exc).__name__}")
+                    if progress is not None:
+                        now = time.monotonic()
+                        if (completed == total
+                                or completed % progress_hit_interval == 0
+                                or now - last_progress >= progress_interval):
+                            progress(completed, total, now - started)
+                            last_progress = now
                     continue
                 local_anchor = hit.start_offset - window_start
                 assembled = self.assembler.analyze_bytes(
@@ -518,6 +680,13 @@ class ElectrumRawRecoveryPipeline:
                     correlated = self._correlate(candidate)
                     found[(correlated.physical_start, correlated.physical_end,
                            correlated.serialization_type)] = correlated
+                if progress is not None:
+                    now = time.monotonic()
+                    if (completed == total
+                            or completed % progress_hit_interval == 0
+                            or now - last_progress >= progress_interval):
+                        progress(completed, total, now - started)
+                        last_progress = now
         return self._result(
             len(relevant), tuple(found.values()), failures,
             legacy_anchor_hits=sum(hit.hit_type in legacy_names for hit in relevant),
