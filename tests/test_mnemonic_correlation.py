@@ -104,6 +104,21 @@ def test_many_ascii_sliding_windows_form_one_cluster():
                for item in annotations)
 
 
+def test_large_regular_overlap_with_one_fingerprint_is_dense_sliding_series():
+    items = tuple(
+        occurrence(60_000 + index * 4, 60_090 + index * 4, "same-fingerprint",
+                   standard="ELECTRUM", words=15,
+                   language="chinese_simplified", encoding="utf-16-le")
+        for index in range(32)
+    )
+    annotations = correlate_mnemonic_occurrences(items)
+    assert len({item.cluster_id for item in annotations}) == 1
+    assert all(item.recovery_relevance == LIKELY_WORDLIST_FALSE_POSITIVE
+               for item in annotations)
+    assert all(MNEMONIC_DENSE_SLIDING_WINDOWS in item.reason_codes
+               for item in annotations)
+
+
 def test_two_distant_real_mnemonics_remain_independent():
     annotations = correlate_mnemonic_occurrences((
         occurrence(1_000, 1_090, "fp-left"),

@@ -157,6 +157,9 @@ def correlate_mnemonic_occurrences(
         ) or (
             len(region) >= 4 and compact and distinct_starts >= 3 and
             len(fingerprints) >= 3 and _regular_starts(region)
+        ) or (
+            len(region) >= 16 and compact and distinct_starts >= 8 and
+            len(overlap_members) >= 16 and _regular_starts(region)
         )
         classified = set(range(len(region))) if dense else {
             position for position, pair in enumerate(region)
