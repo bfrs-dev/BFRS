@@ -11,6 +11,7 @@ import sys
 from typing import Sequence
 
 from bfrs.core.models import ValidationStatus
+from bfrs.core.path_safety import paths_refer_to_same_file
 from bfrs.recovery.berkeley_database_pipeline import BerkeleyDatabaseRecoveryPipeline
 from bfrs.recovery.berkeley_records import BerkeleyLeafRecordExtractor
 from bfrs.validators.base import ValidationContext
@@ -213,6 +214,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     source = arguments.input.resolve()
     output = arguments.output.resolve()
+    manifest = output.with_name(MANIFEST_FILENAME)
+    if paths_refer_to_same_file(output, source):
+        parser.error("output path resolves to input path")
+    if paths_refer_to_same_file(manifest, source):
+        parser.error("manifest path resolves to input path")
+    if paths_refer_to_same_file(manifest, output):
+        parser.error("manifest path resolves to output path")
     try:
         source_size = source.stat().st_size
         source_sha256 = _sha256(source)

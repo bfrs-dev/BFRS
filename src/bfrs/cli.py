@@ -7,6 +7,7 @@ import sys
 import time
 from typing import Sequence
 
+from bfrs.core.path_safety import paths_refer_to_same_file
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
 from bfrs.recovery.mnemonic.mnemonic_recovery_pipeline import MnemonicRecoveryPipeline
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import resolve_worker_count
@@ -319,6 +320,23 @@ def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
         parser.error("--overlap-kib must be smaller than --chunk-mib")
 
 
+def _validate_path_collisions(
+    parser: argparse.ArgumentParser, arguments,
+) -> None:
+    if paths_refer_to_same_file(arguments.output, arguments.input):
+        parser.error("output path resolves to input path")
+    checkpoint = arguments.checkpoint or arguments.resume_checkpoint
+    if checkpoint is not None:
+        if paths_refer_to_same_file(checkpoint, arguments.input):
+            parser.error("checkpoint path resolves to input path")
+        if paths_refer_to_same_file(checkpoint, arguments.output):
+            parser.error("checkpoint path resolves to report output path")
+    if (arguments.revalidate_wallet_records is not None and
+            paths_refer_to_same_file(
+                arguments.output, arguments.revalidate_wallet_records)):
+        parser.error("output path resolves to source report path")
+
+
 def _selection(parser: argparse.ArgumentParser, arguments):
     try:
         targets = (parse_targets(arguments.targets) if arguments.targets else
@@ -362,6 +380,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
     _validate_arguments(parser, arguments)
+    _validate_path_collisions(parser, arguments)
     if arguments.revalidate_wallet_records is not None:
         try:
             old_report = json.loads(

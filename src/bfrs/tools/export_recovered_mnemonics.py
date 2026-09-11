@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
+from bfrs.core.path_safety import paths_refer_to_same_file
 from bfrs.recovery.mnemonic.mnemonic_recovery_pipeline import MnemonicRecoveryPipeline
 
 
@@ -26,15 +27,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = build_parser().parse_args(argv)
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
     if not arguments.allow_seed_export:
         print("refusing seed export: pass --allow-seed-export explicitly", file=sys.stderr)
         return 2
+    manifest = arguments.manifest or arguments.output.with_suffix(
+        arguments.output.suffix + ".manifest.json")
+    if paths_refer_to_same_file(arguments.output, arguments.input):
+        parser.error("output path resolves to input path")
+    if paths_refer_to_same_file(manifest, arguments.input):
+        parser.error("manifest path resolves to input path")
+    if paths_refer_to_same_file(manifest, arguments.output):
+        parser.error("manifest path resolves to output path")
     if arguments.output.exists():
         print("refusing to overwrite secret output", file=sys.stderr)
         return 4
-    manifest = arguments.manifest or arguments.output.with_suffix(
-        arguments.output.suffix + ".manifest.json")
     if manifest.exists():
         print("refusing to overwrite manifest", file=sys.stderr)
         return 4

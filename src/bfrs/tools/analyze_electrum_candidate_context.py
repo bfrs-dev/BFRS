@@ -14,6 +14,7 @@ import sys
 import unicodedata
 from typing import BinaryIO, Callable, ContextManager, Sequence
 
+from bfrs.core.path_safety import paths_refer_to_same_file
 from bfrs.recovery.mnemonic.bip39_validator import BIP39Validator
 from bfrs.recovery.mnemonic.electrum_seed_validator import ElectrumSeedValidator
 from bfrs.recovery.mnemonic.electrum_v1_validator import ElectrumV1Validator
@@ -1255,7 +1256,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = build_parser().parse_args(argv)
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
+    if paths_refer_to_same_file(arguments.output, arguments.report):
+        parser.error("output path resolves to source report path")
+    if paths_refer_to_same_file(arguments.output, arguments.image):
+        parser.error("output path resolves to input image path")
     try:
         report = json.loads(arguments.report.read_text(encoding="utf-8"))
         if not isinstance(report, dict):
