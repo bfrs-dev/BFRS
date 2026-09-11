@@ -1,10 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "bfrs"
-version = "2.0.0"
+dynamic = ["version"]
+description = "Offline forensic scanner for recovering and validating cryptocurrency wallet artifacts"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pypdf>=5.0,<7",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+]
+
+[project.scripts]
+bfrs = "bfrs.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["bfrs*"]
+
+[tool.setuptools.package-data]
+"bfrs.recovery.mnemonic" = ["wordlists/*.txt"]
+
+[tool.setuptools.dynamic]
+version = {attr = "bfrs.version.VERSION"}
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
