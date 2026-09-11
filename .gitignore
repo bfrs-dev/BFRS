@@ -1,3 +1,36 @@
+# Python build and test artifacts
 __pycache__/
-*.py[cod]
+**/__pycache__/
 .pytest_cache/
+*.py[cod]
+*.egg-info/
+
+# Local environment files
+.env
+.env.*
+
+# Forensic and recovery output
+reports/
+checkpoints/
+carves/
+recovered/
+*.checkpoint.json
+*.checkpoint.json.tmp-*
+
+# Disk images
+*.img
+*.dd
+*.raw
+*.E01
+*.e01
+*.vhd
+*.vhdx
+*.vmdk
+*.gho
+*.ghs
+
+# Wallet and binary recovery material
+wallet.dat
+*.wallet
+*.bin
+*.db
