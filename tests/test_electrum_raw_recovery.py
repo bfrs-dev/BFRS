@@ -4,12 +4,15 @@ from types import SimpleNamespace
 
 import pytest
 
+import bfrs.recovery.electrum_raw_recovery as electrum_raw_module
 from bfrs.core.chunk_reader import ChunkReader
 from bfrs.core.models import RawHit
 from bfrs.recovery.electrum_raw_recovery import (
     ELECTRUM_BIE1_BASE64_SIGNATURE,
     ELECTRUM_SIGNATURE_NAMES,
     ELECTRUM_SIGNATURE_PATTERNS,
+    MAX_BACKWARD_CONTEXT,
+    MAX_MERGED_ELECTRUM_READ_SIZE,
     MAX_SCANNER_CANDIDATE_WINDOW,
     ElectrumCandidateAssembler,
     ElectrumRawRecoveryPipeline,
@@ -517,3 +520,280 @@ def test_run_hits_reports_throttled_secret_free_progress(tmp_path):
     assert updates[-1][0:2] == (1, 1)
     assert SYNTHETIC_SEED not in repr(updates)
     assert SYNTHETIC_XPRV not in repr(updates)
+
+
+class _CountingRangeReader:
+    def __init__(self, data: bytes, *, eof: int | None = None) -> None:
+        self.data = data
+        self.eof = len(data) if eof is None else eof
+        self.calls: list[tuple[int, int]] = []
+
+    def read_at(self, offset: int, length: int) -> bytes:
+        self.calls.append((offset, length))
+        available_end = min(offset + length, self.eof, len(self.data))
+        if available_end <= offset:
+            return b""
+        return self.data[offset:available_end]
+
+    @property
+    def requested_bytes(self) -> int:
+        return sum(length for _, length in self.calls)
+
+
+class _RecordingAssembler:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def analyze_bytes(self, data, **kwargs):
+        self.calls.append((
+            kwargs["physical_start"],
+            kwargs["required_anchor_offset"],
+            kwargs["anchor_types"],
+            len(data),
+        ))
+        return ()
+
+
+def _sized_source(tmp_path, size: int):
+    path = tmp_path / "synthetic-secondary-reads.bin"
+    with path.open("wb") as stream:
+        if size:
+            stream.seek(size - 1)
+            stream.write(b"\0")
+    return path
+
+
+def _hit(offset: int, hit_type=ELECTRUM_BIE1_BASE64_SIGNATURE):
+    return RawHit(offset, offset + 6, hit_type, 0.0, "synthetic", {})
+
+
+def _pipeline_with_recorder(path, reader):
+    pipeline = ElectrumRawRecoveryPipeline(source=path, range_reader=reader)
+    recorder = _RecordingAssembler()
+    pipeline.assembler = recorder
+    return pipeline, recorder
+
+
+def _run_per_anchor_baseline(pipeline, hits, reader, *, range_start=0,
+                             range_end=None):
+    """Test-only copy of the pre-merge physical read behavior."""
+    end = pipeline.path.stat().st_size if range_end is None else range_end
+    found = {}
+    for hit in hits:
+        window_start = max(range_start, hit.start_offset - MAX_BACKWARD_CONTEXT)
+        window_end = min(end, window_start + MAX_SCANNER_CANDIDATE_WINDOW)
+        data = reader.read_at(window_start, window_end - window_start)
+        assembled = pipeline.assembler.analyze_bytes(
+            data,
+            source=str(pipeline.path),
+            physical_start=window_start,
+            required_anchor_offset=hit.start_offset - window_start,
+            anchor_types=(hit.hit_type,),
+        )
+        for candidate in assembled:
+            correlated = pipeline._correlate(candidate)
+            found[(correlated.physical_start, correlated.physical_end,
+                   correlated.serialization_type)] = correlated
+    return pipeline._result(len(hits), tuple(found.values()), ())
+
+
+def test_one_anchor_uses_one_physical_read_and_preserves_result(tmp_path):
+    wallet = _plaintext()
+    prefix = b"X" * 128
+    data = prefix + wallet + b"\0" * 128
+    path = tmp_path / "single-anchor.bin"
+    path.write_bytes(data)
+    anchor = len(prefix) + wallet.index(b'"seed_version"')
+    hit = _hit(anchor, "electrum_seed_version_anchor")
+    reader = _CountingRangeReader(data)
+
+    merged = ElectrumRawRecoveryPipeline(
+        source=path, range_reader=reader).run_hits((hit,))
+    original = ElectrumRawRecoveryPipeline(source=path).run_hits((hit,))
+
+    assert len(reader.calls) == 1
+    assert merged == original
+
+
+def test_two_distant_anchor_windows_use_two_reads(tmp_path):
+    size = 6 * 1024 * 1024
+    path = _sized_source(tmp_path, size)
+    reader = _CountingRangeReader(b"\0" * size)
+    pipeline, _ = _pipeline_with_recorder(path, reader)
+
+    pipeline.run_hits((_hit(1024 * 1024), _hit(5 * 1024 * 1024)))
+
+    assert len(reader.calls) == 2
+
+
+def test_two_strongly_overlapping_windows_use_one_read(tmp_path):
+    size = 4 * 1024 * 1024
+    path = _sized_source(tmp_path, size)
+    reader = _CountingRangeReader(b"\0" * size)
+    pipeline, _ = _pipeline_with_recorder(path, reader)
+
+    pipeline.run_hits((_hit(1200 * 1024), _hit(1300 * 1024)))
+
+    assert len(reader.calls) == 1
+
+
+def test_dense_anchors_reduce_physical_calls_and_requested_bytes(tmp_path):
+    size = 4 * 1024 * 1024
+    path = _sized_source(tmp_path, size)
+    reader = _CountingRangeReader(b"\0" * size)
+    pipeline, recorder = _pipeline_with_recorder(path, reader)
+    hits = tuple(_hit(MAX_BACKWARD_CONTEXT + index * 4096)
+                 for index in range(40))
+    baseline_reader = _CountingRangeReader(b"\0" * size)
+    baseline_pipeline, _ = _pipeline_with_recorder(path, baseline_reader)
+
+    _run_per_anchor_baseline(baseline_pipeline, hits, baseline_reader)
+    pipeline.run_hits(hits)
+
+    assert len(baseline_reader.calls) == len(hits)
+    assert baseline_reader.requested_bytes == (
+        len(hits) * MAX_SCANNER_CANDIDATE_WINDOW)
+    assert len(reader.calls) == 1
+    assert len(recorder.calls) == len(hits)
+    assert reader.requested_bytes == (
+        MAX_SCANNER_CANDIDATE_WINDOW + (len(hits) - 1) * 4096)
+    assert reader.requested_bytes < baseline_reader.requested_bytes // 20
+
+
+def test_three_identical_windows_share_one_read_but_keep_anchor_analysis(tmp_path):
+    size = 3 * 1024 * 1024
+    path = _sized_source(tmp_path, size)
+    reader = _CountingRangeReader(b"\0" * size)
+    pipeline, recorder = _pipeline_with_recorder(path, reader)
+    hits = (_hit(100), _hit(200), _hit(300))
+
+    pipeline.run_hits(hits)
+
+    assert reader.calls == [(0, MAX_SCANNER_CANDIDATE_WINDOW)]
+    assert len(recorder.calls) == 3
+    assert [item[1] for item in recorder.calls] == [100, 200, 300]
+
+
+def test_anchor_near_source_start_preserves_clamp_and_offsets(tmp_path):
+    size = 3 * 1024 * 1024
+    path = _sized_source(tmp_path, size)
+    reader = _CountingRangeReader(b"\0" * size)
+    pipeline, recorder = _pipeline_with_recorder(path, reader)
+
+    pipeline.run_hits((_hit(7),))
+
+    assert reader.calls == [(0, MAX_SCANNER_CANDIDATE_WINDOW)]
+    assert recorder.calls == [(
+        0, 7, (ELECTRUM_BIE1_BASE64_SIGNATURE,),
+        MAX_SCANNER_CANDIDATE_WINDOW,
+    )]
+
+
+def test_anchor_near_source_end_preserves_clamp_and_offsets(tmp_path):
+    size = 3 * 1024 * 1024
+    anchor = size - 7
+    path = _sized_source(tmp_path, size)
+    reader = _CountingRangeReader(b"\0" * size)
+    pipeline, recorder = _pipeline_with_recorder(path, reader)
+
+    pipeline.run_hits((_hit(anchor),))
+
+    expected_start = anchor - MAX_BACKWARD_CONTEXT
+    assert reader.calls == [(expected_start, size - expected_start)]
+    assert recorder.calls == [(
+        expected_start, MAX_BACKWARD_CONTEXT,
+        (ELECTRUM_BIE1_BASE64_SIGNATURE,), size - expected_start,
+    )]
+
+
+def test_merged_read_limit_safely_splits_overlap_chain(tmp_path, monkeypatch):
+    limit = 4 * 1024 * 1024
+    monkeypatch.setattr(
+        electrum_raw_module, "MAX_MERGED_ELECTRUM_READ_SIZE", limit)
+    assert limit >= MAX_SCANNER_CANDIDATE_WINDOW
+    size = 10 * 1024 * 1024
+    path = _sized_source(tmp_path, size)
+    reader = _CountingRangeReader(b"\0" * size)
+    pipeline, recorder = _pipeline_with_recorder(path, reader)
+    hits = tuple(_hit(MAX_BACKWARD_CONTEXT + index * 1536 * 1024)
+                 for index in range(6))
+
+    pipeline.run_hits(hits)
+
+    assert 1 < len(reader.calls) < len(hits)
+    assert all(length <= limit for _, length in reader.calls)
+    assert len(recorder.calls) == len(hits)
+
+
+def test_merged_results_provenance_offsets_and_order_match_original(tmp_path):
+    wallet = _plaintext()
+    prefix = b"P" * (MAX_BACKWARD_CONTEXT + 128)
+    data = prefix + wallet + b"\0" * 128
+    path = tmp_path / "semantic-equivalence.bin"
+    path.write_bytes(data)
+    hits = tuple(
+        _hit(len(prefix) + wallet.index(pattern), name)
+        for name, pattern in (
+            ("electrum_seed_version_anchor", b'"seed_version"'),
+            ("electrum_wallet_type_anchor", b'"wallet_type"'),
+            ("electrum_keystore_anchor", b'"keystore"'),
+        )
+    )
+    baseline_reader = _CountingRangeReader(data)
+    baseline_pipeline = ElectrumRawRecoveryPipeline(
+        source=path, range_reader=baseline_reader)
+    original = _run_per_anchor_baseline(
+        baseline_pipeline, hits, baseline_reader)
+    reader = _CountingRangeReader(data)
+    merged = ElectrumRawRecoveryPipeline(
+        source=path, range_reader=reader).run_hits(hits)
+    repeated = ElectrumRawRecoveryPipeline(
+        source=path, range_reader=_CountingRangeReader(data)).run_hits(
+            tuple(reversed(hits)))
+
+    assert merged == original == repeated
+    assert len(baseline_reader.calls) == len(hits)
+    assert len(reader.calls) == 1
+    assert merged.candidates[0].provenance == original.candidates[0].provenance
+    assert merged.candidates[0].physical_start == len(prefix)
+
+
+def test_no_anchors_performs_zero_secondary_reads(tmp_path):
+    path = _sized_source(tmp_path, 1024)
+    reader = _CountingRangeReader(b"\0" * 1024)
+
+    result = ElectrumRawRecoveryPipeline(
+        source=path, range_reader=reader).run_hits(())
+
+    assert reader.calls == []
+    assert result.anchors_found == 0
+
+
+def test_short_merged_read_matches_per_anchor_eof_slices(tmp_path):
+    size = 3 * 1024 * 1024
+    eof = 1400 * 1024
+    data = b"\0" * size
+    path = _sized_source(tmp_path, size)
+    hits = (_hit(1024 * 1024), _hit(1300 * 1024))
+    merged_reader = _CountingRangeReader(data, eof=eof)
+    pipeline, merged_recorder = _pipeline_with_recorder(path, merged_reader)
+
+    pipeline.run_hits(hits)
+
+    expected = []
+    baseline_reader = _CountingRangeReader(data, eof=eof)
+    for window in pipeline._anchor_windows(hits, range_start=0, range_end=size):
+        logical = baseline_reader.read_at(window.start, window.end - window.start)
+        expected.append((
+            window.start,
+            window.hit.start_offset - window.start,
+            (window.hit.hit_type,),
+            len(logical),
+        ))
+    assert len(merged_reader.calls) == 1
+    assert len(baseline_reader.calls) == len(hits)
+    assert merged_recorder.calls == expected
+
+
+def test_default_merged_read_limit_covers_original_candidate_window():
+    assert MAX_MERGED_ELECTRUM_READ_SIZE >= MAX_SCANNER_CANDIDATE_WINDOW

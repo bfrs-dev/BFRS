@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 import re
 import time
-from typing import Any, Callable, Iterable
+from typing import Any, BinaryIO, Callable, Iterable, Protocol
 
 from bfrs.core.models import RawHit
 from bfrs.recovery.ntfs_mft_data import NtfsMftRecordError
@@ -43,12 +43,41 @@ ELECTRUM_SIGNATURE_NAMES = frozenset(name for name, _ in ELECTRUM_SIGNATURE_PATT
 MAX_ELECTRUM_WALLET_SIZE = 32 * 1024 * 1024
 MAX_BACKWARD_CONTEXT = 1024 * 1024
 MAX_SCANNER_CANDIDATE_WINDOW = 2 * 1024 * 1024
+MAX_MERGED_ELECTRUM_READ_SIZE = 16 * 1024 * 1024
 BASE64_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 SECRET_KEYS = frozenset({
     "seed", "seed_extra_words", "passphrase", "xprv", "prv", "privkey",
     "private_key", "keypairs", "master_private_key", "master_private_keys",
 })
 KNOWN_KEYSTORE_TYPES = frozenset({"bip32", "old", "hardware", "imported"})
+
+
+class PhysicalRangeReader(Protocol):
+    def read_at(self, offset: int, length: int) -> bytes: ...
+
+
+class _OpenImageRangeReader:
+    def __init__(self, stream: BinaryIO) -> None:
+        self.stream = stream
+
+    def read_at(self, offset: int, length: int) -> bytes:
+        self.stream.seek(offset)
+        return self.stream.read(length)
+
+
+@dataclass(frozen=True, slots=True)
+class _AnchorWindow:
+    hit: RawHit
+    start: int
+    end: int
+    input_order: int
+
+
+@dataclass(frozen=True, slots=True)
+class _MergedReadWindow:
+    start: int
+    end: int
+    anchors: tuple[_AnchorWindow, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -626,10 +655,60 @@ class ElectrumRawRecoveryPipeline:
     """Assemble scanner hits or analyze one explicitly bounded reader range."""
 
     def __init__(self, *, source: str | Path,
-                 known_artifacts: Iterable[KnownElectrumArtifact] = ()) -> None:
+                 known_artifacts: Iterable[KnownElectrumArtifact] = (),
+                 range_reader: PhysicalRangeReader | None = None) -> None:
         self.path = Path(source).resolve()
         self.known_artifacts = tuple(known_artifacts)
+        self.range_reader = range_reader
         self.assembler = ElectrumCandidateAssembler()
+
+    @staticmethod
+    def _anchor_windows(
+        hits: tuple[RawHit, ...], *, range_start: int, range_end: int,
+    ) -> tuple[_AnchorWindow, ...]:
+        windows = (
+            _AnchorWindow(
+                hit,
+                max(range_start, hit.start_offset - MAX_BACKWARD_CONTEXT),
+                0,
+                input_order,
+            )
+            for input_order, hit in enumerate(hits)
+        )
+        bounded = tuple(
+            _AnchorWindow(
+                item.hit,
+                item.start,
+                min(range_end, item.start + MAX_SCANNER_CANDIDATE_WINDOW),
+                item.input_order,
+            )
+            for item in windows
+        )
+        return tuple(sorted(bounded, key=lambda item: (
+            item.start, item.end, item.hit.start_offset, item.hit.end_offset,
+            item.hit.hit_type, item.input_order,
+        )))
+
+    @staticmethod
+    def _merged_read_windows(
+        windows: tuple[_AnchorWindow, ...],
+    ) -> tuple[_MergedReadWindow, ...]:
+        batches: list[_MergedReadWindow] = []
+        for window in windows:
+            if batches:
+                previous = batches[-1]
+                merged_end = max(previous.end, window.end)
+                if (window.start <= previous.end and
+                        merged_end - previous.start <=
+                        MAX_MERGED_ELECTRUM_READ_SIZE):
+                    batches[-1] = _MergedReadWindow(
+                        previous.start, merged_end,
+                        (*previous.anchors, window),
+                    )
+                    continue
+            batches.append(_MergedReadWindow(
+                window.start, window.end, (window,)))
+        return tuple(batches)
 
     def run_hits(self, hits: Iterable[RawHit], *, range_start: int = 0,
                  range_end: int | None = None,
@@ -638,6 +717,9 @@ class ElectrumRawRecoveryPipeline:
                  progress_hit_interval: int = 32) -> ElectrumRawRecovery:
         relevant = tuple(hit for hit in hits if hit.hit_type in ELECTRUM_SIGNATURE_NAMES)
         end = self.path.stat().st_size if range_end is None else range_end
+        windows = self._anchor_windows(
+            relevant, range_start=range_start, range_end=end)
+        batches = self._merged_read_windows(windows)
         found: dict[tuple[int, int, str], ElectrumRawCandidate] = {}
         failures = []
         legacy_names = {name for name, _ in LEGACY_ELECTRUM_SIGNATURE_PATTERNS}
@@ -646,51 +728,80 @@ class ElectrumRawRecoveryPipeline:
         last_progress = started
         if progress is not None:
             progress(0, total, 0.0)
-        with self.path.open("rb") as image:
-            for completed, hit in enumerate(relevant, 1):
-                window_start = max(range_start, hit.start_offset - MAX_BACKWARD_CONTEXT)
-                window_end = min(end, window_start + MAX_SCANNER_CANDIDATE_WINDOW)
+
+        def process(reader: PhysicalRangeReader) -> None:
+            nonlocal last_progress
+            completed = 0
+            for batch in batches:
                 try:
-                    image.seek(window_start)
-                    data = image.read(window_end - window_start)
+                    merged_data = reader.read_at(
+                        batch.start, batch.end - batch.start)
                 except OSError as exc:
-                    failures.append(f"electrum_candidate_read_failure:{type(exc).__name__}")
-                    if progress is not None:
-                        now = time.monotonic()
-                        if (completed == total
-                                or completed % progress_hit_interval == 0
-                                or now - last_progress >= progress_interval):
-                            progress(completed, total, now - started)
-                            last_progress = now
+                    failures.extend(
+                        f"electrum_candidate_read_failure:{type(exc).__name__}"
+                        for _ in batch.anchors)
+                    for _ in batch.anchors:
+                        completed += 1
+                        last_progress = self._report_hit_progress(
+                            progress, completed, total, started, last_progress,
+                            progress_interval, progress_hit_interval)
                     continue
-                local_anchor = hit.start_offset - window_start
-                assembled = self.assembler.analyze_bytes(
-                        data, source=str(self.path), physical_start=window_start,
+                for window in batch.anchors:
+                    logical_start = window.start - batch.start
+                    logical_end = window.end - batch.start
+                    data = merged_data[logical_start:logical_end]
+                    local_anchor = window.hit.start_offset - window.start
+                    assembled = self.assembler.analyze_bytes(
+                        data, source=str(self.path), physical_start=window.start,
                         required_anchor_offset=local_anchor,
-                        anchor_types=(hit.hit_type,))
-                if not assembled:
-                    failures.append(
-                        "ELECTRUM_LEGACY_STRUCTURE_INCONSISTENT"
-                        if hit.hit_type in legacy_names else
-                        "ELECTRUM_FRAMING_INVALID"
-                        if "bie" in hit.hit_type
-                        else "ELECTRUM_STRUCTURE_INCONSISTENT"
-                    )
-                for candidate in assembled:
-                    correlated = self._correlate(candidate)
-                    found[(correlated.physical_start, correlated.physical_end,
-                           correlated.serialization_type)] = correlated
-                if progress is not None:
-                    now = time.monotonic()
-                    if (completed == total
-                            or completed % progress_hit_interval == 0
-                            or now - last_progress >= progress_interval):
-                        progress(completed, total, now - started)
-                        last_progress = now
+                        anchor_types=(window.hit.hit_type,))
+                    if not assembled:
+                        failures.append(
+                            "ELECTRUM_LEGACY_STRUCTURE_INCONSISTENT"
+                            if window.hit.hit_type in legacy_names else
+                            "ELECTRUM_FRAMING_INVALID"
+                            if "bie" in window.hit.hit_type
+                            else "ELECTRUM_STRUCTURE_INCONSISTENT"
+                        )
+                    for candidate in assembled:
+                        correlated = self._correlate(candidate)
+                        found[(correlated.physical_start,
+                               correlated.physical_end,
+                               correlated.serialization_type)] = correlated
+                    completed += 1
+                    last_progress = self._report_hit_progress(
+                        progress, completed, total, started, last_progress,
+                        progress_interval, progress_hit_interval)
+
+        if self.range_reader is not None:
+            process(self.range_reader)
+        elif batches:
+            with self.path.open("rb") as image:
+                process(_OpenImageRangeReader(image))
         return self._result(
             len(relevant), tuple(found.values()), failures,
             legacy_anchor_hits=sum(hit.hit_type in legacy_names for hit in relevant),
         )
+
+    @staticmethod
+    def _report_hit_progress(
+        progress: Callable[[int, int, float], None] | None,
+        completed: int,
+        total: int,
+        started: float,
+        last_progress: float,
+        progress_interval: float,
+        progress_hit_interval: int,
+    ) -> float:
+        if progress is None:
+            return last_progress
+        now = time.monotonic()
+        if (completed == total
+                or completed % progress_hit_interval == 0
+                or now - last_progress >= progress_interval):
+            progress(completed, total, now - started)
+            return now
+        return last_progress
 
     def analyze_range(self, *, start: int, end: int,
                       allocation_state: str = "UNKNOWN_ALLOCATION",
