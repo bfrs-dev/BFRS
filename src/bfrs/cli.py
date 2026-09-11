@@ -17,6 +17,7 @@ from bfrs.recovery.mnemonic.seed_scan_checkpoint import (
 from bfrs.recovery.unified_scan_checkpoint import (
     UnifiedCheckpointError,
     UnifiedScanCheckpoint,
+    build_scanner_identity,
 )
 from bfrs.reporting.json_report import write_json_report
 from bfrs.reporting.json_report import serialize_full_image_result
@@ -503,14 +504,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     range_end = file_size if arguments.end is None else arguments.end
     unified_checkpoint = None
-    scanner_identity = {
-        "targets": sorted(selection.targets),
-        "signatures": [signature.name for signature in selection.signatures],
-        "mnemonic_enabled": bool(
+    scanner_identity = build_scanner_identity(
+        targets=selection.targets,
+        signatures=selection.signatures,
+        mnemonic_enabled=bool(
             (arguments.include_mnemonic or arguments.targets is not None)
             and not arguments.skip_mnemonic),
-        "bitcoin_context_enabled": arguments.include_bitcoin_context,
-    }
+        bitcoin_context_enabled=arguments.include_bitcoin_context,
+    )
     try:
         if arguments.resume_checkpoint:
             unified_checkpoint = UnifiedScanCheckpoint.resume(

@@ -10,7 +10,10 @@ from bfrs.cli import main
 from bfrs.core.chunk_reader import Chunk, ChunkReader
 from bfrs.core.secp256k1 import GENERATOR, encode_sec_public_key
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
-from bfrs.recovery.unified_scan_checkpoint import UnifiedScanCheckpoint
+from bfrs.recovery.unified_scan_checkpoint import (
+    UnifiedScanCheckpoint,
+    build_scanner_identity,
+)
 from bfrs.reporting.json_report import serialize_full_image_result
 from bfrs.scanners.fast_scanner import FastScanner, Signature
 from bfrs.scanners.target_registry import (
@@ -229,11 +232,12 @@ def test_unified_checkpoint_resume_skips_completed_ownership_and_matches_clean(t
     source = tmp_path / "resume.img"
     source.write_bytes(payload)
     selection = _selection()
-    identity = {
-        "targets": sorted(selection.targets),
-        "signatures": [item.name for item in selection.signatures],
-        "mnemonic_enabled": True,
-    }
+    identity = build_scanner_identity(
+        targets=selection.targets,
+        signatures=selection.signatures,
+        mnemonic_enabled=True,
+        bitcoin_context_enabled=False,
+    )
     checkpoint = UnifiedScanCheckpoint.create(
         tmp_path / "unified.checkpoint.json", source,
         start=0, end=len(payload), chunk_size=CHUNK_SIZE, overlap=OVERLAP,
