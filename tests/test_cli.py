@@ -564,9 +564,10 @@ def test_public_target_pipeline_synthetic_raw_fixtures(
     else:
         assert accepted == []
         if case == "short_anchors":
-            assert payload["target_findings"]
+            assert payload["target_findings"] == []
+            assert payload["rejected_statistics"]["total_count"] > 0
             assert all(item["structural_status"] == "REJECTED"
-                       for item in payload["target_findings"])
+                       for item in payload["rejected_statistics"]["groups"])
 
 
 def test_public_progress_counts_accepted_multibit_and_armory_findings(

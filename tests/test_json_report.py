@@ -1,6 +1,8 @@
 from dataclasses import replace
 import json
 
+import pytest
+
 from bfrs.cli import BITCOIN_CORE_SIGNATURES_V1
 from bfrs.core.secp256k1 import (
     FIELD_PRIME,
@@ -9,12 +11,16 @@ from bfrs.core.secp256k1 import (
     encode_sec_public_key,
     scalar_multiply,
 )
+from bfrs.core.models import RawHit
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryResult
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
 from bfrs.reporting.json_report import (
+    REPORT_SCHEMA_VERSION,
+    _aggregate_rejected_findings,
     serialize_full_image_result,
     write_json_report,
 )
+from bfrs.tools.revalidate_wallet_records import _selected_offsets
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
 from bfrs.validators.berkeley_page import KEYDATA, PAGE_HEADER_SIZE
 from bfrs.validators.candidate_policy import CandidatePolicy
@@ -150,6 +156,7 @@ def historical_wallet_result(tmp_path) -> FullImageRecoveryResult:
 def test_safe_json_schema_is_explicit_and_deterministic(tmp_path):
     result = historical_wallet_result(tmp_path)
     payload = serialize_full_image_result(result, CONFIGURATION)
+    assert payload["report_schema_version"] == REPORT_SCHEMA_VERSION == 2
     assert payload["application"] == {"name": APP_NAME, "version": VERSION}
     assert payload["source"] == str((tmp_path / "historical-wallet.img").resolve())
     assert payload["scan_range"] == {
@@ -265,3 +272,157 @@ def test_serializer_rejects_unrelated_objects():
         assert str(error) == "result must be FullImageRecoveryResult"
     else:
         raise AssertionError("unrelated result was accepted")
+
+
+def _finding(offset, *, status="REJECTED", structural="REJECTED",
+             artifact="noise", reason=("SYNTHETIC_NOISE",)):
+    return RawHit(
+        offset,
+        offset + 1,
+        "synthetic_detector",
+        0.1,
+        "synthetic.img",
+        target="bitcoin-core",
+        artifact_kind=artifact,
+        structural_status=structural,
+        validation_status=status,
+        reason_codes=reason,
+        recommended_recovery_action="REVIEW_CONTEXT",
+    )
+
+
+def test_one_hundred_thousand_rejected_findings_are_compact_and_actionable_kept(
+        tmp_path):
+    baseline = historical_wallet_result(tmp_path)
+    rejected = tuple(_finding(offset) for offset in range(100_000))
+    candidates = tuple(
+        _finding(200_000 + offset, status="UNVALIDATED", structural="FRAGMENT",
+                 artifact="candidate", reason=("REVIEW_REQUIRED",))
+        for offset in range(12)
+    )
+    validated = tuple(
+        _finding(300_000 + offset, status="CRYPTO_VALID", structural="STRONG",
+                 artifact="validated", reason=("CRYPTO_VALID",))
+        for offset in range(5)
+    )
+    revalidation_record = _finding(
+        400_000, artifact="wallet_record", reason=("REVALIDATE_RECORD",))
+    findings = (*rejected, *candidates, *validated, revalidation_record)
+    result = replace(
+        baseline, target_findings=findings, raw_hit_count=len(findings))
+
+    payload = serialize_full_image_result(result, CONFIGURATION)
+    encoded_after = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    old_payload = dict(payload)
+    old_payload.pop("rejected_statistics")
+    old_payload["target_findings"] = [item.safe_dict() for item in findings]
+    encoded_before = json.dumps(
+        old_payload, sort_keys=True, separators=(",", ":"))
+
+    assert len(payload["target_findings"]) == 18
+    assert payload["rejected_statistics"] == {
+        "total_count": 100_000,
+        "group_count": 1,
+        "groups": [{
+            "target": "bitcoin-core",
+            "detector": "synthetic_detector",
+            "artifact_kind": "noise",
+            "validation_status": "REJECTED",
+            "structural_status": "REJECTED",
+            "reason_codes": ["SYNTHETIC_NOISE"],
+            "count": 100_000,
+            "first_offset": 0,
+            "last_offset": 99_999,
+        }],
+    }
+    full_offsets = {item["physical_start"] for item in payload["target_findings"]}
+    assert {200_000 + offset for offset in range(12)} <= full_offsets
+    assert {300_000 + offset for offset in range(5)} <= full_offsets
+    assert _selected_offsets(payload) == ((400_000,), 1)
+    assert len(encoded_before) / len(encoded_after) > 100
+
+
+def test_rejected_aggregation_groups_reason_target_and_artifact_deterministically():
+    findings = (
+        _finding(9, reason=("B",)),
+        _finding(2, reason=("A",)),
+        replace(_finding(4, reason=("A",)), target="electrum"),
+        replace(_finding(3, reason=("A",)), artifact_kind="other"),
+    )
+    first = _aggregate_rejected_findings(findings)
+    second = _aggregate_rejected_findings(tuple(reversed(findings)))
+    assert first == second
+    retained, statistics = first
+    assert retained == []
+    assert statistics["total_count"] == 4
+    assert statistics["group_count"] == 4
+
+
+def test_empty_rejected_and_only_validated_findings_remain_full():
+    validated = (_finding(
+        7, status="CHECKSUM_VALID", structural="STRONG",
+        artifact="bitcoin_address", reason=("CHECKSUM_VALID",)),)
+    retained, statistics = _aggregate_rejected_findings(validated)
+    assert [item["physical_start"] for item in retained] == [7]
+    assert statistics == {"total_count": 0, "group_count": 0, "groups": []}
+
+
+def test_only_rejected_findings_produce_no_full_records():
+    retained, statistics = _aggregate_rejected_findings(
+        (_finding(1), _finding(2)))
+    assert retained == []
+    assert statistics["total_count"] == 2
+
+
+def test_likely_wordlist_mnemonic_occurrence_is_aggregated_but_summary_untouched(
+        tmp_path):
+    baseline = historical_wallet_result(tmp_path)
+    mnemonic_summary = {
+        "candidates_total": 1,
+        "crypto_valid_occurrences": 1,
+        "candidates": [{
+            "fingerprint": "safe-synthetic-fingerprint",
+            "occurrences": [{"physical_start": 123, "physical_end": 456}],
+        }],
+    }
+    occurrence = replace(
+        _finding(
+            123,
+            status="BIP39_VALID",
+            structural="COMPLETE",
+            artifact="mnemonic",
+            reason=("WORDLIST_REGION_LIKELY",),
+        ),
+        safe_fingerprint="safe-synthetic-fingerprint",
+        safe_metadata={
+            "recovery_relevance": "LIKELY_WORDLIST_FALSE_POSITIVE",
+            "mnemonic_standard": "BIP39",
+        },
+    )
+    result = replace(
+        baseline,
+        target_findings=(occurrence,),
+        evidence={**baseline.evidence, "mnemonic_recovery": mnemonic_summary},
+    )
+
+    payload = serialize_full_image_result(result, CONFIGURATION)
+
+    assert payload["target_findings"] == []
+    assert payload["rejected_statistics"]["total_count"] == 1
+    assert payload["mnemonic_recovery"] == mnemonic_summary
+
+
+def test_atomic_write_failure_preserves_existing_report(tmp_path, monkeypatch):
+    result = historical_wallet_result(tmp_path)
+    report = tmp_path / "existing.json"
+    report.write_text("original report\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "bfrs.reporting.json_report.os.replace",
+        lambda *args: (_ for _ in ()).throw(OSError("synthetic replace failure")),
+    )
+
+    with pytest.raises(OSError, match="synthetic replace failure"):
+        write_json_report(report, result, CONFIGURATION)
+
+    assert report.read_text(encoding="utf-8") == "original report\n"
+    assert list(tmp_path.glob(f".{report.name}.tmp-*")) == []

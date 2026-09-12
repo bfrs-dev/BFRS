@@ -1,11 +1,73 @@
 """Explicit, secret-safe JSON reporting for full-image recovery."""
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping
+import uuid
 
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryResult
 from bfrs.version import APP_NAME, VERSION
+
+
+REPORT_SCHEMA_VERSION = 2
+_LIKELY_WORDLIST_FALSE_POSITIVE = "LIKELY_WORDLIST_FALSE_POSITIVE"
+
+
+def _aggregate_rejected_findings(findings) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Keep actionable findings and aggregate deterministic rejected noise."""
+    retained = []
+    groups: dict[tuple[object, ...], dict[str, Any]] = {}
+    total = 0
+    for finding in findings:
+        likely_wordlist_noise = (
+            finding.artifact_kind == "mnemonic"
+            and finding.safe_metadata.get("recovery_relevance")
+            == _LIKELY_WORDLIST_FALSE_POSITIVE
+        )
+        rejected = (
+            finding.validation_status == "REJECTED"
+            or finding.structural_status == "REJECTED"
+            or likely_wordlist_noise
+        )
+        # The wallet-record revalidation tool requires every source offset.
+        if not rejected or finding.artifact_kind == "wallet_record":
+            retained.append(finding.safe_dict())
+            continue
+        reasons = tuple(finding.reason_codes) or (
+            finding.validation_status
+            if finding.validation_status != "UNVALIDATED"
+            else finding.structural_status,
+        )
+        key = (
+            finding.target,
+            finding.hit_type,
+            finding.artifact_kind,
+            finding.validation_status,
+            finding.structural_status,
+            reasons,
+        )
+        group = groups.setdefault(key, {
+            "target": finding.target,
+            "detector": finding.hit_type,
+            "artifact_kind": finding.artifact_kind,
+            "validation_status": finding.validation_status,
+            "structural_status": finding.structural_status,
+            "reason_codes": list(reasons),
+            "count": 0,
+            "first_offset": finding.start_offset,
+            "last_offset": finding.start_offset,
+        })
+        group["count"] += 1
+        group["first_offset"] = min(group["first_offset"], finding.start_offset)
+        group["last_offset"] = max(group["last_offset"], finding.start_offset)
+        total += 1
+    ordered_groups = [groups[key] for key in sorted(groups)]
+    return retained, {
+        "total_count": total,
+        "group_count": len(ordered_groups),
+        "groups": ordered_groups,
+    }
 
 
 def _identity(identity) -> dict[str, Any]:
@@ -1198,7 +1260,10 @@ def serialize_full_image_result(
             "errors",
         )
     }
+    target_findings, rejected_statistics = _aggregate_rejected_findings(
+        result.target_findings)
     return {
+        "report_schema_version": REPORT_SCHEMA_VERSION,
         "application": {"name": APP_NAME, "version": VERSION},
         "source": result.source,
         "scan_range": {
@@ -1265,7 +1330,8 @@ def serialize_full_image_result(
         "electrum_raw_recovery": _electrum_raw_recovery(
             result.electrum_raw_recovery
         ),
-        "target_findings": [item.safe_dict() for item in result.target_findings],
+        "target_findings": target_findings,
+        "rejected_statistics": rejected_statistics,
         "bitcoin_context_evidence": _bitcoin_context_evidence(result),
         "mnemonic_coverage": dict(result.evidence.get("mnemonic_coverage", {
             "performed": False, "standards": (),
@@ -1306,7 +1372,19 @@ def write_json_report(
     report_path = Path(path)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     payload = serialize_full_image_result(result, configuration)
-    with report_path.open("w", encoding="utf-8", newline="\n") as output:
-        json.dump(payload, output, indent=2, sort_keys=True, ensure_ascii=False)
-        output.write("\n")
+    temporary = report_path.with_name(
+        f".{report_path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as output:
+            json.dump(payload, output, indent=2, sort_keys=True, ensure_ascii=False)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, report_path)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return report_path.resolve()
