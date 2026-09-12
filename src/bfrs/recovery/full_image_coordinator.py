@@ -35,6 +35,7 @@ from bfrs.recovery.metadata_less_fragments import (
 from bfrs.recovery.ntfs_bitcoin_artifacts import (
     NTFSBitcoinArtifactIndex,
     NTFSBitcoinArtifactLocator,
+    NTFSMFTIndexProgress,
 )
 from bfrs.recovery.ntfs_directory_index import (
     NTFSDirectoryIndexArtifactRecovery,
@@ -256,6 +257,7 @@ class FullImageRecoveryCoordinator:
         electrum_only: bool = False,
         targets: frozenset[str] | None = None,
         progress: Callable[[ScanProgress], None] | None = None,
+        ntfs_progress: Callable[[NTFSMFTIndexProgress], None] | None = None,
         electrum_progress: Callable[[int, int, float], None] | None = None,
         resume_results: Mapping[tuple[int, int], tuple[RawHit, ...]] | None = None,
         unit_complete: Callable[[tuple[int, int], tuple[RawHit, ...], int, int], None]
@@ -264,7 +266,8 @@ class FullImageRecoveryCoordinator:
         reader = ChunkReader(path, chunk_size=self._chunk_size, overlap=self._overlap)
         range_end = reader.file_size if end is None else end
         ntfs_locator = NTFSBitcoinArtifactLocator()
-        ntfs_bitcoin_artifact_index = ntfs_locator.index(reader.path)
+        ntfs_bitcoin_artifact_index = ntfs_locator.index(
+            reader.path, progress=ntfs_progress)
         if electrum_only:
             return self._scan_electrum_only(
                 reader, start, range_end, ntfs_locator,
@@ -357,7 +360,7 @@ class FullImageRecoveryCoordinator:
         electrum_raw_recovery = ElectrumRawRecoveryPipeline(
             source=reader.path,
             known_artifacts=known_electrum_artifacts_from_contexts(
-                historical_contexts
+                historical_contexts, range_start=start, range_end=range_end,
             ),
         ).run_hits(
             electrum_hits, range_start=start, range_end=range_end,
@@ -712,7 +715,8 @@ class FullImageRecoveryCoordinator:
         )
         electrum = ElectrumRawRecoveryPipeline(
             source=reader.path,
-            known_artifacts=known_electrum_artifacts_from_contexts(contexts),
+            known_artifacts=known_electrum_artifacts_from_contexts(
+                contexts, range_start=start, range_end=range_end),
         ).run_hits(
             electrum_hits, range_start=start, range_end=range_end,
             progress=electrum_progress,

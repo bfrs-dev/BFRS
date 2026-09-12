@@ -789,6 +789,9 @@ def test_cli_targets_all_reports_sparse_complete_progress(tmp_path, capsys):
     assert main(basic_arguments(source, report) + ["--targets", "all"]) == 0
 
     stderr = capsys.readouterr().err
+    assert "NTFS index records=0" in stderr
+    assert "phase=NTFS/MFT indexing  complete" in stderr
+    assert stderr.index("NTFS index") < stderr.index("Target scan")
     assert "Target scan 100.0%" in stderr
     assert "7/7 bytes" in stderr
     assert "MiB/s" in stderr

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import re
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 from bfrs.recovery.ntfs_extents import (
     NtfsMappingPairsDecoder,
@@ -39,6 +39,17 @@ FILE_DIRECTORY = 0x0002
 NAMESPACE_NAMES = {0: "posix", 1: "win32", 2: "dos", 3: "win32_dos"}
 MAX_MFT_RECORDS = 50_000_000
 MFT_MIRROR_RECORD_COUNT = 4
+MFT_PROGRESS_RECORD_INTERVAL = 1024
+
+
+@dataclass(frozen=True, slots=True)
+class NTFSMFTIndexProgress:
+    records_processed: int
+    total_records: int | None
+    bytes_processed: int
+    total_bytes: int | None
+    phase: str = "NTFS/MFT indexing"
+    complete: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,12 +406,28 @@ class NTFSBitcoinArtifactLocator:
 
     def index(
         self, source: str | Path, *, volume_offset: int | None = None,
+        progress: Callable[[NTFSMFTIndexProgress], None] | None = None,
     ) -> NTFSBitcoinArtifactIndex:
         self._stale_context = None
         path = Path(source).resolve()
+        if progress is not None:
+            progress(NTFSMFTIndexProgress(0, None, 0, None))
         with _Image(path) as image:
-            return self._index_open_image(
-                path, image, volume_offset=volume_offset)
+            result = self._index_open_image(
+                path, image, volume_offset=volume_offset, progress=progress)
+        if progress is not None:
+            total_records = (result.mft_records_scanned
+                             if result.mft_records_scanned else None)
+            total_bytes = (None if total_records is None else
+                           total_records * result.mft_record_size)
+            progress(NTFSMFTIndexProgress(
+                result.mft_records_scanned,
+                total_records,
+                result.mft_records_scanned * (result.mft_record_size or 0),
+                total_bytes,
+                complete=True,
+            ))
+        return result
 
     def _index_open_image(
         self,
@@ -408,6 +435,7 @@ class NTFSBitcoinArtifactLocator:
         image: _Image,
         *,
         volume_offset: int | None,
+        progress: Callable[[NTFSMFTIndexProgress], None] | None,
     ) -> NTFSBitcoinArtifactIndex:
         diagnostics: list[str] = []
         if volume_offset is None:
@@ -473,6 +501,9 @@ class NTFSBitcoinArtifactLocator:
             image, mft.extent_mapping.extents, safe_stream_size
         )
         record_count = safe_stream_size // boot.record_size
+        if progress is not None:
+            progress(NTFSMFTIndexProgress(
+                0, record_count, 0, record_count * boot.record_size))
         records: dict[tuple[int, int], _Record] = {}
         main_by_number: dict[int, _Record] = {}
         mirror_expected = MFT_MIRROR_RECORD_COUNT
@@ -506,12 +537,30 @@ class NTFSBitcoinArtifactLocator:
                 )
                 if len(diagnostics) < 200:
                     diagnostics.append(f"mft_record_invalid:{number}:{error}")
+                if (progress is not None
+                        and scanned % MFT_PROGRESS_RECORD_INTERVAL == 0
+                        and scanned < record_count):
+                    progress(NTFSMFTIndexProgress(
+                        scanned,
+                        record_count,
+                        scanned * boot.record_size,
+                        record_count * boot.record_size,
+                    ))
                 continue
             valid += 1
             allocated += int(record.allocated)
             deleted += int(not record.allocated)
             records[(number, record.sequence)] = record
             main_by_number[number] = record
+            if (progress is not None
+                    and scanned % MFT_PROGRESS_RECORD_INTERVAL == 0
+                    and scanned < record_count):
+                progress(NTFSMFTIndexProgress(
+                    scanned,
+                    record_count,
+                    scanned * boot.record_size,
+                    record_count * boot.record_size,
+                ))
 
         recovery_diagnostic = self._build_mft_recovery_diagnostic(
             path=path,

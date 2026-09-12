@@ -266,6 +266,119 @@ def test_resident_electrum_json_is_active_current_duplicate(tmp_path):
     assert provenance["logical_size"] == len(_plaintext())
 
 
+def _known_artifact_context(*, extent_start, extent_end, record_offset=9000):
+    extent = SimpleNamespace(
+        vcn_start=0,
+        sparse=False,
+        physical_byte_start=extent_start,
+        physical_byte_end=extent_end,
+    )
+    data = SimpleNamespace(
+        resident=False,
+        logical_size=extent_end - extent_start,
+        extents=(extent,),
+        resident_value_offset=None,
+    )
+    alias = SimpleNamespace(
+        filename="default_wallet",
+        parent_mft_record_number=4,
+    )
+    record = SimpleNamespace(
+        number=4,
+        allocated=True,
+        data=data,
+        aliases=(alias,),
+    )
+    return SimpleNamespace(
+        current_records_by_number={4: record},
+        source="synthetic.img",
+        boot=SimpleNamespace(volume_offset=0),
+        physical_offset_for_mft_record=lambda number: record_offset,
+    )
+
+
+@pytest.mark.parametrize(
+    "extent_start,extent_end,range_start,range_end,expected",
+    (
+        (100, 200, 0, 1000, True),
+        (100, 200, 120, 180, True),
+        (100, 200, 150, 250, True),
+        (100, 200, 50, 150, True),
+        (100, 200, 200, 300, False),
+        (100, 200, 0, 100, False),
+        (300, 400, 0, 100, False),
+    ),
+)
+def test_known_ntfs_artifact_admission_uses_half_open_data_extent_range(
+        extent_start, extent_end, range_start, range_end, expected):
+    context = _known_artifact_context(
+        extent_start=extent_start,
+        extent_end=extent_end,
+        record_offset=9000,
+    )
+
+    artifacts = known_electrum_artifacts_from_contexts(
+        (context,), range_start=range_start, range_end=range_end)
+
+    assert bool(artifacts) is expected
+
+
+def test_global_mft_record_outside_range_does_not_hide_extent_inside_range():
+    context = _known_artifact_context(
+        extent_start=100,
+        extent_end=200,
+        record_offset=9000,
+    )
+    artifacts = known_electrum_artifacts_from_contexts(
+        (context,), range_start=120, range_end=180)
+    assert len(artifacts) == 1
+    assert artifacts[0].physical_mft_record_offset == 9000
+
+
+def test_mft_record_inside_range_does_not_admit_extent_outside_range():
+    context = _known_artifact_context(
+        extent_start=300,
+        extent_end=400,
+        record_offset=50,
+    )
+    assert known_electrum_artifacts_from_contexts(
+        (context,), range_start=0, range_end=100) == ()
+
+
+def test_known_artifact_without_explicit_range_preserves_full_scan_behavior():
+    context = _known_artifact_context(extent_start=300, extent_end=400)
+    assert len(known_electrum_artifacts_from_contexts((context,))) == 1
+
+
+def test_resident_artifact_outside_range_avoids_secondary_record_read():
+    reads = []
+    data = SimpleNamespace(
+        resident=True,
+        logical_size=32,
+        extents=(),
+        resident_value_offset=128,
+    )
+    alias = SimpleNamespace(
+        filename="default_wallet",
+        parent_mft_record_number=4,
+    )
+    record = SimpleNamespace(
+        number=4, allocated=True, data=data, aliases=(alias,))
+    context = SimpleNamespace(
+        current_records_by_number={4: record},
+        source="synthetic.img",
+        boot=SimpleNamespace(volume_offset=0),
+        physical_offset_for_mft_record=lambda number: 50,
+        read_resident_unnamed_data=lambda number: reads.append(number),
+    )
+
+    artifacts = known_electrum_artifacts_from_contexts(
+        (context,), range_start=0, range_end=100)
+
+    assert artifacts == ()
+    assert reads == []
+
+
 @pytest.mark.parametrize("magic", (b"BIE1", b"BIE2"))
 def test_resident_bie_containers_are_targeted_and_correlated(tmp_path, magic):
     path, context = _resident_context(tmp_path, _encrypted(magic))

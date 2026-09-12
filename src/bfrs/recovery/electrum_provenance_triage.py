@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Iterable
 
+from bfrs.core.ranges import intersects
 from bfrs.recovery.electrum_raw_recovery import (
     ElectrumCandidateAssembler,
     KnownElectrumArtifact,
@@ -242,8 +243,9 @@ def extent_matches(context: NTFSStaleRecoveryContext, target: TargetRange,
             if (extent.sparse or extent.physical_byte_start is None
                     or extent.physical_byte_end is None):
                 continue
-            if (extent.physical_byte_start < target.physical_end
-                    and target.physical_start < extent.physical_byte_end):
+            if intersects(
+                    target.physical_start, target.physical_end,
+                    extent.physical_byte_start, extent.physical_byte_end):
                 matches.append(_record_match(
                     context, record, extent, target, stale=not active,
                 ))

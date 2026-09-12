@@ -10,6 +10,7 @@ from typing import Sequence
 from bfrs.core.path_safety import paths_refer_to_same_file
 from bfrs.core.worker_control import WorkerControlError
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
+from bfrs.recovery.ntfs_bitcoin_artifacts import NTFSMFTIndexProgress
 from bfrs.recovery.mnemonic.mnemonic_recovery_pipeline import MnemonicRecoveryPipeline
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import resolve_worker_count
 from bfrs.recovery.mnemonic.seed_scan_checkpoint import (
@@ -165,6 +166,38 @@ class _ProgressLine:
             flush=True,
         )
         self._rendered = True
+
+    def finish(self) -> None:
+        if self._rendered:
+            print(file=sys.stderr)
+            self._rendered = False
+
+
+class _NTFSProgressLine:
+    """Render the independent global NTFS metadata pre-pass."""
+
+    def __init__(self) -> None:
+        self._rendered = False
+
+    def __call__(self, update: NTFSMFTIndexProgress) -> None:
+        if update.total_records is None:
+            progress = "records=" + str(update.records_processed)
+        else:
+            percent = (100.0 if update.total_records == 0 else
+                       min(100.0, update.records_processed * 100.0
+                           / update.total_records))
+            progress = (
+                f"{percent:5.1f}%  records={update.records_processed}/"
+                f"{update.total_records}"
+            )
+        status = "  complete" if update.complete else ""
+        print(
+            f"\rNTFS index {progress}  phase={update.phase}{status}",
+            end="\n" if update.complete else "",
+            file=sys.stderr,
+            flush=True,
+        )
+        self._rendered = not update.complete
 
     def finish(self) -> None:
         if self._rendered:
@@ -558,6 +591,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, UnifiedCheckpointError) as error:
         print(f"checkpoint error: {error}", file=sys.stderr)
         return 3
+    ntfs_progress = _NTFSProgressLine()
     scan_progress = _ProgressLine("Target scan", targets=selection.targets)
     electrum_progress = _ElectrumProgressLine()
     try:
@@ -568,6 +602,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             electrum_only=arguments.electrum_only,
             targets=selection.targets,
             progress=scan_progress,
+            ntfs_progress=ntfs_progress,
             electrum_progress=electrum_progress,
             resume_results=(unified_checkpoint.completed_results
                             if unified_checkpoint else None),
@@ -577,19 +612,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         if unified_checkpoint is not None:
             unified_checkpoint.save(force=True)
+        ntfs_progress.finish()
         scan_progress.finish()
         print("scan interrupted by user", file=sys.stderr)
         return 130
     except WorkerControlError as error:
         if unified_checkpoint is not None:
             unified_checkpoint.save(force=True)
+        ntfs_progress.finish()
         scan_progress.finish()
         print(f"worker error: {error}", file=sys.stderr)
         return 3
     except OSError as error:
+        ntfs_progress.finish()
         scan_progress.finish()
         print(f"input error: {error}", file=sys.stderr)
         return 3
+    ntfs_progress.finish()
     scan_progress.finish()
     if unified_checkpoint is not None:
         unified_checkpoint.mark_complete()

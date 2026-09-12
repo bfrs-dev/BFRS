@@ -215,3 +215,66 @@ def test_index_result_matches_legacy_per_read_open_model(tmp_path, monkeypatch):
     assert after == before
     assert len(handles) == 1
     assert handles[0].closed is True
+
+
+def test_index_progress_is_optional_monotonic_and_result_neutral(tmp_path):
+    path = _synthetic_image(tmp_path)
+    updates = []
+
+    baseline = NTFSBitcoinArtifactLocator().index(path)
+    observed = NTFSBitcoinArtifactLocator().index(path, progress=updates.append)
+
+    assert observed == baseline
+    assert updates[0].records_processed == 0
+    assert [item.records_processed for item in updates] == sorted(
+        item.records_processed for item in updates)
+    assert updates[-1].complete is True
+    assert updates[-1].records_processed == observed.mft_records_scanned
+    assert updates[-1].total_records == observed.mft_records_scanned
+    assert updates[-1].bytes_processed == (
+        observed.mft_records_scanned * observed.mft_record_size)
+    assert all(item.phase == "NTFS/MFT indexing" for item in updates)
+
+
+def test_index_progress_is_batched_by_record_interval(tmp_path, monkeypatch):
+    path = _synthetic_image(tmp_path)
+    updates = []
+    monkeypatch.setattr(ntfs_module, "MFT_PROGRESS_RECORD_INTERVAL", 2)
+
+    NTFSBitcoinArtifactLocator().index(path, progress=updates.append)
+
+    intermediate = [item.records_processed for item in updates
+                    if not item.complete and item.records_processed]
+    assert intermediate == [2, 4, 6]
+
+
+def test_index_progress_exception_never_reports_false_completion(
+        tmp_path, monkeypatch):
+    path = _synthetic_image(tmp_path)
+    updates = []
+    locator = NTFSBitcoinArtifactLocator()
+    monkeypatch.setattr(
+        locator,
+        "_discover",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("synthetic indexing exception")),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic indexing exception"):
+        locator.index(path, progress=updates.append)
+
+    assert updates
+    assert not any(item.complete for item in updates)
+
+
+def test_non_ntfs_progress_finishes_without_inventing_total(tmp_path):
+    path = tmp_path / "not-ntfs.bin"
+    path.write_bytes(b"not an NTFS image")
+    updates = []
+
+    result = NTFSBitcoinArtifactLocator().index(path, progress=updates.append)
+
+    assert result.volume_offset is None
+    assert updates[-1].complete is True
+    assert updates[-1].records_processed == 0
+    assert updates[-1].total_records is None

@@ -13,6 +13,7 @@ import time
 from typing import Any, BinaryIO, Callable, Iterable, Protocol
 
 from bfrs.core.models import RawHit
+from bfrs.core.ranges import intersects
 from bfrs.recovery.ntfs_mft_data import NtfsMftRecordError
 from bfrs.recovery.electrum_legacy_recovery import (
     ElectrumLegacyCandidateAssembler,
@@ -997,7 +998,17 @@ def replace_candidate(candidate: ElectrumRawCandidate, *,
     )
 
 
-def known_electrum_artifacts_from_contexts(contexts) -> tuple[KnownElectrumArtifact, ...]:
+def known_electrum_artifacts_from_contexts(
+    contexts, *, range_start: int = 0, range_end: int | None = None,
+) -> tuple[KnownElectrumArtifact, ...]:
+    """Return artifacts whose physical data intersects the requested range.
+
+    MFT records remain globally discoverable.  When ``range_end`` is supplied,
+    only resident data or nonresident extents intersecting the half-open scan
+    range are admitted for correlation and follow-up recovery.
+    """
+    if range_start < 0 or (range_end is not None and range_end < range_start):
+        raise ValueError("invalid known-artifact range")
     output = []
     for context in contexts:
         records = context.current_records_by_number
@@ -1017,6 +1028,35 @@ def known_electrum_artifacts_from_contexts(contexts) -> tuple[KnownElectrumArtif
             resident = None
             resident_failure = None
             physical_mft_offset = context.physical_offset_for_mft_record(record.number)
+            if range_end is not None:
+                if record.data.resident:
+                    value_offset = record.data.resident_value_offset
+                    admitted = (
+                        physical_mft_offset is not None
+                        and value_offset is not None
+                        and intersects(
+                            range_start,
+                            range_end,
+                            physical_mft_offset + value_offset,
+                            physical_mft_offset + value_offset
+                            + record.data.logical_size,
+                        )
+                    )
+                else:
+                    admitted = any(
+                        not extent.sparse
+                        and extent.physical_byte_start is not None
+                        and extent.physical_byte_end is not None
+                        and intersects(
+                            range_start,
+                            range_end,
+                            extent.physical_byte_start,
+                            extent.physical_byte_end,
+                        )
+                        for extent in record.data.extents
+                    )
+                if not admitted:
+                    continue
             if record.data.resident:
                 try:
                     resident = context.read_resident_unnamed_data(record.number)
