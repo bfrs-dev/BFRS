@@ -143,7 +143,19 @@ def test_armory_boundary_duplicate_suppression_and_paper_routing(tmp_path):
     assert wallet[0].start_offset == len(prefix)
     paper = _scan(tmp_path, b"Armory Paper Backup", {TARGET_ARMORY})[0]
     assert paper.artifact_kind == "ARMORY_PAPER_BACKUP"
+    assert paper.structural_status == "ANCHOR_ONLY"
+    assert paper.validation_status == "UNVALIDATED"
     assert paper.recommended_recovery_action == "DOCUMENT_RECOVERY"
+
+
+def test_openssl_salted_prefix_alone_is_discovery_only(tmp_path):
+    salted = _scan(tmp_path, b"Salted__" + b"ordinary payload", {
+        TARGET_MULTIBIT
+    })[0]
+
+    assert salted.structural_status == "REJECTED"
+    assert salted.validation_status == "INSUFFICIENT_ENCRYPTED_STRUCTURE"
+    assert salted.recommended_recovery_action == "REVIEW_CONTEXT"
 
 
 def test_one_shared_chunk_iteration_returns_all_wallet_families(tmp_path):

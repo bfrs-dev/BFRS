@@ -3,6 +3,7 @@
 from collections.abc import Iterable
 
 from bfrs.core.models import Hotspot, RawHit
+from bfrs.validators.evidence_strength import classify_raw_hit
 
 
 DEFAULT_CLUSTER_GAP = 2 * 1024 * 1024
@@ -68,6 +69,7 @@ class HotspotBuilder:
             max(hit.end_offset for hit in cluster) + self.padding,
         )
 
+        signals = tuple(classify_raw_hit(hit) for hit in cluster)
         return Hotspot(
             start_offset=start_offset,
             end_offset=end_offset,
@@ -77,5 +79,16 @@ class HotspotBuilder:
                 "hit_count": len(cluster),
                 "hit_types": tuple(hit.hit_type for hit in cluster),
                 "hit_offsets": tuple(hit.start_offset for hit in cluster),
+                "hit_targets": tuple(hit.target for hit in cluster),
+                "hit_artifact_kinds": tuple(hit.artifact_kind for hit in cluster),
+                "hit_structural_statuses": tuple(
+                    hit.structural_status for hit in cluster
+                ),
+                "hit_validation_statuses": tuple(
+                    hit.validation_status for hit in cluster
+                ),
+                "hit_evidence_strengths": tuple(
+                    signal.strength.name for signal in signals
+                ),
             },
         )

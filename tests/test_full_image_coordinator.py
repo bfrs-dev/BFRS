@@ -316,6 +316,34 @@ def test_false_raw_hits_do_not_elevate_status(tmp_path):
     assert not result.reconstructed_databases
 
 
+@pytest.mark.parametrize(
+    "noise",
+    (
+        b"random bytes before" + BTREE_MAGIC.to_bytes(4, "little") + b"after",
+        b"documentation prefix \x04mkey without a Berkeley record",
+        b"documentation prefix \x07keymeta without a Berkeley record",
+        (b"\x04mkey noise " * 20),
+    ),
+)
+def test_targeted_weak_bitcoin_noise_is_discovered_but_not_admitted(
+    tmp_path, noise
+):
+    path = tmp_path / "weak-bitcoin-noise.img"
+    path.write_bytes(noise)
+    result = FullImageRecoveryCoordinator(
+        BITCOIN_CORE_SIGNATURES_V1,
+        CandidatePolicy(min_hits=1, min_distinct_types=1),
+        chunk_size=256,
+        cluster_gap=2048,
+        hotspot_padding=128,
+    ).scan(path)
+
+    assert result.raw_hit_count >= 1
+    assert result.hotspot_count >= 1
+    assert result.accepted_hotspot_count == 0
+    assert result.target_findings
+
+
 def test_rejected_metadata_near_independent_valid_leaf_recovers_fragment(tmp_path):
     invalid_metadata = bytearray(PAGE_SIZE)
     invalid_metadata[12:16] = BTREE_MAGIC.to_bytes(4, "little")

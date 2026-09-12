@@ -23,6 +23,10 @@ from bfrs.recovery.ntfs_bitcoin_artifacts import NTFSBitcoinArtifactLocator
 from bfrs.recovery.ntfs_mft_data import NtfsMftRecordError
 from bfrs.reporting.json_report import _electrum_raw_recovery
 from bfrs.scanners.fast_scanner import FastScanner, Signature
+from bfrs.scanners.target_registry import (
+    TARGET_ELECTRUM,
+    build_target_selection,
+)
 from tests.test_ntfs_bitcoin_artifacts import (
     data_resident,
     file_record,
@@ -880,6 +884,105 @@ def test_no_anchors_performs_zero_secondary_reads(tmp_path):
 
     assert reader.calls == []
     assert result.anchors_found == 0
+
+
+def _targeted_hit(offset, hit_type, *, structural="ANCHOR_ONLY",
+                  validation="UNVALIDATED"):
+    return RawHit(
+        offset, offset + 6, hit_type, 0.0, "synthetic", {},
+        target=TARGET_ELECTRUM,
+        artifact_kind="electrum_wallet_anchor",
+        structural_status=structural,
+        validation_status=validation,
+    )
+
+
+def test_targeted_single_and_duplicate_weak_anchors_skip_secondary_reads(tmp_path):
+    path = _sized_source(tmp_path, 4096)
+    reader = _CountingRangeReader(b"BIE1 documentation" + b"\0" * 4078)
+    hits = tuple(
+        _targeted_hit(index * 16, "electrum_bie1_raw_anchor")
+        for index in range(10)
+    )
+
+    result = ElectrumRawRecoveryPipeline(
+        source=path, range_reader=reader
+    ).run_hits(hits)
+
+    assert result.anchors_found == 10
+    assert result.candidates_total == 0
+    assert result.failures == ("ELECTRUM_WEAK_ANCHOR_NOT_ADMITTED",)
+    assert reader.calls == []
+
+
+def test_distinct_electrum_documentation_anchors_are_parsed_but_rejected(tmp_path):
+    data = b"documentation mentions BIE1 and BIE2 without a wallet"
+    path = tmp_path / "electrum-documentation.bin"
+    path.write_bytes(data)
+    reader = _CountingRangeReader(data)
+    hits = (
+        _targeted_hit(data.index(b"BIE1"), "electrum_bie1_raw_anchor"),
+        _targeted_hit(data.index(b"BIE2"), "electrum_bie2_raw_anchor"),
+    )
+
+    result = ElectrumRawRecoveryPipeline(
+        source=path, range_reader=reader
+    ).run_hits(hits)
+
+    assert result.anchors_found == 2
+    assert result.candidates_total == 0
+    assert len(reader.calls) == 1
+
+
+def test_correlated_electrum_scanner_evidence_admits_recovery(tmp_path):
+    wallet = _plaintext()
+    path = tmp_path / "structural-electrum.bin"
+    path.write_bytes(wallet)
+    selection = build_target_selection(
+        frozenset({TARGET_ELECTRUM}), include_mnemonics=False
+    )
+    hits = tuple(FastScanner(selection.signatures).scan(
+        ChunkReader(path, chunk_size=4096, overlap=64)
+    ))
+    electrum_hits = tuple(
+        item for item in hits if item.target == TARGET_ELECTRUM
+    )
+
+    assert {
+        "electrum_seed_version_anchor",
+        "electrum_wallet_type_anchor",
+        "electrum_keystore_anchor",
+    } <= {item.hit_type for item in electrum_hits}
+    assert all(
+        item.validation_status == "UNVALIDATED"
+        for item in electrum_hits
+        if item.hit_type in {
+            "electrum_seed_version_anchor",
+            "electrum_wallet_type_anchor",
+            "electrum_keystore_anchor",
+        }
+    )
+    result = ElectrumRawRecoveryPipeline(source=path).run_hits(electrum_hits)
+    assert result.complete_candidates == 1
+
+
+def test_structural_encrypted_electrum_evidence_admits_singly(tmp_path):
+    wallet = _encrypted()
+    path = tmp_path / "structural-encrypted-electrum.bin"
+    path.write_bytes(wallet)
+    selection = build_target_selection(
+        frozenset({TARGET_ELECTRUM}), include_mnemonics=False
+    )
+    hit = next(
+        item for item in FastScanner(selection.signatures).scan(
+            ChunkReader(path, chunk_size=4096, overlap=64)
+        )
+        if item.hit_type == ELECTRUM_BIE1_BASE64_SIGNATURE
+    )
+
+    assert hit.validation_status == "ELECTRUM_CONTAINER_STRUCTURAL_VALID"
+    result = ElectrumRawRecoveryPipeline(source=path).run_hits((hit,))
+    assert result.complete_candidates == 1
 
 
 def test_short_merged_read_matches_per_anchor_eof_slices(tmp_path):

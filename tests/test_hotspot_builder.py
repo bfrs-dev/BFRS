@@ -73,6 +73,17 @@ def test_unsorted_hits_produce_deterministic_evidence() -> None:
         "hit_count": 3,
         "hit_types": ("alpha", "second", "third"),
         "hit_offsets": (10, 20, 30),
+        "hit_targets": ("unknown", "unknown", "unknown"),
+        "hit_artifact_kinds": ("unknown", "unknown", "unknown"),
+        "hit_structural_statuses": (
+            "UNVALIDATED", "UNVALIDATED", "UNVALIDATED"
+        ),
+        "hit_validation_statuses": (
+            "UNVALIDATED", "UNVALIDATED", "UNVALIDATED"
+        ),
+        "hit_evidence_strengths": (
+            "CORROBORATING", "CORROBORATING", "CORROBORATING"
+        ),
     }
 
 

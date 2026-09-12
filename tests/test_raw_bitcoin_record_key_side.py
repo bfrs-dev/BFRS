@@ -179,8 +179,8 @@ def test_rejected_key_hit_does_not_reenter_downstream_with_nearby_signal(
     ).scan(source)
 
     assert result.raw_hit_count == 2
-    assert result.accepted_hotspot_count == 1
-    # Only mkey reaches the downstream orphan diagnostic.  The rejected key
-    # remains visible solely in raw accounting and target findings.
-    assert result.orphan_record_key_diagnostic.raw_strong_hit_count == 1
+    assert result.accepted_hotspot_count == 0
+    # Neither the rejected key nor an unstructured lone mkey marker reaches
+    # downstream recovery; both remain visible in discovery accounting.
+    assert result.orphan_record_key_diagnostic.raw_strong_hit_count == 0
     assert result.orphan_record_key_diagnostic.valid_key_count == 0

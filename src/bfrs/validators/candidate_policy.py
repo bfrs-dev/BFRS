@@ -4,6 +4,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from bfrs.core.models import Hotspot
+from bfrs.validators.evidence_strength import EvidenceStrength
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,11 +55,30 @@ class CandidatePolicy:
         distinct_types = tuple(sorted(set(hit_types)))
         signal_span = max(hit_offsets) - min(hit_offsets) if hit_offsets else 0
 
+        target_aware = self._target_aware_evidence(hotspot, hit_types)
+        strongest = max(
+            (item[3] for item in target_aware),
+            default=EvidenceStrength.WEAK,
+        )
+        independent_by_target: dict[str, set[tuple[str, str]]] = {}
+        for target, artifact_kind, hit_type, _ in target_aware:
+            independent_by_target.setdefault(target, set()).add(
+                (artifact_kind, hit_type)
+            )
+        correlated_target = any(
+            len(identities) >= 2
+            for target, identities in independent_by_target.items()
+            if target != "unknown"
+        )
+
         reasons: list[str] = []
-        if hit_count < self.min_hits:
+        strong_single = strongest >= EvidenceStrength.STRONG
+        if hit_count < self.min_hits and not strong_single:
             reasons.append("insufficient_hits")
-        if len(distinct_types) < self.min_distinct_types:
+        if len(distinct_types) < self.min_distinct_types and not strong_single:
             reasons.append("insufficient_distinct_types")
+        if target_aware and not strong_single and not correlated_target:
+            reasons.append("weak_evidence_requires_independent_corroboration")
         if any(group.isdisjoint(distinct_types) for group in self.required_groups):
             reasons.append("missing_required_group")
         if self.max_signal_span is not None and signal_span > self.max_signal_span:
@@ -71,6 +91,46 @@ class CandidatePolicy:
             distinct_types=distinct_types,
             signal_span=signal_span,
         )
+
+    @staticmethod
+    def _target_aware_evidence(
+        hotspot: Hotspot,
+        hit_types: tuple[str, ...],
+    ) -> tuple[tuple[str, str, str, EvidenceStrength], ...]:
+        evidence = hotspot.evidence
+        keys = (
+            "hit_targets",
+            "hit_artifact_kinds",
+            "hit_evidence_strengths",
+        )
+        if not any(key in evidence for key in keys):
+            return ()
+        if not all(key in evidence for key in keys):
+            raise ValueError("target-aware evidence fields must be complete")
+        targets = evidence["hit_targets"]
+        artifact_kinds = evidence["hit_artifact_kinds"]
+        strengths = evidence["hit_evidence_strengths"]
+        for name, values in (
+            ("hit_targets", targets),
+            ("hit_artifact_kinds", artifact_kinds),
+            ("hit_evidence_strengths", strengths),
+        ):
+            if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+                raise ValueError(f"evidence {name} must be a sequence")
+            if len(values) != len(hit_types):
+                raise ValueError(f"evidence {name} count does not match hits")
+            if any(not isinstance(value, str) or not value for value in values):
+                raise ValueError(f"evidence {name} values must be non-empty strings")
+        try:
+            normalized_strengths = tuple(EvidenceStrength[name] for name in strengths)
+        except KeyError as error:
+            raise ValueError("unknown evidence strength") from error
+        if all(target == "unknown" for target in targets):
+            return ()
+        return tuple(zip(
+            tuple(targets), tuple(artifact_kinds), hit_types,
+            normalized_strengths, strict=True,
+        ))
 
     @staticmethod
     def _validated_evidence(

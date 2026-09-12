@@ -19,6 +19,7 @@ from bfrs.recovery.electrum_legacy_recovery import (
     ElectrumLegacyCandidateAssembler,
     LEGACY_ELECTRUM_SIGNATURE_PATTERNS,
 )
+from bfrs.validators.evidence_strength import EvidenceStrength, classify_raw_hit
 
 
 ELECTRUM_BIE1_BASE64_SIGNATURE = "electrum_bie1_base64_anchor"
@@ -664,6 +665,38 @@ class ElectrumRawRecoveryPipeline:
         self.assembler = ElectrumCandidateAssembler()
 
     @staticmethod
+    def _admitted_hits(hits: tuple[RawHit, ...]) -> tuple[RawHit, ...]:
+        """Retain parser-confirmed singles and correlated weak anchor types."""
+        admitted: set[int] = set()
+        weak: list[tuple[int, RawHit]] = []
+        for index, hit in enumerate(hits):
+            if hit.target == "unknown":
+                admitted.add(index)
+                continue
+            signal = classify_raw_hit(hit)
+            if signal.strength >= EvidenceStrength.CORROBORATING:
+                admitted.add(index)
+            else:
+                weak.append((index, hit))
+
+        ordered = sorted(weak, key=lambda item: (
+            item[1].start_offset, item[1].end_offset, item[1].hit_type, item[0]
+        ))
+        clusters: list[list[tuple[int, RawHit]]] = []
+        for item in ordered:
+            if not clusters or (
+                item[1].start_offset - clusters[-1][-1][1].start_offset
+                > MAX_SCANNER_CANDIDATE_WINDOW
+            ):
+                clusters.append([item])
+            else:
+                clusters[-1].append(item)
+        for cluster in clusters:
+            if len({hit.hit_type for _, hit in cluster}) >= 2:
+                admitted.update(index for index, _ in cluster)
+        return tuple(hit for index, hit in enumerate(hits) if index in admitted)
+
+    @staticmethod
     def _anchor_windows(
         hits: tuple[RawHit, ...], *, range_start: int, range_end: int,
     ) -> tuple[_AnchorWindow, ...]:
@@ -717,12 +750,14 @@ class ElectrumRawRecoveryPipeline:
                  progress_interval: float = 0.5,
                  progress_hit_interval: int = 32) -> ElectrumRawRecovery:
         relevant = tuple(hit for hit in hits if hit.hit_type in ELECTRUM_SIGNATURE_NAMES)
+        admitted = self._admitted_hits(relevant)
         end = self.path.stat().st_size if range_end is None else range_end
         windows = self._anchor_windows(
-            relevant, range_start=range_start, range_end=end)
+            admitted, range_start=range_start, range_end=end)
         batches = self._merged_read_windows(windows)
         found: dict[tuple[int, int, str], ElectrumRawCandidate] = {}
-        failures = []
+        failures = ([] if len(admitted) == len(relevant) else
+                    ["ELECTRUM_WEAK_ANCHOR_NOT_ADMITTED"])
         legacy_names = {name for name, _ in LEGACY_ELECTRUM_SIGNATURE_PATTERNS}
         total = len(relevant)
         started = time.monotonic()
@@ -732,7 +767,7 @@ class ElectrumRawRecoveryPipeline:
 
         def process(reader: PhysicalRangeReader) -> None:
             nonlocal last_progress
-            completed = 0
+            completed = len(relevant) - len(admitted)
             for batch in batches:
                 try:
                     merged_data = reader.read_at(
@@ -779,6 +814,8 @@ class ElectrumRawRecoveryPipeline:
         elif batches:
             with self.path.open("rb") as image:
                 process(_OpenImageRangeReader(image))
+        elif progress is not None and total:
+            progress(total, total, time.monotonic() - started)
         return self._result(
             len(relevant), tuple(found.values()), failures,
             legacy_anchor_hits=sum(hit.hit_type in legacy_names for hit in relevant),

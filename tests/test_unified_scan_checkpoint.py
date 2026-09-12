@@ -117,6 +117,19 @@ def test_changed_scanner_semantics_version_is_rejected(tmp_path) -> None:
         )
 
 
+def test_pre_p1_5_scanner_semantics_checkpoint_is_rejected(tmp_path) -> None:
+    source, checkpoint = _create(
+        tmp_path,
+        _identity(semantics_version=UNIFIED_SCANNER_SEMANTICS_VERSION - 1),
+    )
+
+    with pytest.raises(
+        UnifiedCheckpointError,
+        match="scanner semantic mismatch: scanner semantics version differs",
+    ):
+        _resume(checkpoint, source)
+
+
 def test_changed_mnemonic_enablement_is_rejected(tmp_path) -> None:
     source, checkpoint = _create(tmp_path)
 

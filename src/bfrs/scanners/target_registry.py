@@ -12,7 +12,14 @@ from bfrs.core.chunk_reader import Chunk
 from bfrs.core.models import RawHit
 from bfrs.core.secp256k1 import GROUP_ORDER
 from bfrs.core.worker_control import abort_executor, submit_process_future
-from bfrs.recovery.electrum_raw_recovery import ELECTRUM_SIGNATURE_PATTERNS
+from bfrs.recovery.electrum_raw_recovery import (
+    BASE64_BYTES,
+    ELECTRUM_SIGNATURE_PATTERNS,
+    MAX_BACKWARD_CONTEXT,
+    MAX_SCANNER_CANDIDATE_WINDOW,
+    ElectrumCandidateAssembler,
+    ElectrumStructuralValidator,
+)
 from bfrs.recovery.metadata_less_fragments import FRAMED_BITCOIN_RECORD_PATTERNS
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import RawMnemonicScanner
 from bfrs.recovery.ntfs_detached_volume import (
@@ -33,7 +40,13 @@ from bfrs.recovery.orphan_private_key_der import (
 )
 from bfrs.scanners.bitcoin_context import BitcoinTextContextChunkDetector
 from bfrs.scanners.fast_scanner import ChunkDetector, Signature, SignatureAssessment
-from bfrs.validators.berkeley_metadata import BTREE_MAGIC
+from bfrs.validators.base import ValidationContext
+from bfrs.validators.berkeley_metadata import (
+    BTREE_MAGIC,
+    MAGIC_OFFSET,
+    MAX_PAGE_SIZE,
+    BerkeleyMetadataValidator,
+)
 from bfrs.validators.bitcoin_encoding import decode_base58check
 
 
@@ -129,6 +142,125 @@ def _scan_mnemonic_branch(
 def _bounded(chunk: Chunk, local_offset: int, before: int = 512,
              after: int = 4096) -> bytes:
     return chunk.data[max(0, local_offset - before):local_offset + after]
+
+
+def _berkeley_metadata_assessment(
+    signature: Signature,
+    chunk: Chunk,
+    local_offset: int,
+) -> SignatureAssessment:
+    page_start = local_offset - MAGIC_OFFSET
+    if page_start < 0:
+        return SignatureAssessment()
+    data = chunk.data[page_start:page_start + MAX_PAGE_SIZE]
+    validation = BerkeleyMetadataValidator().validate(ValidationContext(
+        "chunk", chunk.offset + page_start, data
+    ))
+    if validation.status.value == "structural":
+        return SignatureAssessment(
+            0.95,
+            "STRUCTURAL",
+            "BERKELEY_METADATA_STRUCTURAL_VALID",
+            ("BERKELEY_METADATA_PAGE_CONFIRMED",),
+            ("BERKELEY_METADATA_FIELDS",),
+            {
+                "byte_order": validation.evidence.get("byte_order"),
+                "page_size": validation.evidence.get("page_size"),
+            },
+            "BITCOIN_WALLET_RECOVERY",
+        )
+    return SignatureAssessment(
+        0.20 if validation.status.value == "fragment" else 0.05,
+        "FRAGMENT" if validation.status.value == "fragment" else "ANCHOR_ONLY",
+        "BERKELEY_METADATA_FRAGMENT" if validation.status.value == "fragment"
+        else "UNVALIDATED",
+        tuple(validation.evidence.get("reasons", ())),
+    )
+
+
+def _electrum_anchor_assessment(
+    signature: Signature,
+    chunk: Chunk,
+    local_offset: int,
+) -> SignatureAssessment:
+    # Common JSON and raw-magic anchors are intentionally cheap discovery
+    # evidence.  Their independent co-occurrence is evaluated before recovery.
+    if signature.name.endswith((
+        "seed_version_anchor",
+        "wallet_type_anchor",
+        "keystore_anchor",
+        "bie1_raw_anchor",
+        "bie2_raw_anchor",
+    )):
+        return SignatureAssessment()
+    if "base64_anchor" in signature.name:
+        token_end = local_offset
+        limit = min(
+            len(chunk.data), local_offset + MAX_SCANNER_CANDIDATE_WINDOW
+        )
+        while token_end < limit and chunk.data[token_end] in BASE64_BYTES:
+            token_end += 1
+        candidate = ElectrumStructuralValidator().validate_encrypted(
+            chunk.data[local_offset:token_end],
+            source="chunk",
+            physical_start=chunk.offset + local_offset,
+            anchors=(signature.name,),
+        )
+        if candidate is None:
+            return SignatureAssessment()
+        return SignatureAssessment(
+            0.95,
+            "STRUCTURAL",
+            "ELECTRUM_CONTAINER_STRUCTURAL_VALID",
+            tuple(candidate.reason_codes),
+            ("ELECTRUM_PARSER_VALID",),
+            {
+                "serialization_type": candidate.serialization_type,
+                "encryption_state": candidate.encryption_state,
+            },
+            "ELECTRUM_WALLET_RECOVERY",
+        )
+    window_start = max(0, local_offset - MAX_BACKWARD_CONTEXT)
+    data = chunk.data[
+        window_start:window_start + MAX_SCANNER_CANDIDATE_WINDOW
+    ]
+    candidates = ElectrumCandidateAssembler().analyze_bytes(
+        data,
+        source="chunk",
+        physical_start=chunk.offset + window_start,
+        required_anchor_offset=local_offset - window_start,
+        anchor_types=(signature.name,),
+    )
+    complete = next((
+        item for item in candidates
+        if item.completeness == "COMPLETE" and item.confidence == "HIGH"
+    ), None)
+    if complete is not None:
+        return SignatureAssessment(
+            0.95,
+            "STRUCTURAL",
+            "ELECTRUM_CONTAINER_STRUCTURAL_VALID",
+            tuple(complete.reason_codes),
+            ("ELECTRUM_PARSER_VALID",),
+            {
+                "serialization_type": complete.serialization_type,
+                "encryption_state": complete.encryption_state,
+            },
+            "ELECTRUM_WALLET_RECOVERY",
+        )
+    if candidates:
+        return SignatureAssessment(
+            0.55,
+            "FRAGMENT",
+            "ELECTRUM_CONTAINER_FRAGMENT_VALID",
+            tuple(dict.fromkeys(
+                reason for item in candidates for reason in item.reason_codes
+            )),
+            ("ELECTRUM_PARSER_FRAGMENT",),
+            {},
+            "ELECTRUM_FRAGMENT_RECOVERY",
+        )
+    return SignatureAssessment()
 
 
 def _protobuf_network_framed(data: bytes, offset: int) -> bool:
@@ -399,9 +531,9 @@ def _armory_assessment(signature: Signature, chunk: Chunk,
 def _armory_paper_assessment(signature: Signature, chunk: Chunk,
                              local_offset: int) -> SignatureAssessment:
     return SignatureAssessment(
-        0.55, "FRAGMENT", "PAPER_BACKUP_MARKER",
-        ("ARMORY_PAPER_BACKUP_MARKER",), ("DOCUMENT_MARKER",),
-        {"route": "DOCUMENT_RECOVERY"}, "DOCUMENT_RECOVERY")
+        0.05, "ANCHOR_ONLY", "UNVALIDATED",
+        ("ARMORY_PAPER_BACKUP_MARKER_ONLY",), ("DOCUMENT_MARKER",),
+        {"route": "DOCUMENT_REVIEW"}, "DOCUMENT_RECOVERY")
 
 
 class MnemonicChunkDetector:
@@ -513,9 +645,11 @@ _SHARED_NTFS_SIGNATURES = (
 
 _BITCOIN_TARGET_SIGNATURES = (
     Signature("berkeley_metadata_little_endian", BTREE_MAGIC.to_bytes(4, "little"),
-              "berkeley_metadata", TARGET_BITCOIN_CORE, "berkeley_metadata"),
+              "berkeley_metadata", TARGET_BITCOIN_CORE, "berkeley_metadata",
+              _berkeley_metadata_assessment),
     Signature("berkeley_metadata_big_endian", BTREE_MAGIC.to_bytes(4, "big"),
-              "berkeley_metadata", TARGET_BITCOIN_CORE, "berkeley_metadata"),
+              "berkeley_metadata", TARGET_BITCOIN_CORE, "berkeley_metadata",
+              _berkeley_metadata_assessment),
     *(Signature(name, pattern, "bitcoin_record", TARGET_BITCOIN_CORE,
                 "wallet_record") for name, pattern in FRAMED_BITCOIN_RECORD_PATTERNS),
 )
@@ -528,7 +662,8 @@ _SECRET_SIGNATURES = (
 
 _ELECTRUM_TARGET_SIGNATURES = (
     *(Signature(name, pattern, "electrum_raw_anchor", TARGET_ELECTRUM,
-                "electrum_wallet_anchor") for name, pattern in ELECTRUM_SIGNATURE_PATTERNS),
+                "electrum_wallet_anchor", _electrum_anchor_assessment)
+      for name, pattern in ELECTRUM_SIGNATURE_PATTERNS),
 )
 
 BITCOIN_CORE_SIGNATURES_V1 = (

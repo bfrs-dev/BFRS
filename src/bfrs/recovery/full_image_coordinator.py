@@ -29,6 +29,7 @@ from bfrs.recovery.logical_page_map import (
     LogicalPageLocation,
 )
 from bfrs.recovery.metadata_less_fragments import (
+    FRAMED_BITCOIN_RECORD_PATTERNS,
     MetadataLessBerkeleyFragmentRecovery,
     MetadataLessBerkeleyFragmentRecoveryPipeline,
 )
@@ -77,6 +78,7 @@ from bfrs.recovery.orphan_record_key_diagnostic import (
     OrphanBitcoinRecordKeyDiagnosticPipeline,
 )
 from bfrs.recovery.orphan_private_key_der import (
+    HISTORICAL_EC_PRIVATE_KEY_DER_SIGNATURE,
     OrphanHistoricalECPrivateKeyRecovery,
     OrphanHistoricalECPrivateKeyRecoveryPipeline,
 )
@@ -104,7 +106,11 @@ from bfrs.scanners.bitcoin_context import (
     BITCOIN_CONTEXT_ARTIFACT_KINDS,
     scan_bitcoin_context_for_sec_pubkeys,
 )
-from bfrs.scanners.target_registry import TARGET_ARMORY, TARGET_MULTIBIT
+from bfrs.scanners.target_registry import (
+    TARGET_ARMORY,
+    TARGET_BITCOIN_CORE,
+    TARGET_MULTIBIT,
+)
 from bfrs.scanners.hotspot_builder import (
     DEFAULT_CLUSTER_GAP,
     DEFAULT_PADDING,
@@ -370,6 +376,9 @@ class FullImageRecoveryCoordinator:
             hit for hit in recovery_hits if hit.hit_type in _RAW_KEY_SIDE_HIT_TYPES)
         hits, binary_context_findings = self._assess_raw_key_side_hits(
             reader.path, tuple(recovery_hits), range_end
+        )
+        hits = self._assess_structural_record_hits(
+            reader.path, hits, start, range_end
         )
         assessed_by_identity = {
             (hit.start_offset, hit.end_offset, hit.hit_type): hit
@@ -925,13 +934,10 @@ class FullImageRecoveryCoordinator:
         end: int,
     ) -> tuple[Hotspot, ...]:
         relative_hits = tuple(
-            RawHit(
+            replace(
+                hit,
                 start_offset=hit.start_offset - start,
                 end_offset=hit.end_offset - start,
-                hit_type=hit.hit_type,
-                confidence=hit.confidence,
-                source=hit.source,
-                evidence=hit.evidence,
             )
             for hit in hits
         )
@@ -950,6 +956,154 @@ class FullImageRecoveryCoordinator:
                 },
             )
             for item in relative_hotspots
+        )
+
+    @staticmethod
+    def _assess_structural_record_hits(
+        path: Path,
+        hits: tuple[RawHit, ...],
+        range_start: int,
+        range_end: int,
+    ) -> tuple[RawHit, ...]:
+        assessed_hits = list(hits)
+
+        class _Reader:
+            def __init__(self, stream) -> None:
+                self.stream = stream
+
+            def read_at(self, offset: int, length: int) -> bytes:
+                self.stream.seek(offset)
+                return self.stream.read(length)
+
+            def read_before(
+                self, end_offset: int, maximum_length: int, lower_bound: int
+            ) -> tuple[int, bytes]:
+                start_offset = max(lower_bound, end_offset - maximum_length)
+                return start_offset, self.read_at(
+                    start_offset, end_offset - start_offset
+                )
+
+        metadata_indices = tuple(
+            index for index, hit in enumerate(assessed_hits)
+            if hit.target == TARGET_BITCOIN_CORE
+            and hit.artifact_kind == "berkeley_metadata"
+        )
+        if metadata_indices:
+            validator = BerkeleyMetadataValidator()
+            with path.open("rb") as stream:
+                for index in metadata_indices:
+                    hit = assessed_hits[index]
+                    page_start = hit.start_offset - MAGIC_OFFSET
+                    if page_start < range_start:
+                        continue
+                    stream.seek(page_start)
+                    data = stream.read(min(MAX_PAGE_SIZE, range_end - page_start))
+                    validation = validator.validate(ValidationContext(
+                        str(path.resolve()), page_start, data
+                    ))
+                    if validation.status is ValidationStatus.STRUCTURAL:
+                        assessed_hits[index] = replace(
+                            hit,
+                            structural_status="STRUCTURAL",
+                            validation_status=(
+                                "BERKELEY_METADATA_STRUCTURAL_VALID"
+                            ),
+                            reason_codes=("BERKELEY_METADATA_PAGE_CONFIRMED",),
+                            correlated_evidence=("BERKELEY_METADATA_FIELDS",),
+                        )
+
+        secret_indices = tuple(
+            index for index, hit in enumerate(assessed_hits)
+            if hit.hit_type == HISTORICAL_EC_PRIVATE_KEY_DER_SIGNATURE
+        )
+        if secret_indices:
+            secret_hits = tuple(assessed_hits[index] for index in secret_indices)
+            source = str(path.resolve())
+            with path.open("rb") as stream:
+                reader = _Reader(stream)
+                complete = OrphanHistoricalECPrivateKeyRecoveryPipeline(
+                    secret_hits,
+                    source=source,
+                    range_start=range_start,
+                    range_end=range_end,
+                    range_reader=reader,
+                ).run()
+                fragments = OrphanHistoricalECPrivateKeyFragmentRecoveryPipeline(
+                    secret_hits,
+                    source=source,
+                    range_start=range_start,
+                    range_end=range_end,
+                    range_reader=reader,
+                ).run()
+            valid_offsets = {
+                item.absolute_anchor_offset for item in fragments.locations
+            }
+            valid_offsets.update(
+                hit.start_offset
+                for hit in secret_hits
+                for item in complete.locations
+                if item.absolute_der_offset < hit.start_offset < (
+                    item.absolute_der_offset + item.der_length
+                )
+            )
+            for index in secret_indices:
+                hit = assessed_hits[index]
+                if hit.start_offset in valid_offsets:
+                    assessed_hits[index] = replace(
+                        hit,
+                        confidence=0.99,
+                        # A standalone valid secret is admissible evidence, but
+                        # is not itself a structurally complete wallet.
+                        structural_status="ANCHOR_ONLY",
+                        validation_status="SECP256K1_VALID",
+                        reason_codes=("SECP256K1_PRIVATE_KEY_DER_VALID",),
+                        correlated_evidence=(
+                            "PRIVATE_SCALAR_RANGE",
+                            "EMBEDDED_PUBLIC_KEY_MATCH",
+                        ),
+                        recommended_recovery_action="SECRET_RECOVERY",
+                    )
+
+        record_hits = tuple(
+            hit for hit in assessed_hits
+            if hit.hit_type in dict(FRAMED_BITCOIN_RECORD_PATTERNS)
+        )
+        if not record_hits:
+            return tuple(assessed_hits)
+
+        with path.open("rb") as stream:
+            assessment = MetadataLessBerkeleyFragmentRecoveryPipeline(
+                record_hits,
+                source=str(path.resolve()),
+                range_start=range_start,
+                range_end=range_end,
+                range_reader=_Reader(stream),
+            ).run()
+        structural_offsets = {
+            item.discovery_hit_offset
+            for item in assessment.record_locations
+            if item.page_status is ValidationStatus.STRUCTURAL
+        }
+        return tuple(
+            replace(
+                hit,
+                structural_status="STRUCTURAL",
+                validation_status="BITCOIN_RECORD_STRUCTURAL_VALID",
+                reason_codes=tuple(dict.fromkeys((
+                    *hit.reason_codes,
+                    "BERKELEY_LEAF_RECORD_STRUCTURAL_VALID",
+                ))),
+                correlated_evidence=tuple(dict.fromkeys((
+                    *hit.correlated_evidence,
+                    "BERKELEY_LEAF_PAGE",
+                    "FRAMED_WALLET_RECORD",
+                ))),
+            )
+            if (
+                hit.start_offset in structural_offsets
+                and hit.validation_status != BITCOIN_RECORD_KEY_SIDE_VALID
+            ) else hit
+            for hit in assessed_hits
         )
 
     @staticmethod
