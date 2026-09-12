@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import pytest
 
@@ -167,10 +168,10 @@ def test_legacy_v1_without_semantics_version_is_rejected_without_modification(
     tmp_path,
 ) -> None:
     source, checkpoint = _create(tmp_path)
-    payload = checkpoint.payload
-    payload["format"] = LEGACY_UNIFIED_CHECKPOINT_FORMAT
-    payload.pop("format_version")
-    payload["scanner_identity"].pop("scanner_semantics_version")
+    payload = {
+        "format": LEGACY_UNIFIED_CHECKPOINT_FORMAT,
+        "scanner_identity": {},
+    }
     checkpoint.path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -178,7 +179,7 @@ def test_legacy_v1_without_semantics_version_is_rejected_without_modification(
 
     with pytest.raises(
         UnifiedCheckpointError,
-        match="legacy unified checkpoint rejected:.*V1 compatibility contract.*new checkpoint",
+        match="legacy JSON checkpoint storage format rejected:.*new checkpoint",
     ):
         _resume(checkpoint, source)
 
@@ -187,9 +188,11 @@ def test_legacy_v1_without_semantics_version_is_rejected_without_modification(
 
 def test_unsupported_format_version_has_explicit_error(tmp_path) -> None:
     source, checkpoint = _create(tmp_path)
-    payload = checkpoint.payload
-    payload["format_version"] = UNIFIED_CHECKPOINT_FORMAT_VERSION + 1
-    checkpoint.path.write_text(json.dumps(payload), encoding="utf-8")
+    with sqlite3.connect(checkpoint.path) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'format_version'",
+            (json.dumps(UNIFIED_CHECKPOINT_FORMAT_VERSION + 1),),
+        )
 
     with pytest.raises(UnifiedCheckpointError, match="checkpoint format mismatch"):
         _resume(checkpoint, source)
@@ -197,9 +200,9 @@ def test_unsupported_format_version_has_explicit_error(tmp_path) -> None:
 
 def test_corrupted_checkpoint_has_explicit_error(tmp_path) -> None:
     source, checkpoint = _create(tmp_path)
-    checkpoint.path.write_text("{", encoding="utf-8")
+    checkpoint.path.write_bytes(b"not a checkpoint")
 
-    with pytest.raises(UnifiedCheckpointError, match="corrupted unified checkpoint"):
+    with pytest.raises(UnifiedCheckpointError, match="checkpoint format mismatch"):
         _resume(checkpoint, source)
 
 
@@ -242,7 +245,10 @@ def test_application_version_is_diagnostic_only(tmp_path) -> None:
     source, checkpoint = _create(tmp_path)
     payload = checkpoint.payload
     assert payload["application"]["version"]
-    payload["application"]["version"] = "future-diagnostic-version"
-    checkpoint.path.write_text(json.dumps(payload), encoding="utf-8")
+    with sqlite3.connect(checkpoint.path) as connection:
+        connection.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'application'",
+            (json.dumps({"name": "BFRS", "version": "future-diagnostic-version"}),),
+        )
 
     assert _resume(checkpoint, source).path == checkpoint.path

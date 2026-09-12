@@ -325,8 +325,7 @@ def test_unified_checkpoint_resume_skips_completed_ownership_and_matches_clean(t
     assert _logical(continued) == _logical(clean)
     assert (continued.evidence["io_metrics"]["physical_linear_bytes_read"] <
             clean.evidence["io_metrics"]["physical_linear_bytes_read"])
-    serialized = checkpoint.path.read_text(encoding="utf-8")
-    assert bip39_phrase("english") not in serialized
+    assert bip39_phrase("english").encode() not in checkpoint.path.read_bytes()
 
 
 def test_mnemonic_coverage_is_explicit_when_stage_is_skipped(tmp_path):

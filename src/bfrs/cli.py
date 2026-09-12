@@ -624,10 +624,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"worker error: {error}", file=sys.stderr)
         return 3
     except OSError as error:
+        if unified_checkpoint is not None:
+            unified_checkpoint.close()
         ntfs_progress.finish()
         scan_progress.finish()
         print(f"input error: {error}", file=sys.stderr)
         return 3
+    except BaseException:
+        if unified_checkpoint is not None:
+            unified_checkpoint.close()
+        raise
     ntfs_progress.finish()
     scan_progress.finish()
     if unified_checkpoint is not None:

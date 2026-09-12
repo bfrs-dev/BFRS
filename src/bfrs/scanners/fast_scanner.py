@@ -177,7 +177,10 @@ class FastScanner:
         raw_hits = 0
         anchors_total = 0
         emitted_progress = False
-        resumed = dict(resume_results or {})
+        # Checkpoint-backed mappings load one completed unit at a time.  Do not
+        # eagerly duplicate every persisted RawHit in memory during resume.
+        resumed = resume_results or {}
+        resumed_keys = frozenset(resumed)
         used_resumed: set[tuple[int, int]] = set()
         process_backed_detector = next((
             detector for detector in self.detectors
@@ -187,7 +190,7 @@ class FastScanner:
             process_backed_detector is not None
             and len(self.detectors) > 1
             and range_end - start > reader.chunk_size)
-        if not resumed and unit_complete is None:
+        if not resumed_keys and unit_complete is None:
             units = (
                 (
                     chunk.offset,
@@ -201,7 +204,7 @@ class FastScanner:
         else:
             units = reader.iter_owned_chunks(
                 start=start, end=range_end,
-                skip_ownership_ranges=resumed)
+                skip_ownership_ranges=resumed_keys)
         try:
             for ownership_start, ownership_end, chunk in units:
                 unit_key = (ownership_start, ownership_end)
@@ -302,7 +305,7 @@ class FastScanner:
                         complete=ownership_end >= range_end,
                     ))
                     emitted_progress = True
-            unexpected = set(resumed) - used_resumed
+            unexpected = resumed_keys - used_resumed
             if unexpected:
                 raise ValueError("checkpoint contains incompatible ownership ranges")
         except BaseException:
