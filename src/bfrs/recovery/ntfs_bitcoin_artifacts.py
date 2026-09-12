@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import re
+from typing import BinaryIO
 
 from bfrs.recovery.ntfs_extents import (
     NtfsMappingPairsDecoder,
@@ -233,13 +234,32 @@ class _Image:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.size = path.stat().st_size
+        self._source: BinaryIO | None = None
+
+    def __enter__(self) -> _Image:
+        if self._source is not None:
+            raise RuntimeError("image_reader_already_open")
+        self._source = self.path.open("rb")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._source is not None:
+            self._source.close()
+            self._source = None
 
     def read_at(self, offset: int, length: int) -> bytes:
         if offset < 0 or length < 0 or offset > self.size or length > self.size - offset:
             raise ValueError("read_outside_image")
-        with self.path.open("rb") as source:
-            source.seek(offset)
-            data = source.read(length)
+        if self._source is None:
+            with self.path.open("rb") as source:
+                source.seek(offset)
+                data = source.read(length)
+        else:
+            self._source.seek(offset)
+            data = self._source.read(length)
         if len(data) != length:
             raise OSError("short_image_read")
         return data
@@ -378,7 +398,17 @@ class NTFSBitcoinArtifactLocator:
     ) -> NTFSBitcoinArtifactIndex:
         self._stale_context = None
         path = Path(source).resolve()
-        image = _Image(path)
+        with _Image(path) as image:
+            return self._index_open_image(
+                path, image, volume_offset=volume_offset)
+
+    def _index_open_image(
+        self,
+        path: Path,
+        image: _Image,
+        *,
+        volume_offset: int | None,
+    ) -> NTFSBitcoinArtifactIndex:
         diagnostics: list[str] = []
         if volume_offset is None:
             boot = self._discover(image, diagnostics)
