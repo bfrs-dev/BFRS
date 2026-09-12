@@ -9,6 +9,7 @@ import pytest
 from bfrs.cli import main
 from bfrs.core.chunk_reader import Chunk, ChunkReader
 from bfrs.core.secp256k1 import GENERATOR, encode_sec_public_key
+from bfrs.core.worker_control import WorkerStallError
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
 from bfrs.recovery.unified_scan_checkpoint import (
     UnifiedScanCheckpoint,
@@ -148,9 +149,12 @@ def test_unified_workers_are_logically_identical(tmp_path):
     source = tmp_path / "workers.img"
     source.write_bytes(payload)
     selection = _selection()
-    one = _coordinator(selection, workers=1).scan(source, targets=selection.targets)
-    two = _coordinator(selection, workers=2).scan(source, targets=selection.targets)
-    assert _logical(one) == _logical(two)
+    baseline = _logical(
+        _coordinator(selection, workers=1).scan(source, targets=selection.targets))
+    for workers in (2, 4):
+        result = _coordinator(selection, workers=workers).scan(
+            source, targets=selection.targets)
+        assert _logical(result) == baseline
 
 
 def test_process_worker_scans_supplied_bytes_without_opening_source():
@@ -165,6 +169,54 @@ def test_process_worker_scans_supplied_bytes_without_opening_source():
         detector.close()
     assert len(hits) == 1
     assert hits[0].safe_metadata["mnemonic_standard"] == "BIP39"
+
+
+def test_branch_stall_aborts_process_detector_without_completing_unit(
+        tmp_path, monkeypatch):
+    source = tmp_path / "synthetic-stall.bin"
+    source.write_bytes(b"x" * 32)
+    completed = []
+
+    class LocalDetector:
+        required_overlap = 0
+
+        def detect_chunk(self, *args, **kwargs):
+            return ()
+
+    class ProcessDetector(LocalDetector):
+        def __init__(self):
+            self.future = Future()
+            self.aborted = False
+            self.closed = False
+
+        def submit_chunk(self, *args, **kwargs):
+            return self.future
+
+        def abort(self):
+            self.aborted = True
+            self.future.cancel()
+
+        def close(self):
+            self.closed = True
+
+    process_detector = ProcessDetector()
+    scanner = FastScanner((), chunk_detectors=(LocalDetector(), process_detector))
+    reader = ChunkReader(source, chunk_size=16, overlap=4)
+    monkeypatch.setattr(
+        "bfrs.scanners.fast_scanner.wait_for_single_future",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            WorkerStallError("synthetic branch stall")),
+    )
+
+    with pytest.raises(WorkerStallError, match="synthetic branch stall"):
+        list(scanner.scan(
+            reader,
+            unit_complete=lambda *args: completed.append(args),
+        ))
+
+    assert completed == []
+    assert process_detector.aborted is True
+    assert process_detector.closed is False
 
 
 def test_checkpoint_callback_waits_for_target_and_mnemonic_branches(tmp_path):

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections.abc import Iterable, Iterator
+from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 import hashlib
 import os
@@ -13,6 +14,14 @@ import re
 import signal
 import unicodedata
 from typing import Callable
+
+from bfrs.core.worker_control import (
+    abort_executor,
+    iter_bounded_results,
+    submit_process_future,
+    validate_worker_count,
+    wait_for_all_futures,
+)
 
 from .bip39_validator import BIP39Validator, WORD_COUNTS
 from .electrum_seed_validator import ElectrumSeedValidator
@@ -53,8 +62,7 @@ _WORKER_SCANNER: RawMnemonicScanner | None = None
 
 
 def resolve_worker_count(workers: int) -> int:
-    if workers < 0:
-        raise ValueError("workers must be nonnegative")
+    validate_worker_count(workers)
     return min(max((os.cpu_count() or 1) - 1, 1), 4) if workers == 0 else workers
 
 
@@ -206,17 +214,20 @@ class RawMnemonicScanner:
         path = Path(source).resolve()
         range_end = path.stat().st_size if end is None else end
         worker_count = resolve_worker_count(workers)
-        units = self._plan_work_units(path, start, range_end)
-        planned = {(unit[3], unit[4]): unit for unit in units}
         resumed = resume_results or {}
-        unexpected = set(resumed) - set(planned)
-        if unexpected:
-            raise ValueError("checkpoint contains incompatible ownership ranges")
+        if resumed:
+            planned = {(unit[3], unit[4])
+                       for unit in self._iter_work_units(path, start, range_end)}
+            if set(resumed) - planned:
+                raise ValueError("checkpoint contains incompatible ownership ranges")
         results = [(end_offset - start_offset, result)
                    for (start_offset, end_offset), result in resumed.items()]
         completed = sum(size for size, _ in results)
         total = range_end - start
-        pending = [unit for unit in units if (unit[3], unit[4]) not in resumed]
+        pending = (
+            unit for unit in self._iter_work_units(path, start, range_end)
+            if (unit[3], unit[4]) not in resumed
+        )
         if progress is not None and completed:
             progress(completed, total)
         if worker_count == 1:
@@ -236,19 +247,21 @@ class RawMnemonicScanner:
 
     def _plan_work_units(self, source: Path, start: int, range_end: int
                          ) -> list[tuple[str, int, int, int, int]]:
+        return list(self._iter_work_units(source, start, range_end))
+
+    def _iter_work_units(self, source: Path, start: int, range_end: int
+                         ) -> Iterator[tuple[str, int, int, int, int]]:
         step = min(self.chunk_size - self.overlap, _MAX_PARALLEL_OWNERSHIP)
         path = str(source)
-        units = []
         ownership_start = start
         while ownership_start < range_end:
             ownership_end = min(ownership_start + step, range_end)
             scan_end = min(ownership_end + self.overlap, range_end)
             if scan_end >= range_end:
                 ownership_end = range_end
-            units.append((path, ownership_start, scan_end,
-                          ownership_start, ownership_end))
+            yield (path, ownership_start, scan_end,
+                   ownership_start, ownership_end)
             ownership_start = ownership_end
-        return units
 
     def _scan_local_unit(self, unit: tuple[str, int, int, int, int]
                          ) -> RawMnemonicScanResult:
@@ -260,35 +273,32 @@ class RawMnemonicScanner:
                                ownership_start=ownership_start,
                                ownership_end=ownership_end)
 
-    def _scan_path_parallel(self, units: list[tuple[str, int, int, int, int]],
+    def _scan_path_parallel(self, units: Iterable[tuple[str, int, int, int, int]],
                             workers: int, progress: Callable[[int, int], None] | None,
                             unit_complete: UnitComplete | None, completed: int, total: int
                             ) -> list[tuple[int, RawMnemonicScanResult]]:
         results: list[tuple[int, RawMnemonicScanResult]] = []
-        if not units:
-            return results
         executor = ProcessPoolExecutor(
             max_workers=workers, initializer=_initialize_worker,
             initargs=(self.chunk_size, self.overlap))
-        futures = {}
         try:
-            futures = {executor.submit(_scan_work_unit, unit): unit for unit in units}
-            for future in as_completed(futures):
-                unit = futures[future]
+            for unit, result in iter_bounded_results(
+                executor,
+                units,
+                submit=lambda pool, item: pool.submit(_scan_work_unit, item),
+                unit_id=lambda item: f"ownership[{item[3]}..{item[4]})",
+                workers=workers,
+                operation="mnemonic path scan",
+            ):
                 owned = unit[4] - unit[3]
-                results.append((owned, future.result()))
-                result = results[-1][1]
+                results.append((owned, result))
                 completed += owned
                 if unit_complete is not None:
                     unit_complete(unit, result, completed, total)
                 if progress is not None:
                     progress(completed, total)
         except BaseException:
-            for future in futures:
-                future.cancel()
-            for process in tuple(getattr(executor, "_processes", {}).values()):
-                process.terminate()
-            executor.shutdown(wait=True, cancel_futures=True)
+            abort_executor(executor)
             raise
         else:
             executor.shutdown(wait=True)
@@ -716,22 +726,23 @@ class RawMnemonicScanner:
         futures = []
         try:
             futures = [
-                self._phase_executor.submit(
-                    _scan_phase_work_unit,
+                submit_process_future(
+                    self._phase_executor, _scan_phase_work_unit,
                     (data, source, base_offset, source_kind,
                      ownership_start, ownership_end, phase),
+                    operation="mnemonic decode",
+                    unit_id=f"phase[{phase[0]}:{phase[1]}]",
                 )
                 for phase in decode_passes
             ]
-            results = [future.result() for future in futures]
+            results = wait_for_all_futures(
+                [(future, f"phase[{encoding}:{alignment}]")
+                 for future, (encoding, alignment) in zip(futures, decode_passes)],
+                operation="mnemonic decode",
+            )
         except BaseException:
-            for future in futures:
-                future.cancel()
             executor = self._phase_executor
-            for process in tuple(
-                    getattr(executor, "_processes", {}).values()):
-                process.terminate()
-            executor.shutdown(wait=True, cancel_futures=True)
+            abort_executor(executor, futures)
             self._phase_executor = None
             raise
         return self._merge_phase_results(results)
@@ -771,4 +782,10 @@ class RawMnemonicScanner:
     def close(self) -> None:
         if self._phase_executor is not None:
             self._phase_executor.shutdown(wait=True, cancel_futures=True)
+            self._phase_executor = None
+
+    def abort(self) -> None:
+        """Cancel queued phase work without waiting for a stalled child."""
+        if self._phase_executor is not None:
+            abort_executor(self._phase_executor)
             self._phase_executor = None

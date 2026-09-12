@@ -15,6 +15,7 @@ import zipfile
 import pytest
 
 from bfrs.cli import main
+from bfrs.core.worker_control import WorkerExecutionError
 from bfrs.recovery.mnemonic.bip39_validator import BIP39Validator
 from bfrs.recovery.mnemonic.document_seed_recovery import (
     DocumentSeedRecovery,
@@ -941,6 +942,44 @@ def test_checkpoint_resume_workers_six_to_four_never_rescans_completed_units(
     assert set(submitted[4]).isdisjoint(saved)
     assert progress[0] == (sum(end - start for start, end in saved), 30_000)
     assert progress[-1] == (30_000, 30_000)
+
+
+def test_failed_parallel_unit_is_not_checkpoint_completed(tmp_path, monkeypatch):
+    source = tmp_path / "failed-unit.bin"
+    source.write_bytes(b"ordinary deterministic prose " * 500)
+    scanner = RawMnemonicScanner(chunk_size=8192, overlap=4096)
+    planned = scanner._plan_work_units(source.resolve(), 0, source.stat().st_size)
+    acknowledged = []
+
+    class RecordingExecutor:
+        def __init__(self, **unused):
+            self.shutdown_calls = []
+
+        def shutdown(self, *, wait, cancel_futures=False):
+            self.shutdown_calls.append((wait, cancel_futures))
+
+    def one_success_then_failure(executor, items, **unused):
+        iterator = iter(items)
+        first = next(iterator)
+        yield first, scanner._scan_local_unit(first)
+        failed = next(iterator)
+        raise WorkerExecutionError(
+            f"synthetic worker failure for ownership[{failed[3]}..{failed[4]})")
+
+    monkeypatch.setattr(raw_scanner_module, "ProcessPoolExecutor", RecordingExecutor)
+    monkeypatch.setattr(
+        raw_scanner_module, "iter_bounded_results", one_success_then_failure)
+
+    with pytest.raises(WorkerExecutionError, match="synthetic worker failure"):
+        scanner.scan_path(
+            source,
+            workers=2,
+            unit_complete=lambda unit, result, completed, total: acknowledged.append(
+                (unit[3], unit[4])),
+        )
+
+    assert acknowledged == [(planned[0][3], planned[0][4])]
+    assert (planned[1][3], planned[1][4]) not in acknowledged
 
 
 def test_checkpoint_create_refuses_to_overwrite_existing_state(tmp_path):

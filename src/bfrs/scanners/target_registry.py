@@ -11,6 +11,7 @@ from collections.abc import Callable
 from bfrs.core.chunk_reader import Chunk
 from bfrs.core.models import RawHit
 from bfrs.core.secp256k1 import GROUP_ORDER
+from bfrs.core.worker_control import abort_executor, submit_process_future
 from bfrs.recovery.electrum_raw_recovery import ELECTRUM_SIGNATURE_PATTERNS
 from bfrs.recovery.metadata_less_fragments import FRAMED_BITCOIN_RECORD_PATTERNS
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import RawMnemonicScanner
@@ -433,14 +434,26 @@ class MnemonicChunkDetector:
             self._branch_executor = ProcessPoolExecutor(
                 max_workers=1, initializer=_initialize_mnemonic_branch,
                 initargs=(self.standards,))
-        return self._branch_executor.submit(_scan_mnemonic_branch, (
-            chunk.data, source, chunk.offset, ownership_start, ownership_end))
+        return submit_process_future(
+            self._branch_executor,
+            _scan_mnemonic_branch,
+            (chunk.data, source, chunk.offset, ownership_start, ownership_end),
+            operation="mnemonic branch",
+            unit_id=f"ownership[{ownership_start}..{ownership_end})",
+        )
 
     def close(self) -> None:
         if self._branch_executor is not None:
             self._branch_executor.shutdown(wait=True, cancel_futures=True)
             self._branch_executor = None
         self.scanner.close()
+
+    def abort(self) -> None:
+        """Cancel process-backed work without waiting on a stalled branch."""
+        if self._branch_executor is not None:
+            abort_executor(self._branch_executor)
+            self._branch_executor = None
+        self.scanner.abort()
 
 
 _WIF_FINGERPRINT_DOMAIN = b"BFRS-WIF-FINGERPRINT-V1\0"

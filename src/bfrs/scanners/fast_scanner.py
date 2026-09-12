@@ -7,6 +7,7 @@ from typing import Protocol
 
 from bfrs.core.chunk_reader import Chunk, ChunkReader
 from bfrs.core.models import RawHit
+from bfrs.core.worker_control import wait_for_single_future
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +246,11 @@ class FastScanner:
                         detector_hits[index] = run_detector(detector)
                     if branch_future is not None:
                         index = self.detectors.index(process_backed_detector)
-                        detector_hits[index] = branch_future.result()
+                        detector_hits[index] = wait_for_single_future(
+                            branch_future,
+                            operation="mnemonic branch",
+                            unit_id=f"ownership[{ownership_start}..{ownership_end})",
+                        )
                     ordered_hits = (
                         (hit.start_offset, index, ordinal, hit)
                         for index in range(len(self.detectors))
@@ -300,7 +305,17 @@ class FastScanner:
             unexpected = set(resumed) - used_resumed
             if unexpected:
                 raise ValueError("checkpoint contains incompatible ownership ranges")
-        finally:
+        except BaseException:
+            for detector in self.detectors:
+                abort = getattr(detector, "abort", None)
+                if abort is not None:
+                    abort()
+                else:
+                    close = getattr(detector, "close", None)
+                    if close is not None:
+                        close()
+            raise
+        else:
             for detector in self.detectors:
                 close = getattr(detector, "close", None)
                 if close is not None:

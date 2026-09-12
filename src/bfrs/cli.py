@@ -8,6 +8,7 @@ import time
 from typing import Sequence
 
 from bfrs.core.path_safety import paths_refer_to_same_file
+from bfrs.core.worker_control import WorkerControlError
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
 from bfrs.recovery.mnemonic.mnemonic_recovery_pipeline import MnemonicRecoveryPipeline
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import resolve_worker_count
@@ -309,8 +310,10 @@ def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
             parser.error(f"--{name.replace('_', '-')} must be at least {minimum}")
     if arguments.overlap_kib < 0:
         parser.error("--overlap-kib must be nonnegative")
-    if arguments.workers < 0:
-        parser.error("--workers must be nonnegative")
+    try:
+        resolve_worker_count(arguments.workers)
+    except ValueError as error:
+        parser.error(str(error))
     if arguments.minimum_hits < 1:
         parser.error("--minimum-hits must be at least 1")
     if arguments.minimum_distinct_types < 1:
@@ -469,6 +472,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed_progress.finish()
             print("scan interrupted by user", file=sys.stderr)
             return 130
+        except WorkerControlError as error:
+            if checkpoint is not None:
+                checkpoint.save(force=True)
+            seed_progress.finish()
+            print(f"worker error: {error}", file=sys.stderr)
+            return 3
         except (OSError, ValueError) as error:
             print(f"input error: {error}", file=sys.stderr)
             return 3
@@ -571,6 +580,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         scan_progress.finish()
         print("scan interrupted by user", file=sys.stderr)
         return 130
+    except WorkerControlError as error:
+        if unified_checkpoint is not None:
+            unified_checkpoint.save(force=True)
+        scan_progress.finish()
+        print(f"worker error: {error}", file=sys.stderr)
+        return 3
     except OSError as error:
         scan_progress.finish()
         print(f"input error: {error}", file=sys.stderr)
