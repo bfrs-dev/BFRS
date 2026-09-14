@@ -149,12 +149,28 @@ def test_unified_workers_are_logically_identical(tmp_path):
     source = tmp_path / "workers.img"
     source.write_bytes(payload)
     selection = _selection()
-    baseline = _logical(
-        _coordinator(selection, workers=1).scan(source, targets=selection.targets))
+    baseline_result = _coordinator(selection, workers=1).scan(
+        source, targets=selection.targets)
+    baseline = _logical(baseline_result)
+    baseline_report = serialize_full_image_result(baseline_result, {})
+    baseline_public = (
+        baseline_report["finding_summary"],
+        tuple(item["normalized_state"]
+              for item in baseline_report["target_findings"]),
+        tuple(item.get("safe_fingerprint")
+              for item in baseline_report["target_findings"]),
+    )
     for workers in (2, 4):
         result = _coordinator(selection, workers=workers).scan(
             source, targets=selection.targets)
         assert _logical(result) == baseline
+        report = serialize_full_image_result(result, {})
+        assert (
+            report["finding_summary"],
+            tuple(item["normalized_state"] for item in report["target_findings"]),
+            tuple(item.get("safe_fingerprint")
+                  for item in report["target_findings"]),
+        ) == baseline_public
 
 
 def test_process_worker_scans_supplied_bytes_without_opening_source():
@@ -318,11 +334,17 @@ def test_unified_checkpoint_resume_skips_completed_ownership_and_matches_clean(t
         chunk_size=CHUNK_SIZE, overlap=OVERLAP, scanner_identity=identity)
 
     clean = _coordinator(selection).scan(source, targets=selection.targets)
-    continued = _coordinator(selection).scan(
+    continued = _coordinator(selection, workers=4).scan(
         source, targets=selection.targets,
         resume_results=resumed.completed_results,
         unit_complete=resumed.record)
     assert _logical(continued) == _logical(clean)
+    clean_report = serialize_full_image_result(clean, {})
+    continued_report = serialize_full_image_result(continued, {})
+    assert continued_report["finding_summary"] == clean_report["finding_summary"]
+    assert [item["normalized_state"] for item in continued_report["target_findings"]] == [
+        item["normalized_state"] for item in clean_report["target_findings"]
+    ]
     assert (continued.evidence["io_metrics"]["physical_linear_bytes_read"] <
             clean.evidence["io_metrics"]["physical_linear_bytes_read"])
     assert bip39_phrase("english").encode() not in checkpoint.path.read_bytes()

@@ -86,7 +86,7 @@ Create a checkpoint:
 ```powershell
 bfrs --input X:\evidence\case-001.img `
   --output D:\bfrs-work\case-001-report.json `
-  --checkpoint D:\bfrs-work\case-001.checkpoint.json
+  --checkpoint D:\bfrs-work\case-001.checkpoint.sqlite
 ```
 
 Resume with the same source, range, chunk geometry, targets, and scanner
@@ -95,7 +95,7 @@ semantics:
 ```powershell
 bfrs --input X:\evidence\case-001.img `
   --output D:\bfrs-work\case-001-report.json `
-  --resume-checkpoint D:\bfrs-work\case-001.checkpoint.json
+  --resume-checkpoint D:\bfrs-work\case-001.checkpoint.sqlite
 ```
 
 A mnemonic-only scan is available when wallet/container recovery is not
@@ -113,8 +113,16 @@ revalidation.
 
 ## Interpreting results
 
-BFRS does not yet expose one universal status enum across every artifact type.
-At a high level:
+BFRS report schema 3 exposes `normalized_state` with four independent axes:
+
+- `discovery_state`: `RAW`, `REJECTED`, `CANDIDATE`, or `ACCEPTED`;
+- `structural_state`: `NONE`, `FRAGMENT`, or `COMPLETE`;
+- `crypto_state`: `NOT_APPLICABLE`, `UNCHECKED`, `VALID`, or `INVALID`;
+- `recovery_relevance`: `INDEPENDENT`, `CONTEXT_REVIEW`, or
+  `LIKELY_FALSE_POSITIVE`.
+
+Legacy target-specific fields remain beside this contract for revalidation and
+export compatibility. At a high level:
 
 - raw/anchor-only findings are unconfirmed discovery signals;
 - rejected findings failed structural or cryptographic checks;
@@ -132,9 +140,10 @@ conclusive evidence.
 
 ## Output and forensic safety
 
-The JSON report is written to `--output`; checkpoints are written only to the
-explicit `--checkpoint` path and updated when resuming. Reports can become very
-large because they preserve detailed findings and context metadata.
+The JSON report is written to `--output`; SQLite checkpoints are written only
+to the explicit `--checkpoint` path and updated transactionally when resuming.
+Rejected report noise is aggregated while candidate and validated findings keep
+their detailed, secret-safe fields.
 
 - Treat source images as read-only and work from verified forensic copies.
 - Keep reports, checkpoints, carves, and recovered material outside the source
@@ -159,10 +168,10 @@ identity.
   investigated wallet and may not be recoverable.
 - Scanning large images can be I/O- and CPU-intensive; multiprocessing behavior
   depends on the platform and storage device.
-- Checkpoints are compatibility-validated JSON snapshots, not transactional
-  databases.
-- Reports are currently monolithic JSON and may require substantial memory and
-  disk space.
+- Unified checkpoints use SQLite format 3 and reject incompatible scanner
+  semantics or legacy JSON checkpoints explicitly.
+- Reports remain monolithic JSON and may require substantial memory for very
+  large sets of retained candidate or validated findings.
 
 ## License status
 
