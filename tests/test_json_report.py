@@ -156,7 +156,7 @@ def historical_wallet_result(tmp_path) -> FullImageRecoveryResult:
 def test_safe_json_schema_is_explicit_and_deterministic(tmp_path):
     result = historical_wallet_result(tmp_path)
     payload = serialize_full_image_result(result, CONFIGURATION)
-    assert payload["report_schema_version"] == REPORT_SCHEMA_VERSION == 2
+    assert payload["report_schema_version"] == REPORT_SCHEMA_VERSION == 3
     assert payload["application"] == {"name": APP_NAME, "version": VERSION}
     assert payload["source"] == str((tmp_path / "historical-wallet.img").resolve())
     assert payload["scan_range"] == {
@@ -324,6 +324,10 @@ def test_one_hundred_thousand_rejected_findings_are_compact_and_actionable_kept(
         "total_count": 100_000,
         "group_count": 1,
         "groups": [{
+            "normalized_state": {
+                "discovery_state": "REJECTED", "structural_state": "NONE",
+                "crypto_state": "UNCHECKED", "recovery_relevance": "CONTEXT_REVIEW",
+            },
             "target": "bitcoin-core",
             "detector": "synthetic_detector",
             "artifact_kind": "noise",
@@ -409,7 +413,13 @@ def test_likely_wordlist_mnemonic_occurrence_is_aggregated_but_summary_untouched
 
     assert payload["target_findings"] == []
     assert payload["rejected_statistics"]["total_count"] == 1
-    assert payload["mnemonic_recovery"] == mnemonic_summary
+    normalized_mnemonic = payload["mnemonic_recovery"]["candidates"][0]
+    assert "normalized_state" in normalized_mnemonic
+    assert {key: value for key, value in normalized_mnemonic.items()
+            if key != "normalized_state"} == mnemonic_summary["candidates"][0]
+    assert payload["mnemonic_recovery"]["crypto_valid_occurrences"] == 1
+    assert payload["finding_summary"]["crypto_valid_occurrences"] == 1
+    assert payload["finding_summary"]["rejected"] == 0
 
 
 def test_atomic_write_failure_preserves_existing_report(tmp_path, monkeypatch):

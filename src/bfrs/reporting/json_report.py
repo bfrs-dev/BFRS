@@ -8,9 +8,10 @@ import uuid
 
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryResult
 from bfrs.version import APP_NAME, VERSION
+from bfrs.reporting.finding_state import normalized_row, summarize_findings
 
 
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 _LIKELY_WORDLIST_FALSE_POSITIVE = "LIKELY_WORDLIST_FALSE_POSITIVE"
 
 
@@ -32,13 +33,14 @@ def _aggregate_rejected_findings(findings) -> tuple[list[dict[str, Any]], dict[s
         )
         # The wallet-record revalidation tool requires every source offset.
         if not rejected or finding.artifact_kind == "wallet_record":
-            retained.append(finding.safe_dict())
+            retained.append(normalized_row(finding.safe_dict()))
             continue
         reasons = tuple(finding.reason_codes) or (
             finding.validation_status
             if finding.validation_status != "UNVALIDATED"
             else finding.structural_status,
         )
+        state = normalized_row(finding.safe_dict())["normalized_state"]
         key = (
             finding.target,
             finding.hit_type,
@@ -46,8 +48,10 @@ def _aggregate_rejected_findings(findings) -> tuple[list[dict[str, Any]], dict[s
             finding.validation_status,
             finding.structural_status,
             reasons,
+            tuple(state.values()),
         )
         group = groups.setdefault(key, {
+            "normalized_state": state,
             "target": finding.target,
             "detector": finding.hit_type,
             "artifact_kind": finding.artifact_kind,
@@ -1262,7 +1266,7 @@ def serialize_full_image_result(
     }
     target_findings, rejected_statistics = _aggregate_rejected_findings(
         result.target_findings)
-    return {
+    payload = {
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "application": {"name": APP_NAME, "version": VERSION},
         "source": result.source,
@@ -1273,6 +1277,7 @@ def serialize_full_image_result(
         "configuration": safe_configuration,
         "status": result.status.value,
         "raw_hit_count": result.raw_hit_count,
+        "finding_summary": summarize_findings(result.target_findings),
         "hotspot_count": result.hotspot_count,
         "accepted_hotspot_count": result.accepted_hotspot_count,
         "direct_results": [_direct_result(item) for item in result.direct_results],
@@ -1362,6 +1367,40 @@ def serialize_full_image_result(
             "evidence": diagnostics,
         },
     }
+    # Operate on report copies only: no RawHit, recovery or checkpoint mutation.
+    payload["direct_results"] = [normalized_row(row) for row in payload["direct_results"]]
+    for section in ("reconstructed_databases", "reconstructed_wallet_results"):
+        payload[section] = [normalized_row(row, completeness=(
+            "COMPLETE" if row["status"] == "structural" else "NONE"))
+            for row in payload[section]]
+    payload["metadata_less_fragment_summary"] = normalized_row(
+        payload["metadata_less_fragment_summary"])
+    electrum = payload["electrum_raw_recovery"]
+    electrum["candidates"] = [normalized_row(row) for row in electrum["candidates"]]
+    mnemonic = payload["mnemonic_recovery"]
+    mnemonic["candidates"] = [normalized_row(row, artifact_kind="mnemonic")
+                              for row in mnemonic["candidates"]]
+    legacy = payload["legacy_wallet_recovery"]
+    candidates = []
+    for row in legacy["candidates"]:
+        candidate = normalized_row(
+            row, structural_status=(
+                "REJECTED" if row["priority"] == "REJECTED" else "FRAGMENT"),
+            validation_status=("CRYPTO_VALID" if row["crypto_summary"]["crypto_valid_plain_keys"]
+                               else "UNVALIDATED"))
+        candidate["crypto_validation_results"] = [
+            normalized_row(item, validation_status=item["state"], artifact_kind="private_key")
+            for item in row["crypto_validation_results"]]
+        candidates.append(candidate)
+    legacy["candidates"] = candidates
+    # Separate recovery-view counters: these may overlap canonical target hits
+    # and each other and must never be summed into a wallet/secret total.
+    payload["recovery_state_summaries"] = {
+        section: summarize_findings(
+            payload[section], scope=f"{section}; overlapping recovery view, not additive")
+        for section in ("direct_results", "reconstructed_databases", "reconstructed_wallet_results")
+    }
+    return payload
 
 
 def write_json_report(

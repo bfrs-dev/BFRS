@@ -651,7 +651,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"source: {result.source}")
     print(f"range: {result.start_offset}..{result.end_offset}")
-    print(f"raw hits: {result.raw_hit_count}")
+    public_report = serialize_full_image_result(result, _configuration(arguments, selection))
+    public_summary = public_report["finding_summary"]
+    print(f"Raw discovery: {result.raw_hit_count} (raw hits: diagnostic)")
+    print(f"Accepted candidates: {public_summary['accepted_candidates']}")
+    print(f"Review candidates: {public_summary['review_candidates']}")
+    print(f"Rejected: {public_summary['rejected']}")
+    print(f"Structurally complete: {public_summary['structurally_complete']} artifacts")
+    print(f"Crypto-valid occurrences: {public_summary['crypto_valid_occurrences']}")
+    print(f"Unique crypto-valid secrets: {public_summary['crypto_valid_unique_secrets']} identified fingerprints")
+    print(f"Crypto-valid secrets without fingerprint: {public_summary['crypto_valid_secrets_without_fingerprint']}")
+    print("Summary scope: target findings; overlapping recovery views below are not additive")
+    print("Structurally complete reconstructed wallets: "
+          f"{public_report['recovery_state_summaries']['reconstructed_wallet_results']['structurally_complete']}")
     print(f"hotspots: {result.hotspot_count}")
     print(f"accepted hotspots: {result.accepted_hotspot_count}")
     print(f"direct results: {len(result.direct_results)}")
@@ -672,9 +684,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"electrum active duplicates: {electrum.known_active_duplicates}")
         print(f"report path: {report_path}")
         return 0
-    legacy = serialize_full_image_result(result, _configuration(arguments, selection))[
-        "legacy_wallet_recovery"
-    ]
+    legacy = public_report["legacy_wallet_recovery"]
     summary = legacy["summary"]
     print(f"legacy wallet candidates: {summary['wallet_candidates']}")
     print(
