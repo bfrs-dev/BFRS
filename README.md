@@ -173,11 +173,10 @@ identity.
 - Reports remain monolithic JSON and may require substantial memory for very
   large sets of retained candidate or validated findings.
 
-## License status
+## License
 
-This repository is not yet publicly licensed. Absence of a license does not
-grant permission to copy, modify, redistribute, or use the project. A license
-must be selected by the owner before public release.
+BFRS 2.0 is licensed under the GNU General Public License v3.0.
+See LICENSE for details.
 
 See [SECURITY.md](SECURITY.md) for data-handling requirements and
 [CONTRIBUTING.md](CONTRIBUTING.md) for contribution rules.

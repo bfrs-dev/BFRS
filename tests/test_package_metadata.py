@@ -34,11 +34,16 @@ def test_package_discovery_is_limited_to_bfrs_under_src() -> None:
     ]
 
 
-def test_public_docs_exist_and_do_not_claim_a_license() -> None:
+def test_public_docs_and_gpl_license_metadata() -> None:
+    metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
 
     assert "pre-1.0" in readme
-    assert "not yet publicly licensed" in readme
+    assert "licensed under the GNU General Public License v3.0" in readme
+    assert metadata["project"]["license"] == "GPL-3.0-only"
+    assert metadata["project"]["license-files"] == ["LICENSE"]
     assert (ROOT / "SECURITY.md").is_file()
     assert (ROOT / "CONTRIBUTING.md").is_file()
-    assert not (ROOT / "LICENSE").exists()
+    assert "GNU GENERAL PUBLIC LICENSE" in license_text
+    assert "Version 3, 29 June 2007" in license_text

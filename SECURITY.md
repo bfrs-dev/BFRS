@@ -46,4 +46,4 @@ usernames, local paths, offsets tied to a private case, and all key material.
 - verify that Git history contains no forensic or recovery artifacts;
 - run the repository safety checker;
 - confirm that examples and tests use synthetic data only;
-- select an explicit project license.
+- confirm that the GPL-3.0 license metadata and LICENSE file are present.
