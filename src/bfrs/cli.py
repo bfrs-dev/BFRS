@@ -22,6 +22,7 @@ from bfrs.recovery.unified_scan_checkpoint import (
     UnifiedScanCheckpoint,
     build_scanner_identity,
 )
+from bfrs.reporting.recovery_support import print_recovery_support_message
 from bfrs.reporting.json_report import write_json_report
 from bfrs.reporting.json_report import serialize_full_image_result
 from bfrs.scanners.fast_scanner import ScanProgress
@@ -548,6 +549,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("mnemonic likely-wordlist occurrences: "
               f"{summary.likely_wordlist_occurrences}")
         print(f"report path: {arguments.output.resolve()}")
+        print_recovery_support_message(payload)
         return 0
 
     policy = CandidatePolicy(
@@ -683,6 +685,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"electrum complete: {electrum.complete_candidates}")
         print(f"electrum active duplicates: {electrum.known_active_duplicates}")
         print(f"report path: {report_path}")
+        print_recovery_support_message(public_report)
         return 0
     legacy = public_report["legacy_wallet_recovery"]
     summary = legacy["summary"]
@@ -703,6 +706,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{summary['unique_crypto_valid_private_keys']}"
     )
     print(f"report path: {report_path}")
+    print_recovery_support_message(public_report)
     return 0
 
 

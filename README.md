@@ -173,6 +173,17 @@ identity.
 - Reports remain monolithic JSON and may require substantial memory for very
   large sets of retained candidate or validated findings.
 
+## Support BFRS
+
+If BFRS helps you recover a wallet or cryptographic recovery material
+and you would like to support development, donations are voluntary.
+
+Bitcoin (PUBLIC_DONATION_ADDRESS):
+`bc1qw4yrk7dhc2xcnpneh392xzdp9ey05saaxq8dav`
+
+Donation is optional and does not affect access to any BFRS feature.
+The CLI displays this invitation only after validated recovery material is found.
+
 ## License
 
 BFRS 2.0 is licensed under the GNU General Public License v3.0.
