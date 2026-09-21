@@ -34,3 +34,8 @@ wallet.dat
 *.wallet
 *.bin
 *.db
+
+# Explicit physical wallet export (including interrupted temporary files)
+wallet.dat.manifest.json
+.wallet-export-*.tmp
+.wallet-manifest-*.tmp
