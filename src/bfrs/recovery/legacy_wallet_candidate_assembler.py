@@ -131,6 +131,28 @@ class LegacyWalletCandidate:
             "priority": self.priority.value,
             "era": self.era,
             "era_confidence": self.era_confidence,
+            "wallet_format_era": self.era,
+            "wallet_generation_time": self.era_estimate.wallet_generation_time,
+            "wallet_generation_time_iso_utc": (
+                self.era_estimate.wallet_generation_time_iso_utc
+            ),
+            "generation_time_confidence": (
+                self.era_estimate.generation_time_confidence.value
+                if self.era_estimate.generation_time_confidence else None
+            ),
+            "key_time_summary": {
+                "earliest_key_time": self.era_estimate.earliest_key_time,
+                "latest_key_time": self.era_estimate.latest_key_time,
+                "unique_key_timestamps": self.era_estimate.unique_key_timestamps,
+                "timestamp_span_seconds": self.era_estimate.timestamp_span_seconds,
+                "valid_key_timestamps": self.era_estimate.valid_key_timestamps,
+                "invalid_key_timestamps": self.era_estimate.invalid_key_timestamps,
+                "outlier_key_timestamps": self.era_estimate.outlier_key_timestamps,
+            },
+            "client_version_observed": self.era_estimate.client_version_observed,
+            "client_version_semantics": (
+                self.era_estimate.client_version_semantics
+            ),
             "encryption_state": self.encryption_state.value,
             "record_counts": dict(self.record_counts),
             "physical_image_ranges": [list(item) for item in self.physical_ranges],
