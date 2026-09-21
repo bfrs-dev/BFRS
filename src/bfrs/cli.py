@@ -10,6 +10,12 @@ from typing import Sequence
 from bfrs.core.path_safety import paths_refer_to_same_file
 from bfrs.core.worker_control import WorkerControlError
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
+from bfrs.recovery.automatic_wallet_recovery import (
+    recover_wallets,
+    recovery_not_requested,
+    validate_recovery_destination,
+)
+from bfrs.recovery.physical_berkeley_reconstructor import ExportRefused
 from bfrs.recovery.ntfs_bitcoin_artifacts import NTFSMFTIndexProgress
 from bfrs.recovery.mnemonic.mnemonic_recovery_pipeline import MnemonicRecoveryPipeline
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import resolve_worker_count
@@ -243,6 +249,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", required=True, type=Path, help="source image path")
     parser.add_argument("--output", required=True, type=Path, help="JSON report path")
     parser.add_argument(
+        "--recover-wallets",
+        action="store_true",
+        help="write fully validated Bitcoin Core wallets to --recovery-dir",
+    )
+    parser.add_argument(
+        "--recovery-dir",
+        type=Path,
+        help="private output root for --recover-wallets (must be outside Git)",
+    )
+    parser.add_argument(
         "--revalidate-wallet-records",
         type=Path,
         metavar="OLD_REPORT_JSON",
@@ -317,6 +333,8 @@ def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
             arguments.resume_checkpoint,
             arguments.start != 0,
             arguments.end is not None,
+            arguments.recover_wallets,
+            arguments.recovery_dir is not None,
         )):
             parser.error(
                 "--revalidate-wallet-records cannot be combined with scan modes, "
@@ -332,6 +350,12 @@ def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
         parser.error("--include-mnemonic and --skip-mnemonic are mutually exclusive")
     if arguments.include_mnemonic and arguments.seed_scan_only:
         parser.error("--include-mnemonic is redundant with --seed-scan-only")
+    if arguments.recover_wallets and arguments.recovery_dir is None:
+        parser.error("--recover-wallets requires --recovery-dir")
+    if arguments.recovery_dir is not None and not arguments.recover_wallets:
+        parser.error("--recovery-dir requires --recover-wallets")
+    if arguments.recover_wallets and arguments.seed_scan_only:
+        parser.error("--recover-wallets cannot be combined with --seed-scan-only")
     if arguments.checkpoint and arguments.resume_checkpoint:
         parser.error("--checkpoint and --resume-checkpoint are mutually exclusive")
     if arguments.start < 0:
@@ -372,6 +396,13 @@ def _validate_path_collisions(
             paths_refer_to_same_file(
                 arguments.output, arguments.revalidate_wallet_records)):
         parser.error("output path resolves to source report path")
+    if arguments.recovery_dir is not None:
+        if paths_refer_to_same_file(arguments.recovery_dir, arguments.output):
+            parser.error("recovery directory resolves to report output path")
+        try:
+            validate_recovery_destination(arguments.input, arguments.recovery_dir)
+        except ExportRefused as error:
+            parser.error(f"unsafe recovery directory: {error}")
 
 
 def _selection(parser: argparse.ArgumentParser, arguments):
@@ -641,11 +672,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     if unified_checkpoint is not None:
         unified_checkpoint.mark_complete()
 
+    configuration = _configuration(arguments, selection)
+    public_report = serialize_full_image_result(result, configuration)
+    wallet_recovery = recovery_not_requested()
+    if arguments.recover_wallets:
+        try:
+            wallet_recovery = recover_wallets(
+                arguments.input, public_report, arguments.recovery_dir)
+        except ExportRefused as error:
+            wallet_recovery = {
+                "requested": True,
+                "eligible_candidates": 0,
+                "recovered_wallets": 0,
+                "failed_wallets": 1,
+                "outputs": [],
+                "reason_code": str(error),
+            }
     try:
         report_path = write_json_report(
             arguments.output,
             result,
-            _configuration(arguments, selection),
+            configuration,
+            wallet_recovery,
         )
     except OSError as error:
         print(f"report error: {error}", file=sys.stderr)
@@ -653,7 +701,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"source: {result.source}")
     print(f"range: {result.start_offset}..{result.end_offset}")
-    public_report = serialize_full_image_result(result, _configuration(arguments, selection))
+    public_report = serialize_full_image_result(result, configuration, wallet_recovery)
     public_summary = public_report["finding_summary"]
     print(f"Raw discovery: {result.raw_hit_count} (raw hits: diagnostic)")
     print(f"Accepted candidates: {public_summary['accepted_candidates']}")
@@ -706,6 +754,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{summary['unique_crypto_valid_private_keys']}"
     )
     print(f"report path: {report_path}")
+    if arguments.recover_wallets:
+        print("Bitcoin Core wallet recovery")
+        print("----------------------------")
+        print(f"Eligible candidates:       {wallet_recovery['eligible_candidates']}")
+        print(f"Recovered wallets:         {wallet_recovery['recovered_wallets']}")
+        print(f"Failed reconstructions:    {wallet_recovery['failed_wallets']}")
+        for recovered in wallet_recovery["outputs"]:
+            if recovered["status"] == "RECOVERED":
+                print("Recovered:")
+                print((arguments.recovery_dir /
+                       Path(recovered["relative_recovery_path"])).resolve())
     print_recovery_support_message(public_report)
     return 0
 

@@ -8,10 +8,11 @@ import uuid
 
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryResult
 from bfrs.version import APP_NAME, VERSION
+from bfrs.recovery.automatic_wallet_recovery import recovery_not_requested
 from bfrs.reporting.finding_state import normalized_row, summarize_findings
 
 
-REPORT_SCHEMA_VERSION = 3
+REPORT_SCHEMA_VERSION = 4
 _LIKELY_WORDLIST_FALSE_POSITIVE = "LIKELY_WORDLIST_FALSE_POSITIVE"
 
 
@@ -1231,6 +1232,7 @@ def _bitcoin_context_evidence(result: FullImageRecoveryResult) -> dict[str, Any]
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
+    wallet_recovery: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Select only explicitly approved scalar diagnostics and locations."""
     if not isinstance(result, FullImageRecoveryResult):
@@ -1366,6 +1368,9 @@ def serialize_full_image_result(
             "reasons": list(result.reasons),
             "evidence": diagnostics,
         },
+        "wallet_recovery": dict(
+            recovery_not_requested() if wallet_recovery is None else wallet_recovery
+        ),
     }
     # Operate on report copies only: no RawHit, recovery or checkpoint mutation.
     payload["direct_results"] = [normalized_row(row) for row in payload["direct_results"]]
@@ -1383,9 +1388,15 @@ def serialize_full_image_result(
     legacy = payload["legacy_wallet_recovery"]
     candidates = []
     for row in legacy["candidates"]:
+        complete_encrypted = (
+            row["encryption_state"] == "ENCRYPTED_COMPLETE_EVIDENCE"
+            and row["priority"] == "HIGH"
+            and not row["conflicts"]
+        )
         candidate = normalized_row(
             row, structural_status=(
-                "REJECTED" if row["priority"] == "REJECTED" else "FRAGMENT"),
+                "REJECTED" if row["priority"] == "REJECTED" else
+                "COMPLETE" if complete_encrypted else "FRAGMENT"),
             validation_status=("CRYPTO_VALID" if row["crypto_summary"]["crypto_valid_plain_keys"]
                                else "UNVALIDATED"))
         candidate["crypto_validation_results"] = [
@@ -1407,10 +1418,11 @@ def write_json_report(
     path: str | Path,
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
+    wallet_recovery: Mapping[str, Any] | None = None,
 ) -> Path:
     report_path = Path(path)
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = serialize_full_image_result(result, configuration)
+    payload = serialize_full_image_result(result, configuration, wallet_recovery)
     temporary = report_path.with_name(
         f".{report_path.name}.tmp-{uuid.uuid4().hex}")
     try:

@@ -266,7 +266,7 @@ def prepare(source: Path, report: dict, candidate_id: str, stream) -> Reconstruc
     recovery = recoveries[0]
     require(recovery["status"] == "structural" and recovery["database_status"] == "structural", "WALLET_INCOMPLETE")
     for k in ("read_failure_page_numbers", "rejected_extraction_page_numbers"):
-        require(recovery["safe_locations"][k] == [], "READ_FAILURE")
+        require(not recovery["safe_locations"][k], "READ_FAILURE")
     counts = candidate["record_counts"]
     crypto = candidate["crypto_summary"]
     require(set(counts) == {"key", "ckey", "mkey", "keymeta", "defaultkey", "version", "minversion"}, "INVALID_COUNTS")
@@ -290,19 +290,28 @@ def _publish(temp: Path, target: Path) -> None:
         temp.unlink()
 
 
-def export_wallet(source: Path, report_path: Path, candidate_id: str, output: Path,
-                  *, allow_private_key_export: bool = False) -> dict:
+def export_wallet_from_report(
+    source: Path,
+    report: dict,
+    candidate_id: str,
+    output: Path,
+    *,
+    allow_private_key_export: bool = False,
+    manifest_path: Path | None = None,
+    manifest_fields: dict | None = None,
+) -> dict:
+    """Export one accepted candidate from an already serialized safe report."""
     require(allow_private_key_export, "PRIVATE_KEY_EXPORT_NOT_ALLOWED")
-    source, report_path, output = Path(source), Path(report_path), Path(output)
-    manifest = output.with_name(output.name + ".manifest.json")
+    source, output = Path(source), Path(output)
+    manifest = (output.with_name(output.name + ".manifest.json")
+                if manifest_path is None else Path(manifest_path))
+    require(not paths_refer_to_same_file(output, manifest), "PATH_COLLISION")
     for target in (output, manifest):
-        require(not paths_refer_to_same_file(source, target) and
-                not paths_refer_to_same_file(report_path, target), "PATH_COLLISION")
+        require(not paths_refer_to_same_file(source, target), "PATH_COLLISION")
         require(not os.path.lexists(target), "OUTPUT_EXISTS")
     require(output.parent.is_dir(), "OUTPUT_DIRECTORY_MISSING")
     temporary = []
     try:
-        report = json.loads(report_path.read_text(encoding="utf-8-sig"))
         with source.open("rb") as stream:
             plan = prepare(source, report, candidate_id, stream)
             fd, name = tempfile.mkstemp(prefix=".wallet-export-", suffix=".tmp", dir=output.parent)
@@ -326,11 +335,12 @@ def export_wallet(source: Path, report_path: Path, candidate_id: str, output: Pa
             result = {**validation, "sha256": digest.hexdigest(), "size": temp.stat().st_size,
                       "page_count": len(output_pages), "page_size": plan.page_size,
                       "candidate_id": candidate_id, "source_image_basename": source.name}
+            public_manifest = {**result, **(manifest_fields or {})}
             fd, name = tempfile.mkstemp(prefix=".wallet-manifest-", suffix=".tmp", dir=output.parent)
             manifest_temp = Path(name)
             temporary.append(manifest_temp)
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as dest:
-                json.dump(result, dest, indent=2, sort_keys=True)
+                json.dump(public_manifest, dest, indent=2, sort_keys=True)
                 dest.write("\n")
                 dest.flush()
                 os.fsync(dest.fileno())
@@ -350,3 +360,23 @@ def export_wallet(source: Path, report_path: Path, candidate_id: str, output: Pa
     finally:
         for path in temporary:
             path.unlink(missing_ok=True)
+
+
+def export_wallet(source: Path, report_path: Path, candidate_id: str, output: Path,
+                  *, allow_private_key_export: bool = False) -> dict:
+    require(allow_private_key_export, "PRIVATE_KEY_EXPORT_NOT_ALLOWED")
+    source, report_path, output = Path(source), Path(report_path), Path(output)
+    manifest = output.with_name(output.name + ".manifest.json")
+    for target in (output, manifest):
+        require(not paths_refer_to_same_file(report_path, target), "PATH_COLLISION")
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ExportRefused("INVALID_REPORT_OR_STRUCTURE") from None
+    return export_wallet_from_report(
+        source,
+        report,
+        candidate_id,
+        output,
+        allow_private_key_export=allow_private_key_export,
+    )

@@ -111,9 +111,27 @@ Run `bfrs --help` for the complete option list, including bounded `--start` and
 `--end` scans, overlap/chunk controls, Bitcoin text context, and report
 revalidation.
 
+Opt in to exact-page recovery of complete, unambiguous Bitcoin Core wallets:
+
+```powershell
+bfrs --input X:\evidence\case-001.img `
+  --output D:\bfrs-work\case-001-report.json `
+  --targets all --recover-wallets `
+  --recovery-dir D:\private-recovered
+```
+
+Both recovery flags are required. The private recovery directory must remain
+outside every Git working tree. Each successful candidate is written beneath
+`bitcoin-core\candidate_NNN\` as an atomically published `wallet.dat` plus a
+secret-free `recovery_manifest.json`. Existing outputs are never overwritten.
+Ordinary scans never write wallet files.
+
 ## Interpreting results
 
-BFRS report schema 3 exposes `normalized_state` with four independent axes:
+BFRS report schema 4 exposes `normalized_state` with four independent axes and
+an optional-action `wallet_recovery` summary. The summary contains paths,
+hashes, counters and fixed refusal codes only; wallet record values are never
+embedded. The four finding-state axes are:
 
 - `discovery_state`: `RAW`, `REJECTED`, `CANDIDATE`, or `ACCEPTED`;
 - `structural_state`: `NONE`, `FRAGMENT`, or `COMPLETE`;

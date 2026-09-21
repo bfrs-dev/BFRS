@@ -44,6 +44,18 @@ def recovery_support_findings(report: Mapping[str, Any]):
             yield {**row, "artifact_kind": kind}
     for row in report.get("reconstructed_wallet_results", ()):
         yield {**row, "artifact_kind": "reconstructed_wallet"}
+    for row in report.get("wallet_recovery", {}).get("outputs", ()):
+        if row.get("status") == "RECOVERED":
+            yield {
+                **row,
+                "artifact_kind": "reconstructed_wallet",
+                "normalized_state": {
+                    "discovery_state": "ACCEPTED",
+                    "structural_state": "COMPLETE",
+                    "crypto_state": "UNCHECKED",
+                    "recovery_relevance": "INDEPENDENT",
+                },
+            }
     for wallet in report.get("legacy_wallet_recovery", {}).get("candidates", ()):
         state = wallet.get("normalized_state", {})
         if (state.get("discovery_state") == DiscoveryState.REJECTED
