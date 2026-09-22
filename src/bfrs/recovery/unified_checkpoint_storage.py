@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 import hashlib
@@ -9,15 +10,16 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import zlib
 
 from bfrs.core.models import RawHit
 from bfrs.recovery.mnemonic.seed_scan_checkpoint import source_identity
-from bfrs.validators.evidence_strength import EvidenceStrength, classify_raw_hit
 from bfrs.version import APP_NAME, VERSION
 
 
 SQLITE_HEADER = b"SQLite format 3\x00"
-MAX_PERSISTED_HITS_PER_UNIT = 256
+MAX_PERSISTED_HITS_PER_UNIT = 256  # Historical v3 replay threshold.
+RESULT_CODEC = "json-zlib-v1"
 
 
 def _owner():
@@ -67,29 +69,64 @@ def _read_metadata(connection: sqlite3.Connection) -> dict[str, object]:
         ) from error
 
 
-def _is_rejected_noise(hit: RawHit) -> bool:
-    validation = hit.validation_status.upper()
-    return (
-        hit.structural_status.upper() == "REJECTED"
-        or validation == "REJECTED"
-        or any(
-            marker in validation
-            for marker in ("REJECTED", "INVALID", "INSUFFICIENT", "OUT_OF_SCOPE")
-        )
-    )
+def _unit_summary(hits: tuple[RawHit, ...]) -> dict[str, object]:
+    """Return secret-free counters committed with a unit's exact hit state."""
+
+    raw_by_target: Counter[str] = Counter()
+    rejected_by_target: Counter[str] = Counter()
+    pending_by_target: Counter[str] = Counter()
+    validated_by_target: Counter[str] = Counter()
+    fingerprints: dict[str, set[str]] = {}
+    anchors = 0
+    for hit in hits:
+        raw_by_target[hit.target] += 1
+        if hit.target == "internal":
+            anchors += 1
+        elif hit.validation_status == "REJECTED" or hit.structural_status == "REJECTED":
+            rejected_by_target[hit.target] += 1
+        elif hit.validation_status == "UNVALIDATED":
+            pending_by_target[hit.target] += 1
+        else:
+            validated_by_target[hit.target] += 1
+            if hit.safe_fingerprint is not None:
+                fingerprints.setdefault(hit.target, set()).add(hit.safe_fingerprint)
+    return {
+        "raw_hits": len(hits),
+        "anchors": anchors,
+        "raw_by_target": dict(sorted(raw_by_target.items())),
+        "rejected_by_target": dict(sorted(rejected_by_target.items())),
+        "pending_by_target": dict(sorted(pending_by_target.items())),
+        "validated_by_target": dict(sorted(validated_by_target.items())),
+        "validated_fingerprints": {
+            target: sorted(values) for target, values in sorted(fingerprints.items())
+        },
+    }
 
 
-def _requires_replay(hits: tuple[RawHit, ...]) -> bool:
-    """Bound persistence while preserving exact results by rescanning a unit."""
+def _encode_hits(hits: tuple[RawHit, ...]) -> tuple[bytes, str, str]:
+    owner = _owner()
+    raw = _json([owner._serialize_hit(hit) for hit in hits]).encode("ascii")
+    digest = hashlib.sha256(raw).hexdigest()
+    return zlib.compress(raw, level=1), digest, _json(_unit_summary(hits))
 
-    return (
-        len(hits) > MAX_PERSISTED_HITS_PER_UNIT
-        or any(
-            _is_rejected_noise(hit)
-            or classify_raw_hit(hit).strength is EvidenceStrength.WEAK
-            for hit in hits
-        )
-    )
+
+def _decode_hits(
+    payload: bytes, expected_digest: str, expected_count: int,
+) -> tuple[RawHit, ...]:
+    owner = _owner()
+    try:
+        raw = zlib.decompress(payload)
+        if hashlib.sha256(raw).hexdigest() != expected_digest:
+            raise ValueError("result digest mismatch")
+        decoded = json.loads(raw)
+        if not isinstance(decoded, list) or len(decoded) != expected_count:
+            raise ValueError("result count mismatch")
+        hits = tuple(owner._restore_hit(item) for item in decoded)
+        return hits
+    except (zlib.error, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise owner.UnifiedCheckpointError(
+            "corrupted persisted state for completed ownership range"
+        ) from error
 
 
 class _CompletedResults(Mapping[tuple[int, int], tuple[RawHit, ...]]):
@@ -103,7 +140,7 @@ class _CompletedResults(Mapping[tuple[int, int], tuple[RawHit, ...]]):
             with _session(self.path) as connection:
                 rows = connection.execute(
                     "SELECT ownership_start, ownership_end FROM work_units "
-                    "WHERE replay_required = 0 ORDER BY ownership_start, ownership_end"
+                    "ORDER BY ownership_start, ownership_end"
                 ).fetchall()
             yield from ((int(start), int(end)) for start, end in rows)
         except sqlite3.DatabaseError as error:
@@ -115,7 +152,7 @@ class _CompletedResults(Mapping[tuple[int, int], tuple[RawHit, ...]]):
         try:
             with _session(self.path) as connection:
                 row = connection.execute(
-                    "SELECT COUNT(*) FROM work_units WHERE replay_required = 0"
+                    "SELECT COUNT(*) FROM work_units"
                 ).fetchone()
             return int(row[0])
         except sqlite3.DatabaseError as error:
@@ -128,22 +165,30 @@ class _CompletedResults(Mapping[tuple[int, int], tuple[RawHit, ...]]):
         try:
             with _session(self.path) as connection:
                 state = connection.execute(
-                    "SELECT replay_required FROM work_units "
+                    "SELECT hit_count, result_digest, summary_payload FROM work_units "
                     "WHERE ownership_start = ? AND ownership_end = ?",
                     (start, end),
                 ).fetchone()
-                if state is None or int(state[0]):
+                if state is None:
                     raise KeyError(unit)
-                rows = connection.execute(
-                    "SELECT payload FROM results "
-                    "WHERE unit_start = ? AND unit_end = ? ORDER BY ordinal",
+                row = connection.execute(
+                    "SELECT codec, payload FROM results "
+                    "WHERE unit_start = ? AND unit_end = ?",
                     (start, end),
-                ).fetchall()
-            return tuple(
-                _owner()._restore_hit(json.loads(payload))
-                for (payload,) in rows
-            )
+                ).fetchone()
+            if row is None or row[0] != RESULT_CODEC:
+                raise _owner().UnifiedCheckpointError(
+                    "missing or unsupported persisted state for completed ownership range"
+                )
+            hits = _decode_hits(bytes(row[1]), str(state[1]), int(state[0]))
+            if _json(_unit_summary(hits)) != str(state[2]):
+                raise _owner().UnifiedCheckpointError(
+                    "corrupted persisted counters for completed ownership range"
+                )
+            return hits
         except KeyError:
+            raise
+        except _owner().UnifiedCheckpointError:
             raise
         except (sqlite3.DatabaseError, json.JSONDecodeError, TypeError, ValueError) as error:
             raise _owner().UnifiedCheckpointError(
@@ -195,24 +240,21 @@ class SQLiteUnifiedScanCheckpoint:
                         ownership_start INTEGER NOT NULL,
                         ownership_end INTEGER NOT NULL,
                         hit_count INTEGER NOT NULL,
-                        replay_required INTEGER NOT NULL
-                            CHECK (replay_required IN (0, 1)),
                         result_digest TEXT NOT NULL,
+                        summary_payload TEXT NOT NULL,
+                        state_bytes INTEGER NOT NULL CHECK (state_bytes >= 0),
                         PRIMARY KEY (ownership_start, ownership_end)
                     ) WITHOUT ROWID;
                     CREATE TABLE results (
                         unit_start INTEGER NOT NULL,
                         unit_end INTEGER NOT NULL,
-                        result_key TEXT NOT NULL,
-                        ordinal INTEGER NOT NULL,
-                        payload TEXT NOT NULL,
-                        PRIMARY KEY (unit_start, unit_end, result_key),
+                        codec TEXT NOT NULL,
+                        payload BLOB NOT NULL,
+                        PRIMARY KEY (unit_start, unit_end),
                         FOREIGN KEY (unit_start, unit_end)
                             REFERENCES work_units (ownership_start, ownership_end)
                             ON DELETE CASCADE
                     ) WITHOUT ROWID;
-                    CREATE INDEX results_unit_order
-                        ON results (unit_start, unit_end, ordinal);
                     """
                 )
                 connection.execute(
@@ -270,12 +312,17 @@ class SQLiteUnifiedScanCheckpoint:
         try:
             with _session(path) as connection:
                 schema = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                payload = _read_metadata(connection)
+                if schema == 1 and payload.get("format_version") == 3:
+                    raise owner.UnifiedCheckpointError(
+                        "checkpoint v3 requires legacy replay and cannot provide true "
+                        "resume; start a new v4 checkpoint"
+                    )
                 if schema != owner.UNIFIED_CHECKPOINT_SCHEMA_VERSION:
                     raise owner.UnifiedCheckpointError(
                         "checkpoint format mismatch: unsupported SQLite schema version "
                         f"(expected {owner.UNIFIED_CHECKPOINT_SCHEMA_VERSION})"
                     )
-                payload = _read_metadata(connection)
                 if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                     raise owner.UnifiedCheckpointError("corrupted unified checkpoint")
             if (
@@ -330,6 +377,8 @@ class SQLiteUnifiedScanCheckpoint:
             ) from error
         manager = cls(path)
         len(manager.completed_results)
+        manager._validate_completed_prefix(payload)
+        manager._validate_completed_ranges()
         return manager
 
     def _database(self) -> sqlite3.Connection:
@@ -353,7 +402,7 @@ class SQLiteUnifiedScanCheckpoint:
             with _session(self.path) as connection:
                 row = connection.execute(
                     "SELECT COALESCE(SUM(ownership_end - ownership_start), 0) "
-                    "FROM work_units WHERE replay_required = 0"
+                    "FROM work_units"
                 ).fetchone()
             return int(row[0])
         except sqlite3.DatabaseError as error:
@@ -363,14 +412,48 @@ class SQLiteUnifiedScanCheckpoint:
 
     @property
     def replay_required_units(self) -> tuple[tuple[int, int], ...]:
-        with _session(self.path) as connection:
-            return tuple(
-                (int(start), int(end))
-                for start, end in connection.execute(
-                    "SELECT ownership_start, ownership_end FROM work_units "
-                    "WHERE replay_required = 1 ORDER BY ownership_start, ownership_end"
+        return ()
+
+    def _validate_completed_ranges(self) -> None:
+        for unit in self.completed_results:
+            self.completed_results[unit]
+
+    def _validate_completed_prefix(self, metadata: Mapping[str, object]) -> None:
+        try:
+            scan_range = metadata["range"]
+            geometry = metadata["geometry"]
+            cursor = int(scan_range["start"])
+            range_end = int(scan_range["end"])
+            step = int(geometry["chunk_size"]) - int(geometry["overlap"])
+            for unit_start, unit_end in self.completed_results:
+                scan_end = min(cursor + int(geometry["chunk_size"]), range_end)
+                expected_end = range_end if scan_end >= range_end else min(
+                    cursor + step, range_end
                 )
-            )
+                if (unit_start, unit_end) != (cursor, expected_end):
+                    raise ValueError("non-contiguous ownership range")
+                cursor = unit_end
+        except (KeyError, TypeError, ValueError) as error:
+            raise _owner().UnifiedCheckpointError(
+                "corrupted completed ownership prefix"
+            ) from error
+
+    @property
+    def storage_statistics(self) -> dict[str, float | int]:
+        with _session(self.path) as connection:
+            units, findings, payload_bytes = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(hit_count), 0), "
+                "COALESCE(SUM(state_bytes), 0) FROM work_units"
+            ).fetchone()
+        file_bytes = self.path.stat().st_size
+        return {
+            "work_units": int(units),
+            "findings": int(findings),
+            "payload_bytes": int(payload_bytes),
+            "file_bytes": file_bytes,
+            "bytes_per_work_unit": file_bytes / units if units else 0.0,
+            "bytes_per_finding": file_bytes / findings if findings else 0.0,
+        }
 
     def record(
         self,
@@ -383,27 +466,17 @@ class SQLiteUnifiedScanCheckpoint:
         start, end = unit
         if start < 0 or end <= start or completed < 0 or total < completed:
             raise owner.UnifiedCheckpointError("invalid completed ownership range")
-        replay_required = _requires_replay(hits)
-        serialized: list[tuple[str, int, str]] = []
-        digest = hashlib.sha256()
-        if replay_required:
-            digest.update(f"replay:{len(hits)}".encode("ascii"))
-        else:
-            for ordinal, hit in enumerate(hits):
-                payload = owner._canonical_json(owner._serialize_hit(hit))
-                result_key = hashlib.sha256(payload.encode("ascii")).hexdigest()
-                digest.update(result_key.encode("ascii"))
-                serialized.append((result_key, ordinal, payload))
-        result_digest = digest.hexdigest()
+        payload, result_digest, summary_payload = _encode_hits(hits)
         connection = self._database()
         try:
             with connection:
                 existing = connection.execute(
-                    "SELECT hit_count, replay_required, result_digest FROM work_units "
+                    "SELECT hit_count, result_digest, summary_payload, state_bytes "
+                    "FROM work_units "
                     "WHERE ownership_start = ? AND ownership_end = ?",
                     (start, end),
                 ).fetchone()
-                expected = (len(hits), int(replay_required), result_digest)
+                expected = (len(hits), result_digest, summary_payload, len(payload))
                 if existing is not None:
                     if tuple(existing) != expected:
                         raise owner.UnifiedCheckpointError(
@@ -412,18 +485,14 @@ class SQLiteUnifiedScanCheckpoint:
                     return
                 connection.execute(
                     "INSERT INTO work_units "
-                    "(ownership_start, ownership_end, hit_count, replay_required, "
-                    "result_digest) VALUES (?, ?, ?, ?, ?)",
+                    "(ownership_start, ownership_end, hit_count, result_digest, "
+                    "summary_payload, state_bytes) VALUES (?, ?, ?, ?, ?, ?)",
                     (start, end, *expected),
                 )
-                connection.executemany(
-                    "INSERT OR IGNORE INTO results "
-                    "(unit_start, unit_end, result_key, ordinal, payload) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        (start, end, result_key, ordinal, payload)
-                        for result_key, ordinal, payload in serialized
-                    ),
+                connection.execute(
+                    "INSERT INTO results "
+                    "(unit_start, unit_end, codec, payload) VALUES (?, ?, ?, ?)",
+                    (start, end, RESULT_CODEC, sqlite3.Binary(payload)),
                 )
         except sqlite3.DatabaseError as error:
             raise owner.UnifiedCheckpointError(

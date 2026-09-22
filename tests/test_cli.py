@@ -15,10 +15,12 @@ from bfrs.cli import (
     DEFAULT_OVERLAP_KIB,
     DEFAULT_PADDING_MIB,
     _ElectrumProgressLine,
+    _ProgressLine,
     build_parser,
     main,
 )
 from bfrs.validators.berkeley_metadata import BTREE_MAGIC
+from bfrs.scanners.fast_scanner import ScanProgress
 import bfrs.recovery.full_image_coordinator as coordinator_module
 import bfrs.scanners.target_registry as target_registry_module
 from bfrs.recovery.mnemonic.electrum_v1_validator import ElectrumV1Validator
@@ -835,6 +837,21 @@ def test_electrum_recovery_progress_has_count_percent_and_eta(capsys):
     stderr = capsys.readouterr().err
     assert "Electrum recovery 32/100   32.0%  ETA 00:00:17" in stderr
     assert "Electrum recovery 100/100  100.0%  ETA 00:00:00" in stderr
+
+
+def test_resumed_progress_uses_completed_floor_and_remaining_rate(capsys):
+    mib = 1024 * 1024
+    progress = _ProgressLine("Target scan", rate_base=200 * mib)
+    progress._started -= 10.0
+    progress(ScanProgress(
+        scanned_bytes=300 * mib,
+        total_bytes=500 * mib,
+        raw_hits=7,
+    ))
+    stderr = capsys.readouterr().err
+    assert "Target scan  60.0%" in stderr
+    assert "300.0/500.0 MiB" not in stderr  # default byte display remains explicit
+    assert "ETA calculating" not in stderr
 
 
 def test_cli_targets_validate_unknown_and_legacy_mode_conflicts(tmp_path):

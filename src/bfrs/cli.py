@@ -668,7 +668,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"checkpoint error: {error}", file=sys.stderr)
         return 3
     ntfs_progress = _NTFSProgressLine()
-    scan_progress = _ProgressLine("Target scan", targets=selection.targets)
+    scan_progress = _ProgressLine(
+        "Target scan",
+        targets=selection.targets,
+        rate_base=(unified_checkpoint.completed_bytes
+                   if unified_checkpoint is not None else 0),
+    )
     electrum_progress = _ElectrumProgressLine()
     try:
         result = coordinator.scan(

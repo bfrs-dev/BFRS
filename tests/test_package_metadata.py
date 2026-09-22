@@ -17,7 +17,7 @@ def test_project_metadata_uses_code_version_and_main_cli_entry_point() -> None:
         "attr": "bfrs.version.VERSION"
     }
     assert metadata["project"]["scripts"]["bfrs"] == "bfrs.cli:main"
-    assert VERSION == "2.0.0"
+    assert VERSION == "2.0.1"
 
 
 def test_package_discovery_is_limited_to_bfrs_under_src() -> None:
