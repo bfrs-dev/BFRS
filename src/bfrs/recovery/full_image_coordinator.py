@@ -133,6 +133,9 @@ from bfrs.validators.bitcoin_record_key import (
 )
 
 
+_MAX_INTACT_FILE_VALIDATION_BYTES = 256 * 1024 * 1024
+
+
 _RAW_KEY_SIDE_HIT_TYPES = {
     f"bitcoin_{record_type}": record_type
     for record_type in RAW_KEY_SIDE_RECORD_TYPES
@@ -261,6 +264,7 @@ class FullImageRecoveryCoordinator:
         end: int | None = None,
         *,
         electrum_only: bool = False,
+        intact_file_mode: bool = False,
         targets: frozenset[str] | None = None,
         progress: Callable[[ScanProgress], None] | None = None,
         ntfs_progress: Callable[[NTFSMFTIndexProgress], None] | None = None,
@@ -433,18 +437,69 @@ class FullImageRecoveryCoordinator:
                     (hotspot.start_offset, hotspot.end_offset, direct)
                 )
 
-        metadata = self._metadata_candidates(contexts)
-        pages = self._page_candidates(contexts, metadata)
-        range_reader = _AcceptedContextRangeReader(contexts)
-        databases = FragmentedBerkeleyPageReassembler(
-            pages, range_reader=range_reader
-        ).reconstruct(metadata)
-        wallet_results = tuple(
-            ReconstructedBerkeleyWalletPipeline(
-                database, range_reader=range_reader
-            ).run()
-            for database in databases
+        if (
+            intact_file_mode
+            and start == 0
+            and range_end == reader.file_size
+            and range_end <= _MAX_INTACT_FILE_VALIDATION_BYTES
+        ):
+            try:
+                with reader.path.open("rb") as intact_stream:
+                    prefix = intact_stream.read(MAGIC_OFFSET + 4)
+                    magic = prefix[MAGIC_OFFSET:MAGIC_OFFSET + 4]
+                    if magic in {
+                        BTREE_MAGIC.to_bytes(4, "little"),
+                        BTREE_MAGIC.to_bytes(4, "big"),
+                    }:
+                        intact_stream.seek(0)
+                        intact_context = ValidationContext(
+                            str(reader.path.resolve()), 0, intact_stream.read()
+                        )
+                        intact_direct = direct_pipeline.run(intact_context)
+                        if (
+                            intact_direct.status is ValidationStatus.STRUCTURAL
+                            and (
+                                intact_direct.summary.valid_plaintext_key_count > 0
+                                or intact_direct.encrypted_wallet_evidence.structural_database_count > 0
+                            )
+                        ):
+                            contexts = [intact_context]
+                            direct_with_ranges = [(0, range_end, intact_direct)]
+            except OSError as error:
+                errors.append((0, range_end, "intact_file_read_error", type(error).__name__))
+
+        intact_wallet_fast_path = bool(
+            intact_file_mode
+            and start == 0
+            and range_end == reader.file_size
+            and any(
+                direct.status is ValidationStatus.STRUCTURAL
+                and (
+                    direct.summary.valid_plaintext_key_count > 0
+                    or direct.encrypted_wallet_evidence.structural_database_count > 0
+                )
+                for hotspot_start, hotspot_end, direct in direct_with_ranges
+                if hotspot_start == 0 and hotspot_end == range_end
+            )
         )
+        range_reader = _AcceptedContextRangeReader(contexts)
+        if intact_wallet_fast_path:
+            metadata = ()
+            pages = ()
+            databases = ()
+            wallet_results = ()
+        else:
+            metadata = self._metadata_candidates(contexts)
+            pages = self._page_candidates(contexts, metadata)
+            databases = FragmentedBerkeleyPageReassembler(
+                pages, range_reader=range_reader
+            ).reconstruct(metadata)
+            wallet_results = tuple(
+                ReconstructedBerkeleyWalletPipeline(
+                    database, range_reader=range_reader
+                ).run()
+                for database in databases
+            )
         logical_wallet_results: list[LogicalBerkeleyDatabaseRecoveryResult] = []
         for database in databases:
             identity = database.identity
@@ -661,6 +716,7 @@ class FullImageRecoveryCoordinator:
                     sorted(raw_hit_counts.items())
                 ),
                 "selected_targets": tuple(sorted(targets or ())),
+                "intact_wallet_fast_path": intact_wallet_fast_path,
                 "mnemonic_coverage": {
                     "performed": bool(self._mnemonic_standards),
                     "standards": tuple(sorted(self._mnemonic_standards)),

@@ -70,6 +70,23 @@ bfrs --input X:\evidence\case-001.img `
   --targets bitcoin-core,electrum,multibit
 ```
 
+Scan one ordinary file or a directory recursively:
+
+```powershell
+bfrs --input D:\RecoveredFiles\backup.dat `
+  --output D:\bfrs-work\file-report.json --targets all
+
+bfrs --input D:\RecoveredFiles `
+  --output D:\bfrs-work\folder-report.json --targets all
+```
+
+Directories and mounted volume roots are detected automatically. Folder scans
+visit every regular file recursively, do not follow symlinks or junctions, and
+continue after inaccessible or broken files. Findings from `FILE` and `FOLDER`
+sources use `file_path` plus a file-local offset; `IMAGE` findings retain
+physical-offset semantics. Large files still use the shared chunked reader and
+overlap policy.
+
 Use mnemonic workers and include mnemonic detection in the shared scan:
 
 ```powershell
@@ -89,14 +106,17 @@ bfrs --input X:\evidence\case-001.img `
   --checkpoint D:\bfrs-work\case-001.checkpoint.sqlite
 ```
 
-Resume with the same source, range, chunk geometry, targets, and scanner
-semantics:
+Resume an image or individual file with the same source, range, chunk geometry,
+targets, and scanner semantics:
 
 ```powershell
 bfrs --input X:\evidence\case-001.img `
   --output D:\bfrs-work\case-001-report.json `
   --resume-checkpoint D:\bfrs-work\case-001.checkpoint.sqlite
 ```
+
+Folder checkpoint/resume is intentionally deferred to P2.7.1; existing image
+and individual-file checkpoint validation remains unchanged.
 
 A mnemonic-only scan is available when wallet/container recovery is not
 required:
@@ -128,7 +148,7 @@ Ordinary scans never write wallet files.
 
 ## Interpreting results
 
-BFRS report schema 4 exposes `normalized_state` with four independent axes and
+BFRS report schema 5 exposes `normalized_state` with four independent axes and
 an optional-action `wallet_recovery` summary. The summary contains paths,
 hashes, counters and fixed refusal codes only; wallet record values are never
 embedded. The four finding-state axes are:
@@ -152,8 +172,8 @@ export compatibility. At a high level:
   candidates, and likely wordlist false positives without invalidating the
   underlying cryptographic result.
 
-Review reason codes, provenance, allocation state, validation status, and
-physical offsets together. Never treat a single marker or confidence label as
+Review reason codes, provenance, allocation state, validation status, and the
+source-specific location model together. Never treat a single marker or confidence label as
 conclusive evidence.
 
 ## Output and forensic safety

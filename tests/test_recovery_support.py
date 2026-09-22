@@ -110,7 +110,7 @@ def test_cli_success_once_after_report_and_no_donation_in_json(tmp_path, capsys,
     assert BTC_DONATION_ADDRESS not in report
     assert "donation" not in report.lower()
     if mode != "seed":
-        assert json.loads(report)["report_schema_version"] == 4
+        assert json.loads(report)["report_schema_version"] == 5
 
 
 def test_cli_weak_anchor_no_message(tmp_path, capsys):

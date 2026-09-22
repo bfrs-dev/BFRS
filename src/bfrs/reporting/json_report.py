@@ -7,12 +7,13 @@ from typing import Any, Mapping
 import uuid
 
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryResult
+from bfrs.core.models import ValidationStatus
 from bfrs.version import APP_NAME, VERSION
 from bfrs.recovery.automatic_wallet_recovery import recovery_not_requested
 from bfrs.reporting.finding_state import normalized_row, summarize_findings
 
 
-REPORT_SCHEMA_VERSION = 4
+REPORT_SCHEMA_VERSION = 5
 _LIKELY_WORDLIST_FALSE_POSITIVE = "LIKELY_WORDLIST_FALSE_POSITIVE"
 
 
@@ -1229,6 +1230,38 @@ def _bitcoin_context_evidence(result: FullImageRecoveryResult) -> dict[str, Any]
     }
 
 
+
+def _file_local_report(payload: dict[str, Any], file_path: str) -> dict[str, Any]:
+    """Rename physical-location labels when offsets belong to a regular file."""
+    key_map = {
+        "physical_start": "file_offset_start",
+        "physical_end": "file_offset_end",
+        "physical_offset": "file_offset",
+        "physical_image_ranges": "file_ranges",
+        "metadata_physical_offset": "metadata_file_offset",
+    }
+
+    def convert(value):
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if isinstance(value, tuple):
+            return [convert(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        result = {}
+        for key, item in value.items():
+            result[key_map.get(key, key)] = convert(item)
+        return result
+
+    localized = convert(payload)
+    for finding in localized.get("target_findings", []):
+        finding["file_path"] = file_path
+    localized["location_model"] = {
+        "offset_kind": "file_offset",
+        "file_path": file_path,
+    }
+    return localized
+
 def serialize_full_image_result(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
@@ -1251,6 +1284,8 @@ def serialize_full_image_result(
             "skip_mnemonic",
             "targets",
             "signature_set",
+            "source_type",
+            "source_root",
         )
         if name in configuration
     }
@@ -1272,6 +1307,13 @@ def serialize_full_image_result(
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "application": {"name": APP_NAME, "version": VERSION},
         "source": result.source,
+        "source_type": configuration.get("source_type", "IMAGE"),
+        "source_root": configuration.get("source_root", result.source),
+        "location_model": (
+            {"offset_kind": "physical_offset"}
+            if configuration.get("source_type", "IMAGE") == "IMAGE"
+            else {"offset_kind": "file_offset", "file_path": result.source}
+        ),
         "scan_range": {
             "start_offset": result.start_offset,
             "end_offset": result.end_offset,
@@ -1411,6 +1453,32 @@ def serialize_full_image_result(
             payload[section], scope=f"{section}; overlapping recovery view, not additive")
         for section in ("direct_results", "reconstructed_databases", "reconstructed_wallet_results")
     }
+    source_type = str(configuration.get("source_type", "IMAGE"))
+    direct_intact = bool(
+        source_type == "FILE"
+        and result.evidence.get("intact_wallet_fast_path", False)
+        and any(
+            row.get("status") == ValidationStatus.STRUCTURAL.value
+            for row in payload["direct_results"]
+        )
+    )
+    electrum_intact = bool(
+        payload["electrum_raw_recovery"].get("complete_candidates", 0)
+    )
+    payload["intact_wallet"] = {
+        "detected": bool(source_type == "FILE" and (direct_intact or electrum_intact)),
+        "wallet_family": (
+            "BITCOIN_CORE" if direct_intact else
+            "ELECTRUM" if electrum_intact else None
+        ),
+        "format": "BDB" if direct_intact else "ELECTRUM" if electrum_intact else None,
+        "fast_path_used": bool(
+            result.evidence.get("intact_wallet_fast_path", False)
+            or (source_type == "FILE" and electrum_intact)
+        ),
+    }
+    if source_type == "FILE":
+        payload = _file_local_report(payload, result.source)
     return payload
 
 

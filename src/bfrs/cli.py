@@ -8,9 +8,11 @@ import time
 from typing import Sequence
 
 from bfrs.core.path_safety import paths_refer_to_same_file
+from bfrs.core.source_types import SourceType, detect_source_type
 from bfrs.core.worker_control import WorkerControlError
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
 from bfrs.recovery.automatic_wallet_recovery import (
+    recover_intact_wallet,
     recover_wallets,
     recovery_not_requested,
     validate_recovery_destination,
@@ -246,8 +248,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m bfrs.cli",
         description="BFRS filesystem and wallet recovery scan",
     )
-    parser.add_argument("--input", required=True, type=Path, help="source image path")
+    parser.add_argument("--input", required=True, type=Path, help="source image, file, or directory path")
     parser.add_argument("--output", required=True, type=Path, help="JSON report path")
+    parser.add_argument(
+        "--source-type", choices=("image", "file", "folder"),
+        help="optional source override; normally detected automatically",
+    )
     parser.add_argument(
         "--recover-wallets",
         action="store_true",
@@ -441,6 +447,10 @@ def _configuration(arguments, selection=None) -> dict[str, object]:
         "workers": arguments.workers,
         "targets": sorted(selection.targets),
         "signature_set": [signature.name for signature in selection.signatures],
+        "source_type": detect_source_type(
+            arguments.input, arguments.source_type
+        ).value,
+        "source_root": str(arguments.input.resolve(strict=False)),
     }
 
 
@@ -449,6 +459,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     _validate_arguments(parser, arguments)
     _validate_path_collisions(parser, arguments)
+    try:
+        source_type = detect_source_type(arguments.input, arguments.source_type)
+    except ValueError as error:
+        parser.error(str(error))
+    if source_type is SourceType.FOLDER:
+        if arguments.revalidate_wallet_records is not None:
+            parser.error("wallet-record revalidation requires a regular file source")
+        if arguments.start != 0 or arguments.end is not None:
+            parser.error("--start/--end are not supported for FOLDER sources")
+        if arguments.checkpoint or arguments.resume_checkpoint:
+            parser.error(
+                "FOLDER checkpoint/resume is deferred to P2.7.1; IMAGE resume is unchanged"
+            )
+        root = arguments.input.resolve(strict=False)
+        output = arguments.output.resolve(strict=False)
+        if root == output or root in output.parents:
+            parser.error("folder report output must be outside the source root")
+        from bfrs.scanners.folder_source_scanner import scan_folder_source
+        return scan_folder_source(arguments, main)
     if arguments.revalidate_wallet_records is not None:
         try:
             old_report = json.loads(
@@ -633,6 +662,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             start=arguments.start,
             end=arguments.end,
             electrum_only=arguments.electrum_only,
+            intact_file_mode=(source_type is SourceType.FILE),
             targets=selection.targets,
             progress=scan_progress,
             ntfs_progress=ntfs_progress,
@@ -677,8 +707,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     wallet_recovery = recovery_not_requested()
     if arguments.recover_wallets:
         try:
-            wallet_recovery = recover_wallets(
-                arguments.input, public_report, arguments.recovery_dir)
+            if (source_type is SourceType.FILE
+                    and public_report.get("intact_wallet", {}).get("detected")):
+                wallet_recovery = recover_intact_wallet(
+                    arguments.input, public_report, arguments.recovery_dir
+                )
+            else:
+                wallet_recovery = recover_wallets(
+                    arguments.input, public_report, arguments.recovery_dir)
         except ExportRefused as error:
             wallet_recovery = {
                 "requested": True,

@@ -156,7 +156,7 @@ def historical_wallet_result(tmp_path) -> FullImageRecoveryResult:
 def test_safe_json_schema_is_explicit_and_deterministic(tmp_path):
     result = historical_wallet_result(tmp_path)
     payload = serialize_full_image_result(result, CONFIGURATION)
-    assert payload["report_schema_version"] == REPORT_SCHEMA_VERSION == 4
+    assert payload["report_schema_version"] == REPORT_SCHEMA_VERSION == 5
     assert payload["application"] == {"name": APP_NAME, "version": VERSION}
     assert payload["source"] == str((tmp_path / "historical-wallet.img").resolve())
     assert payload["scan_range"] == {

@@ -20,6 +20,14 @@ not required for structurally complete encrypted wallets.
 
 Every successful wallet has a sibling `recovery_manifest.json` containing only
 safe identifiers, ranges, hashes, geometry, record counters, encryption state,
-and the method `EXACT_VALIDATED_PAGE_COPY`. The scan report schema is version 4
-because it adds the top-level `wallet_recovery` contract. Default reports set
-`requested` to false and never create a private artifact.
+and the recovery method. Reconstructed image candidates use
+`EXACT_VALIDATED_PAGE_COPY`. A complete wallet discovered as an ordinary file
+uses `EXACT_INTACT_FILE_COPY` after byte-for-byte hash and format validation;
+BFRS does not reconstruct its pages. Folder recovery places each source file
+under a deterministic `file_NNNNNN` prefix so identical contents retain distinct
+provenance and cannot collide.
+
+The scan report schema is version 5 because P2.7 adds source type, source root,
+and source-specific location semantics. Default reports set `requested` to
+false and never create a private artifact. Folder checkpoint/resume is deferred
+to P2.7.1; existing image and individual-file checkpoint behavior is unchanged.
