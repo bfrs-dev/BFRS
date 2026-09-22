@@ -1281,6 +1281,8 @@ def serialize_full_image_result(
             "minimum_distinct_types",
             "electrum_only",
             "include_mnemonic",
+            "mnemonic_scan_requested",
+            "mnemonic_standards_requested",
             "skip_mnemonic",
             "targets",
             "signature_set",
@@ -1289,6 +1291,23 @@ def serialize_full_image_result(
         )
         if name in configuration
     }
+    mnemonic_coverage = dict(result.evidence.get("mnemonic_coverage", {
+        "performed": False, "standards": (),
+    }))
+    mnemonic_scan_performed = bool(mnemonic_coverage.get("performed", False))
+    mnemonic_standards_checked = list(
+        mnemonic_coverage.get("standards", ())
+        if mnemonic_scan_performed else ()
+    )
+    safe_configuration["include_mnemonic"] = mnemonic_scan_performed
+    safe_configuration["mnemonic_scan_requested"] = bool(
+        configuration.get("mnemonic_scan_requested", mnemonic_scan_performed)
+    )
+    safe_configuration["mnemonic_standards_requested"] = list(
+        configuration.get(
+            "mnemonic_standards_requested", mnemonic_standards_checked
+        )
+    )
     diagnostics = {
         name: result.evidence.get(name, ())
         for name in (
@@ -1382,9 +1401,10 @@ def serialize_full_image_result(
         "target_findings": target_findings,
         "rejected_statistics": rejected_statistics,
         "bitcoin_context_evidence": _bitcoin_context_evidence(result),
-        "mnemonic_coverage": dict(result.evidence.get("mnemonic_coverage", {
-            "performed": False, "standards": (),
-        })),
+        "mnemonic_scan_requested": safe_configuration["mnemonic_scan_requested"],
+        "mnemonic_scan_performed": mnemonic_scan_performed,
+        "mnemonic_standards_checked": mnemonic_standards_checked,
+        "mnemonic_coverage": mnemonic_coverage,
         "mnemonic_recovery": dict(result.evidence.get("mnemonic_recovery", {
             "candidates_total": 0,
             "crypto_valid_occurrences": 0,

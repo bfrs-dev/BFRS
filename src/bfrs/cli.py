@@ -247,6 +247,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m bfrs.cli",
         description="BFRS filesystem and wallet recovery scan",
+        epilog=(
+            "Input is auto-detected as an image, regular file, or folder. "
+            "Folder scans recurse through regular files without following "
+            "symlinks or junctions; folder checkpoint/resume is not supported."
+        ),
     )
     parser.add_argument("--input", required=True, type=Path, help="source image, file, or directory path")
     parser.add_argument("--output", required=True, type=Path, help="JSON report path")
@@ -257,7 +262,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--recover-wallets",
         action="store_true",
-        help="write fully validated Bitcoin Core wallets to --recovery-dir",
+        help=("copy or reconstruct fully validated wallets in --recovery-dir; "
+              "opt-in and may write private wallet material"),
     )
     parser.add_argument(
         "--recovery-dir",
@@ -433,6 +439,12 @@ def _configuration(arguments, selection=None) -> dict[str, object]:
         targets = (frozenset({"electrum"}) if arguments.electrum_only else
                    LEGACY_TARGETS)
         selection = build_target_selection(targets, include_mnemonics=False)
+    mnemonic_standards = sorted({
+        standard
+        for detector in selection.chunk_detectors
+        for standard in getattr(detector, "standards", ())
+    })
+    mnemonic_scan_requested = bool(mnemonic_standards)
     return {
         "chunk_mib": arguments.chunk_mib,
         "overlap_kib": arguments.overlap_kib,
@@ -442,7 +454,9 @@ def _configuration(arguments, selection=None) -> dict[str, object]:
         "minimum_distinct_types": arguments.minimum_distinct_types,
         "electrum_only": arguments.electrum_only,
         "seed_scan_only": arguments.seed_scan_only,
-        "include_mnemonic": arguments.include_mnemonic,
+        "include_mnemonic": mnemonic_scan_requested,
+        "mnemonic_scan_requested": mnemonic_scan_requested,
+        "mnemonic_standards_requested": mnemonic_standards,
         "skip_mnemonic": arguments.skip_mnemonic,
         "workers": arguments.workers,
         "targets": sorted(selection.targets),

@@ -2,7 +2,8 @@
 
 BFRS 2.0 (Bitcoin Forensic Recovery System) is an offline, research-oriented
 tool for locating, validating, and correlating cryptocurrency wallet artifacts
-in disk images and other byte-addressable evidence sources. It is intended for
+in disk images, individual files, directory trees, and mounted filesystems. It
+is intended for
 authorized forensic and recovery work. It does not connect to a blockchain,
 move funds, test balances, or replace manual evidentiary review.
 
@@ -23,6 +24,14 @@ The main scanner currently recognizes evidence associated with:
   and overlap/wordlist relevance classification;
 - NTFS metadata used to correlate allocated, stale, resident, and detached
   wallet evidence.
+
+The scanner combines structural validation with format-specific cryptographic
+validation where the artifact permits it. Its recovery paths include validated
+intact-wallet copying and experimental physical Berkeley DB reconstruction for
+the conservative subsets documented in
+[`docs/automatic_bitcoin_wallet_recovery.md`](docs/automatic_bitcoin_wallet_recovery.md)
+and
+[`docs/experimental_physical_wallet_export.md`](docs/experimental_physical_wallet_export.md).
 
 Detection is evidentiary, not proof of ownership, recoverability, or value.
 Weak markers and damaged filesystem context can produce false positives.
@@ -115,8 +124,9 @@ bfrs --input X:\evidence\case-001.img `
   --resume-checkpoint D:\bfrs-work\case-001.checkpoint.sqlite
 ```
 
-Folder checkpoint/resume is intentionally deferred to P2.7.1; existing image
-and individual-file checkpoint validation remains unchanged.
+**FOLDER resume is not yet supported.** Folder checkpoint/resume is deferred to
+P2.7.1; existing image and individual-file checkpoint validation remains
+unchanged.
 
 A mnemonic-only scan is available when wallet/container recovery is not
 required:
@@ -131,7 +141,9 @@ Run `bfrs --help` for the complete option list, including bounded `--start` and
 `--end` scans, overlap/chunk controls, Bitcoin text context, and report
 revalidation.
 
-Opt in to exact-page recovery of complete, unambiguous Bitcoin Core wallets:
+Opt in to recovery of complete, unambiguous wallets. This can copy a validated
+intact wallet file or reconstruct a supported Bitcoin Core wallet from exact
+validated Berkeley DB pages:
 
 ```powershell
 bfrs --input X:\evidence\case-001.img `
@@ -140,11 +152,12 @@ bfrs --input X:\evidence\case-001.img `
   --recovery-dir D:\private-recovered
 ```
 
-Both recovery flags are required. The private recovery directory must remain
-outside every Git working tree. Each successful candidate is written beneath
-`bitcoin-core\candidate_NNN\` as an atomically published `wallet.dat` plus a
-secret-free `recovery_manifest.json`. Existing outputs are never overwritten.
-Ordinary scans never write wallet files.
+Both recovery flags are required: `--recover-wallets` is explicitly opt-in.
+Recovery may write private wallet material. The private recovery directory must
+remain outside every Git working tree. Each successful Bitcoin Core candidate
+is written beneath `bitcoin-core\candidate_NNN\` as an atomically published
+`wallet.dat` plus a secret-free `recovery_manifest.json`. Existing outputs are
+never overwritten. Ordinary scans never write wallet files.
 
 ## Interpreting results
 
@@ -189,8 +202,10 @@ their detailed, secret-safe fields.
 - Reports and checkpoints may contain sensitive paths, offsets, fingerprints,
   metadata, or recovery evidence even when secret values are redacted.
 - Never publish `reports/`, `checkpoints/`, `recovered/`, or `carves/`.
-- Do not upload disk images, `wallet.dat`, wallet databases, seed phrases,
-  private keys, or recovered exports to public services.
+- Do not publish disk images, `wallet.dat`, wallet databases, private keys,
+  mnemonic or seed phrases, recovered exports, or private recovery manifests.
+- Public reports are designed to omit secret values, but must still be reviewed
+  for sensitive paths, offsets, fingerprints, and case metadata before release.
 - Verify free disk space before long runs and retain hashes and acquisition
   notes outside BFRS.
 
@@ -204,6 +219,14 @@ identity.
   damaged structures, dense wordlist regions, and unallocated filesystem data.
 - A structurally or cryptographically valid artifact may be unrelated to the
   investigated wallet and may not be recoverable.
+- BFRS cannot recover data that has been overwritten and does not recover wallet
+  passwords.
+- BFRS does not decrypt encrypted wallets without the required key or password.
+- Raw physical-disk devices such as Windows `\\.\PhysicalDriveN` are not a
+  supported input. Use an acquired disk image, regular file, directory, or
+  mounted filesystem path.
+- Windows paths and mounted Windows volume roots are supported; filesystem and
+  access-control behavior remains platform dependent.
 - Scanning large images can be I/O- and CPU-intensive; multiprocessing behavior
   depends on the platform and storage device.
 - Unified checkpoints use SQLite format 3 and reject incompatible scanner

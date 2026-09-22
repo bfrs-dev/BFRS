@@ -5,6 +5,11 @@ its read-only reporting behavior. To enable recovery, provide both
 `--recover-wallets` and `--recovery-dir`; the destination must be outside a Git
 working tree.
 
+Recovery may write private wallet material. Keep recovered `wallet.dat` files,
+private keys, mnemonic or seed phrases, and private recovery manifests out of
+Git and public services. Public scan reports omit secret values, but still
+require review for sensitive paths, offsets, fingerprints, and case metadata.
+
 Candidates are ordered by their earliest physical source offset and written as
 `bitcoin-core/candidate_001/wallet.dat`, `candidate_002`, and so on. A candidate
 must be accepted, must not be classified as a likely false positive, and must
@@ -29,5 +34,6 @@ provenance and cannot collide.
 
 The scan report schema is version 5 because P2.7 adds source type, source root,
 and source-specific location semantics. Default reports set `requested` to
-false and never create a private artifact. Folder checkpoint/resume is deferred
-to P2.7.1; existing image and individual-file checkpoint behavior is unchanged.
+false and never create a private artifact. FOLDER resume is not yet supported;
+folder checkpoint/resume is deferred to P2.7.1. Existing image and
+individual-file checkpoint behavior is unchanged.

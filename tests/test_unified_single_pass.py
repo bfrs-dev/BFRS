@@ -360,6 +360,11 @@ def test_mnemonic_coverage_is_explicit_when_stage_is_skipped(tmp_path):
         "performed": False, "standards": (),
     }
     assert result.evidence["mnemonic_recovery"]["candidates_total"] == 0
+    report = serialize_full_image_result(result, {})
+    assert report["configuration"]["include_mnemonic"] is False
+    assert report["mnemonic_scan_requested"] is False
+    assert report["mnemonic_scan_performed"] is False
+    assert report["mnemonic_standards_checked"] == []
 
 
 @pytest.mark.parametrize("flag,performed,count", [
@@ -381,3 +386,22 @@ def test_unified_cli_coverage_and_one_report(tmp_path, flag, performed, count):
     assert report["io_metrics"]["full_image_linear_pass_count"] == 1
     assert report["io_metrics"]["linear_pass_count"] == 1
     assert report["io_metrics"]["linear_bytes_read"] == len(payload)
+
+
+def test_targets_all_reports_effective_mnemonic_coverage(tmp_path):
+    payload, _ = _fixture()
+    source = tmp_path / "targets-all.img"
+    report_path = tmp_path / "targets-all.json"
+    source.write_bytes(payload)
+    assert main([
+        "--input", str(source), "--output", str(report_path),
+        "--targets", "all", "--chunk-mib", "1", "--overlap-kib", "4",
+    ]) == 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["configuration"]["include_mnemonic"] is True
+    assert report["configuration"]["mnemonic_scan_requested"] is True
+    assert report["mnemonic_scan_requested"] is True
+    assert report["mnemonic_scan_performed"] is True
+    assert report["mnemonic_standards_checked"] == [
+        "BIP39", "ELECTRUM", "ELECTRUM_V1",
+    ]
