@@ -1,6 +1,6 @@
 """Chunked binary file reading for large forensic sources."""
 
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +24,7 @@ class ChunkReader:
         path: str | Path,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         overlap: int = 0,
+        read_observer: Callable[[int, int], None] | None = None,
     ) -> None:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be greater than zero")
@@ -35,6 +36,7 @@ class ChunkReader:
         self.path = Path(path)
         self.chunk_size = chunk_size
         self.overlap = overlap
+        self.read_observer = read_observer
         self.linear_pass_count = 0
         self.linear_bytes_read = 0
         self.linear_read_count = 0
@@ -91,6 +93,8 @@ class ChunkReader:
                     yield offset, ownership_end, None
                     continue
                 assert source is not None
+                if self.read_observer is not None:
+                    self.read_observer(offset, scan_end - offset)
                 source.seek(offset)
                 data = source.read(scan_end - offset)
                 self.linear_read_count += 1

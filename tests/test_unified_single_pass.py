@@ -51,9 +51,11 @@ def _fixture() -> tuple[bytes, dict[str, int]]:
     address = _base58check(b"\x00" + b"\x11" * 20)
     public_key = encode_sec_public_key(GENERATOR, compressed=True)
     textual_pubkey = public_key.hex().encode()
+    wif = _base58check(b"\x80" + b"\x22" * 32 + b"\x01")
     raw_record = b"\x04ckey" + bytes((len(public_key),)) + public_key
     parts = (
         (CHUNK_SIZE - len(bip39) // 2, bip39, "bip39"),
+        (CHUNK_SIZE + 1024, wif, "wif"),
         (2 * CHUNK_SIZE - len(address) // 2, address, "address"),
         (3 * CHUNK_SIZE - len(raw_record) // 2, raw_record, "raw_record"),
         (4 * CHUNK_SIZE - len(electrum_v1) // 2, electrum_v1, "electrum_v1"),
@@ -132,6 +134,9 @@ def test_unified_run_finds_all_global_families_once_and_reports_coverage(tmp_pat
     assert len([item for item in result.target_findings
                 if item.hit_type == "bitcoin_ckey" and
                 item.start_offset == offsets["raw_record"]]) == 1
+    assert len([item for item in result.target_findings
+                if item.hit_type == "validated_wif" and
+                item.start_offset == offsets["wif"]]) == 1
     assert any(item.start_offset == offsets["textual_pubkey"]
                for item in result.target_findings)
     assert dict(result.evidence["raw_hit_counts_by_signature"])[
@@ -341,6 +346,11 @@ def test_unified_checkpoint_resume_skips_completed_ownership_and_matches_clean(t
     assert _logical(continued) == _logical(clean)
     clean_report = serialize_full_image_result(clean, {})
     continued_report = serialize_full_image_result(continued, {})
+    clean_without_io = {key: value for key, value in clean_report.items()
+                        if key != "io_metrics"}
+    continued_without_io = {key: value for key, value in continued_report.items()
+                            if key != "io_metrics"}
+    assert continued_without_io == clean_without_io
     assert continued_report["finding_summary"] == clean_report["finding_summary"]
     assert [item["normalized_state"] for item in continued_report["target_findings"]] == [
         item["normalized_state"] for item in clean_report["target_findings"]
@@ -348,6 +358,7 @@ def test_unified_checkpoint_resume_skips_completed_ownership_and_matches_clean(t
     assert (continued.evidence["io_metrics"]["physical_linear_bytes_read"] <
             clean.evidence["io_metrics"]["physical_linear_bytes_read"])
     assert bip39_phrase("english").encode() not in checkpoint.path.read_bytes()
+    assert _base58check(b"\x80" + b"\x22" * 32 + b"\x01") not in checkpoint.path.read_bytes()
 
 
 def test_mnemonic_coverage_is_explicit_when_stage_is_skipped(tmp_path):

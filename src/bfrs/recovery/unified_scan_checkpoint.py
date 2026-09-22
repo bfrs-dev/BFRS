@@ -10,8 +10,8 @@ from bfrs.core.models import RawHit
 
 
 UNIFIED_CHECKPOINT_FORMAT = "BFRS_UNIFIED_SCAN_CHECKPOINT"
-UNIFIED_CHECKPOINT_FORMAT_VERSION = 3
-UNIFIED_CHECKPOINT_SCHEMA_VERSION = 1
+UNIFIED_CHECKPOINT_FORMAT_VERSION = 4
+UNIFIED_CHECKPOINT_SCHEMA_VERSION = 2
 UNIFIED_SCANNER_SEMANTICS_VERSION = 2
 LEGACY_UNIFIED_CHECKPOINT_FORMAT = "BFRS_UNIFIED_SCAN_CHECKPOINT_V1"
 
@@ -136,7 +136,7 @@ def _restore_hit(payload: Mapping[str, object]) -> RawHit:
     return RawHit(**values)
 
 
-# The format-v3 implementation lives separately so the canonical scanner
+# The format-v4 implementation lives separately so the canonical scanner
 # identity contract above stays independent from the storage backend.
 from bfrs.recovery.unified_checkpoint_storage import (  # noqa: E402
     SQLiteUnifiedScanCheckpoint as UnifiedScanCheckpoint,

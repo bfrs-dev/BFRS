@@ -181,6 +181,11 @@ class FastScanner:
         # eagerly duplicate every persisted RawHit in memory during resume.
         resumed = resume_results or {}
         resumed_keys = frozenset(resumed)
+        resumed_cursor = start
+        for unit_start, unit_end in sorted(resumed_keys):
+            if unit_start != resumed_cursor or unit_end <= unit_start or unit_end > range_end:
+                raise ValueError("checkpoint completed ranges are not a contiguous prefix")
+            resumed_cursor = unit_end
         used_resumed: set[tuple[int, int]] = set()
         process_backed_detector = next((
             detector for detector in self.detectors
@@ -287,7 +292,9 @@ class FastScanner:
                             validated_fingerprints.setdefault(
                                 hit.target, set()).add(hit.safe_fingerprint)
                     yield hit
-                if progress is not None:
+                if progress is not None and (
+                    chunk is not None or ownership_end >= resumed_cursor
+                ):
                     scanned_bytes = max(0, ownership_end - start)
                     progress(ScanProgress(
                         scanned_bytes=scanned_bytes,

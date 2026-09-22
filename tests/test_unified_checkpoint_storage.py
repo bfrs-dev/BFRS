@@ -174,8 +174,8 @@ def test_uncommitted_final_transaction_is_ignored_on_reopen(tmp_path):
     connection = sqlite3.connect(checkpoint.path)
     connection.execute("BEGIN IMMEDIATE")
     connection.execute(
-        "INSERT INTO work_units VALUES (?, ?, ?, ?, ?)",
-        (0, 10, 0, 0, "interrupted"),
+        "INSERT INTO work_units VALUES (?, ?, ?, ?, ?, ?)",
+        (0, 10, 0, "interrupted", "{}", 0),
     )
     connection.close()
 
@@ -206,7 +206,7 @@ def test_failure_before_completion_does_not_complete_unit(tmp_path, failure):
     assert len(resume(source, checkpoint).completed_results) == 0
 
 
-def test_rejected_and_unbounded_hit_units_are_replayed_not_persisted(tmp_path):
+def test_rejected_weak_and_large_units_are_persisted_for_true_resume(tmp_path):
     source, checkpoint = create(tmp_path)
     checkpoint.record((0, 10), (rejected_hit(),), 10, 100_000)
     too_many = tuple(
@@ -218,9 +218,12 @@ def test_rejected_and_unbounded_hit_units_are_replayed_not_persisted(tmp_path):
     checkpoint.close()
     reopened = resume(source, checkpoint)
 
-    assert reopened.replay_required_units == ((0, 10), (10, 20), (20, 30))
-    assert len(reopened.completed_results) == 0
-    assert row_count(checkpoint.path, "results") == 0
+    assert reopened.replay_required_units == ()
+    assert len(reopened.completed_results) == 3
+    assert reopened.completed_results[(0, 10)] == (rejected_hit(),)
+    assert reopened.completed_results[(10, 20)] == too_many
+    assert reopened.completed_results[(20, 30)] == (weak_hit(20),)
+    assert row_count(checkpoint.path, "results") == 3
 
 
 def test_close_releases_windows_file_handle(tmp_path):
@@ -277,7 +280,7 @@ def test_semantics_source_range_and_schema_mismatches_are_explicit(tmp_path):
         resume(source, checkpoint)
 
 
-def test_ten_thousand_unit_storage_is_bounded_by_units_not_rejected_hits(tmp_path):
+def test_ten_thousand_unit_storage_is_compact_and_exact(tmp_path):
     _source, checkpoint = create(tmp_path)
     noise_per_unit = 100
     rejected = (rejected_hit(),) * noise_per_unit
@@ -297,7 +300,11 @@ def test_ten_thousand_unit_storage_is_bounded_by_units_not_rejected_hits(tmp_pat
     new_bytes = checkpoint.path.stat().st_size
 
     assert row_count(checkpoint.path, "work_units") == units
-    assert row_count(checkpoint.path, "results") == accepted_findings
+    assert row_count(checkpoint.path, "results") == units
     assert rejected_count == 999_000
     assert checkpoint.full_rewrite_count == 0
-    assert old_estimated_bytes / new_bytes > 100
+    assert old_estimated_bytes / new_bytes > 5
+    statistics = checkpoint.storage_statistics
+    assert statistics["work_units"] == units
+    assert statistics["findings"] == accepted_findings + rejected_count
+    assert statistics["bytes_per_finding"] < serialized_noise_bytes / 5

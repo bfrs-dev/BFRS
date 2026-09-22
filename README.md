@@ -124,6 +124,14 @@ bfrs --input X:\evidence\case-001.img `
   --resume-checkpoint D:\bfrs-work\case-001.checkpoint.sqlite
 ```
 
+Format 4 checkpoints atomically persist each completed ownership unit together
+with its compressed, secret-safe finding state, digest, and counters. Resume
+restores that state and skips normal target-scan reads for the completed prefix;
+only an uncommitted unit is scanned again. Progress starts from the restored
+byte count and ETA is based on newly processed bytes. Format 3 checkpoints did
+not retain complete state for noisy units and are rejected with an explicit
+legacy-replay message instead of being presented as true resume.
+
 **FOLDER resume is not yet supported.** Folder checkpoint/resume is deferred to
 P2.7.1; existing image and individual-file checkpoint validation remains
 unchanged.
@@ -229,7 +237,7 @@ identity.
   access-control behavior remains platform dependent.
 - Scanning large images can be I/O- and CPU-intensive; multiprocessing behavior
   depends on the platform and storage device.
-- Unified checkpoints use SQLite format 3 and reject incompatible scanner
+- Unified checkpoints use SQLite format 4 and reject incompatible scanner
   semantics or legacy JSON checkpoints explicitly.
 - Reports remain monolithic JSON and may require substantial memory for very
   large sets of retained candidate or validated findings.
