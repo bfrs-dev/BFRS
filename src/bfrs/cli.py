@@ -9,7 +9,7 @@ from typing import Sequence
 
 from bfrs.core.path_safety import paths_refer_to_same_file
 from bfrs.core.source_types import SourceType, detect_source_type
-from bfrs.core.worker_control import WorkerControlError
+from bfrs.core.worker_control import WorkerControlError, validate_worker_count
 from bfrs.recovery.full_image_coordinator import FullImageRecoveryCoordinator
 from bfrs.recovery.automatic_wallet_recovery import (
     recover_intact_wallet,
@@ -69,6 +69,7 @@ class _ProgressLine:
         rate_base: int = 0,
         workers: int | None = None,
         display_gib: bool = False,
+        enabled: bool = True,
     ) -> None:
         self._label = label
         self._targets = tuple(
@@ -76,6 +77,7 @@ class _ProgressLine:
         self._rate_base = rate_base
         self._workers = workers
         self._display_gib = display_gib
+        self._enabled = enabled
         self._started = time.monotonic()
         self._last_rendered = 0.0
         self._rendered = False
@@ -111,6 +113,8 @@ class _ProgressLine:
         stage: str | None = None,
         complete: bool | None = None,
     ) -> None:
+        if not self._enabled:
+            return
         now = time.monotonic()
         is_complete = (total == 0 or processed >= total
                        if complete is None else complete)
@@ -185,10 +189,13 @@ class _ProgressLine:
 class _NTFSProgressLine:
     """Render the independent global NTFS metadata pre-pass."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, enabled: bool = True) -> None:
         self._rendered = False
+        self._enabled = enabled
 
     def __call__(self, update: NTFSMFTIndexProgress) -> None:
+        if not self._enabled:
+            return
         if update.total_records is None:
             progress = "records=" + str(update.records_processed)
         else:
@@ -217,7 +224,12 @@ class _NTFSProgressLine:
 class _ElectrumProgressLine:
     """Render secret-free progress for Electrum hit postprocessing."""
 
+    def __init__(self, *, enabled: bool = True) -> None:
+        self._enabled = enabled
+
     def __call__(self, completed: int, total: int, elapsed: float) -> None:
+        if not self._enabled:
+            return
         percent = 100.0 if total == 0 else min(100.0, completed * 100.0 / total)
         if completed >= total:
             eta = "00:00:00"
@@ -316,6 +328,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=_integer, default=1,
                         help=("mnemonic worker processes; target scans parallelize "
                               "encoding phases; 0 selects up to 4 automatically"))
+    parser.add_argument(
+        "--file-workers", type=_integer, default=1,
+        help=("concurrent regular-file workers for folder sources; each worker "
+              "uses an isolated scanner; default: 1"),
+    )
     parser.add_argument("--checkpoint", type=Path,
                         help="create a new scan checkpoint (must not exist)")
     parser.add_argument("--resume-checkpoint", type=Path,
@@ -384,6 +401,12 @@ def _validate_arguments(parser: argparse.ArgumentParser, arguments) -> None:
         resolve_worker_count(arguments.workers)
     except ValueError as error:
         parser.error(str(error))
+    if arguments.file_workers < 1:
+        parser.error("--file-workers must be at least 1")
+    try:
+        validate_worker_count(arguments.file_workers)
+    except ValueError as error:
+        parser.error(str(error).replace("workers", "file workers", 1))
     if arguments.minimum_hits < 1:
         parser.error("--minimum-hits must be at least 1")
     if arguments.minimum_distinct_types < 1:
@@ -468,7 +491,7 @@ def _configuration(arguments, selection=None) -> dict[str, object]:
     }
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, _folder_child: bool = False) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
     _validate_arguments(parser, arguments)
@@ -491,7 +514,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if root == output or root in output.parents:
             parser.error("folder report output must be outside the source root")
         from bfrs.scanners.folder_source_scanner import scan_folder_source
-        return scan_folder_source(arguments, main)
+        return scan_folder_source(
+            arguments, lambda child_argv: main(child_argv, _folder_child=True))
+    if arguments.file_workers != 1:
+        parser.error("--file-workers is only supported for FOLDER sources")
     if arguments.revalidate_wallet_records is not None:
         try:
             old_report = json.loads(
@@ -564,6 +590,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rate_base=resumed_bytes,
             workers=worker_count,
             display_gib=True,
+            enabled=not _folder_child,
         )
 
         try:
@@ -607,23 +634,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"report error: {error}", file=sys.stderr)
             return 4
         summary = result.recovery
-        print(f"source: {result.source}")
-        print(f"range: {result.start_offset}..{result.end_offset}")
-        print(f"mnemonic candidates: {summary.candidates_total}")
-        print(f"BIP39 valid: {summary.bip39_valid}")
-        print(f"Electrum valid: {summary.electrum_valid}")
-        print(f"Electrum 2+ valid: {summary.electrum_2_plus_valid}")
-        print(f"Electrum V1 valid: {summary.electrum_v1_valid}")
-        print(f"duplicate occurrences: {summary.duplicate_occurrences}")
-        print(f"crypto-valid occurrences: {summary.crypto_valid_occurrences}")
-        print("mnemonic independent candidates: "
-              f"{summary.independent_candidate_occurrences}")
-        print("mnemonic overlap-cluster occurrences: "
-              f"{summary.overlap_cluster_occurrences}")
-        print("mnemonic likely-wordlist occurrences: "
-              f"{summary.likely_wordlist_occurrences}")
-        print(f"report path: {arguments.output.resolve()}")
-        print_recovery_support_message(payload)
+        if not _folder_child:
+            print(f"source: {result.source}")
+            print(f"range: {result.start_offset}..{result.end_offset}")
+            print(f"mnemonic candidates: {summary.candidates_total}")
+            print(f"BIP39 valid: {summary.bip39_valid}")
+            print(f"Electrum valid: {summary.electrum_valid}")
+            print(f"Electrum 2+ valid: {summary.electrum_2_plus_valid}")
+            print(f"Electrum V1 valid: {summary.electrum_v1_valid}")
+            print(f"duplicate occurrences: {summary.duplicate_occurrences}")
+            print(f"crypto-valid occurrences: {summary.crypto_valid_occurrences}")
+            print("mnemonic independent candidates: "
+                  f"{summary.independent_candidate_occurrences}")
+            print("mnemonic overlap-cluster occurrences: "
+                  f"{summary.overlap_cluster_occurrences}")
+            print("mnemonic likely-wordlist occurrences: "
+                  f"{summary.likely_wordlist_occurrences}")
+            print(f"report path: {arguments.output.resolve()}")
+            print_recovery_support_message(payload)
         return 0
 
     policy = CandidatePolicy(
@@ -667,14 +695,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, UnifiedCheckpointError) as error:
         print(f"checkpoint error: {error}", file=sys.stderr)
         return 3
-    ntfs_progress = _NTFSProgressLine()
+    ntfs_progress = _NTFSProgressLine(enabled=not _folder_child)
     scan_progress = _ProgressLine(
         "Target scan",
         targets=selection.targets,
         rate_base=(unified_checkpoint.completed_bytes
                    if unified_checkpoint is not None else 0),
+        enabled=not _folder_child,
     )
-    electrum_progress = _ElectrumProgressLine()
+    electrum_progress = _ElectrumProgressLine(enabled=not _folder_child)
     try:
         result = coordinator.scan(
             arguments.input,
@@ -754,73 +783,76 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"report error: {error}", file=sys.stderr)
         return 4
 
-    print(f"source: {result.source}")
-    print(f"range: {result.start_offset}..{result.end_offset}")
     public_report = serialize_full_image_result(result, configuration, wallet_recovery)
     public_summary = public_report["finding_summary"]
-    print(f"Raw discovery: {result.raw_hit_count} (raw hits: diagnostic)")
-    print(f"Accepted candidates: {public_summary['accepted_candidates']}")
-    print(f"Review candidates: {public_summary['review_candidates']}")
-    print(f"Rejected: {public_summary['rejected']}")
-    print(f"Structurally complete: {public_summary['structurally_complete']} artifacts")
-    print(f"Crypto-valid occurrences: {public_summary['crypto_valid_occurrences']}")
-    print(f"Unique crypto-valid secrets: {public_summary['crypto_valid_unique_secrets']} identified fingerprints")
-    print(f"Crypto-valid secrets without fingerprint: {public_summary['crypto_valid_secrets_without_fingerprint']}")
-    print("Summary scope: target findings; overlapping recovery views below are not additive")
-    print("Structurally complete reconstructed wallets: "
-          f"{public_report['recovery_state_summaries']['reconstructed_wallet_results']['structurally_complete']}")
-    print(f"hotspots: {result.hotspot_count}")
-    print(f"accepted hotspots: {result.accepted_hotspot_count}")
-    print(f"direct results: {len(result.direct_results)}")
-    print(f"reconstructed results: {len(result.reconstructed_wallet_results)}")
-    print(f"structural results: {result.structural_wallet_count}")
-    print(f"fragment results: {result.fragment_wallet_count}")
     coverage = result.evidence.get("mnemonic_coverage", {})
     io_metrics = result.evidence.get("io_metrics", {})
-    print(f"mnemonic coverage: {'performed' if coverage.get('performed') else 'skipped'}")
-    print(f"linear passes: {io_metrics.get('linear_pass_count', 0)}")
-    print(f"linear bytes read: {io_metrics.get('linear_bytes_read', 0)}")
-    print(f"secondary reads: {io_metrics.get('secondary_read_count', 0)}")
-    print(f"secondary bytes read: {io_metrics.get('secondary_bytes_read', 0)}")
+    if not _folder_child:
+        print(f"source: {result.source}")
+        print(f"range: {result.start_offset}..{result.end_offset}")
+        print(f"Raw discovery: {result.raw_hit_count} (raw hits: diagnostic)")
+        print(f"Accepted candidates: {public_summary['accepted_candidates']}")
+        print(f"Review candidates: {public_summary['review_candidates']}")
+        print(f"Rejected: {public_summary['rejected']}")
+        print(f"Structurally complete: {public_summary['structurally_complete']} artifacts")
+        print(f"Crypto-valid occurrences: {public_summary['crypto_valid_occurrences']}")
+        print(f"Unique crypto-valid secrets: {public_summary['crypto_valid_unique_secrets']} identified fingerprints")
+        print(f"Crypto-valid secrets without fingerprint: {public_summary['crypto_valid_secrets_without_fingerprint']}")
+        print("Summary scope: target findings; overlapping recovery views below are not additive")
+        print("Structurally complete reconstructed wallets: "
+              f"{public_report['recovery_state_summaries']['reconstructed_wallet_results']['structurally_complete']}")
+        print(f"hotspots: {result.hotspot_count}")
+        print(f"accepted hotspots: {result.accepted_hotspot_count}")
+        print(f"direct results: {len(result.direct_results)}")
+        print(f"reconstructed results: {len(result.reconstructed_wallet_results)}")
+        print(f"structural results: {result.structural_wallet_count}")
+        print(f"fragment results: {result.fragment_wallet_count}")
+        print(f"mnemonic coverage: {'performed' if coverage.get('performed') else 'skipped'}")
+        print(f"linear passes: {io_metrics.get('linear_pass_count', 0)}")
+        print(f"linear bytes read: {io_metrics.get('linear_bytes_read', 0)}")
+        print(f"secondary reads: {io_metrics.get('secondary_read_count', 0)}")
+        print(f"secondary bytes read: {io_metrics.get('secondary_bytes_read', 0)}")
     if arguments.electrum_only:
         electrum = result.electrum_raw_recovery
-        print(f"electrum candidates: {electrum.candidates_total}")
-        print(f"electrum complete: {electrum.complete_candidates}")
-        print(f"electrum active duplicates: {electrum.known_active_duplicates}")
-        print(f"report path: {report_path}")
-        print_recovery_support_message(public_report)
+        if not _folder_child:
+            print(f"electrum candidates: {electrum.candidates_total}")
+            print(f"electrum complete: {electrum.complete_candidates}")
+            print(f"electrum active duplicates: {electrum.known_active_duplicates}")
+            print(f"report path: {report_path}")
+            print_recovery_support_message(public_report)
         return 0
     legacy = public_report["legacy_wallet_recovery"]
     summary = legacy["summary"]
-    print(f"legacy wallet candidates: {summary['wallet_candidates']}")
-    print(
-        "legacy priorities: "
-        f"CRITICAL={summary['critical_candidates']} "
-        f"HIGH={summary['high_candidates']} "
-        f"MEDIUM={summary['medium_candidates']} "
-        f"LOW={summary['low_candidates']}"
-    )
-    print(
-        "crypto-valid key occurrences: "
-        f"{summary['crypto_valid_key_occurrences']}"
-    )
-    print(
-        "unique crypto-valid private keys: "
-        f"{summary['unique_crypto_valid_private_keys']}"
-    )
-    print(f"report path: {report_path}")
-    if arguments.recover_wallets:
-        print("Bitcoin Core wallet recovery")
-        print("----------------------------")
-        print(f"Eligible candidates:       {wallet_recovery['eligible_candidates']}")
-        print(f"Recovered wallets:         {wallet_recovery['recovered_wallets']}")
-        print(f"Failed reconstructions:    {wallet_recovery['failed_wallets']}")
-        for recovered in wallet_recovery["outputs"]:
-            if recovered["status"] == "RECOVERED":
-                print("Recovered:")
-                print((arguments.recovery_dir /
-                       Path(recovered["relative_recovery_path"])).resolve())
-    print_recovery_support_message(public_report)
+    if not _folder_child:
+        print(f"legacy wallet candidates: {summary['wallet_candidates']}")
+        print(
+            "legacy priorities: "
+            f"CRITICAL={summary['critical_candidates']} "
+            f"HIGH={summary['high_candidates']} "
+            f"MEDIUM={summary['medium_candidates']} "
+            f"LOW={summary['low_candidates']}"
+        )
+        print(
+            "crypto-valid key occurrences: "
+            f"{summary['crypto_valid_key_occurrences']}"
+        )
+        print(
+            "unique crypto-valid private keys: "
+            f"{summary['unique_crypto_valid_private_keys']}"
+        )
+        print(f"report path: {report_path}")
+        if arguments.recover_wallets:
+            print("Bitcoin Core wallet recovery")
+            print("----------------------------")
+            print(f"Eligible candidates:       {wallet_recovery['eligible_candidates']}")
+            print(f"Recovered wallets:         {wallet_recovery['recovered_wallets']}")
+            print(f"Failed reconstructions:    {wallet_recovery['failed_wallets']}")
+            for recovered in wallet_recovery["outputs"]:
+                if recovered["status"] == "RECOVERED":
+                    print("Recovered:")
+                    print((arguments.recovery_dir /
+                           Path(recovered["relative_recovery_path"])).resolve())
+        print_recovery_support_message(public_report)
     return 0
 
 

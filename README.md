@@ -86,7 +86,9 @@ bfrs --input D:\RecoveredFiles\backup.dat `
   --output D:\bfrs-work\file-report.json --targets all
 
 bfrs --input D:\RecoveredFiles `
-  --output D:\bfrs-work\folder-report.json --targets all
+  --source-type folder `
+  --output D:\bfrs-work\folder-report.json --targets all `
+  --file-workers 2 --workers 1
 ```
 
 Directories and mounted volume roots are detected automatically. Folder scans
@@ -95,6 +97,14 @@ continue after inaccessible or broken files. Findings from `FILE` and `FOLDER`
 sources use `file_path` plus a file-local offset; `IMAGE` findings retain
 physical-offset semantics. Large files still use the shared chunked reader and
 overlap policy.
+
+`--file-workers` controls bounded parallel processing of separate files in a
+folder scan. Each worker creates isolated scanner and detector state; findings
+cannot cross file boundaries. `--workers` keeps its existing meaning and
+controls mnemonic processing inside each file scan. Start with two file workers
+for rotational media, measure locally, and use four only when the storage and
+CPU benefit from it. Image and single-file scans accept neither parallel folder
+work nor folder batching.
 
 Use mnemonic workers and include mnemonic detection in the shared scan:
 

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 import uuid
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 
 from bfrs.recovery.automatic_wallet_recovery import (
     recover_intact_wallet,
@@ -20,6 +22,101 @@ from bfrs.recovery.automatic_wallet_recovery import (
 )
 from bfrs.reporting.json_report import REPORT_SCHEMA_VERSION
 from bfrs.version import APP_NAME, VERSION
+
+
+_BATCH_FILE_LIMIT = 32
+_BATCH_BYTE_LIMIT = 8 * 1024 * 1024
+_QUEUE_MULTIPLIER = 2
+
+
+class FolderWorkerError(RuntimeError):
+    """A file-worker failed outside the normal per-file error boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ScanOutcome:
+    index: int
+    source: Path
+    size: int
+    mtime_ns: int
+    report: dict | None = None
+    error_reason: str | None = None
+
+
+class _FolderProgress:
+    """Thread-safe, throttled aggregate folder progress."""
+
+    def __init__(self, root: Path, *, files: int, total_bytes: int) -> None:
+        self._root = root
+        self._files = files
+        self._total_bytes = total_bytes
+        self._started = time.monotonic()
+        self._last_rendered = 0.0
+        self._completed = 0
+        self._completed_bytes = 0
+        self._raw_hits = 0
+        self._validated = 0
+        self._rendered = False
+        self._lock = threading.Lock()
+
+    def initial(self, skipped: int) -> None:
+        percent = 100.0 if self._files == 0 else 0.0
+        print(
+            "Folder scan: "
+            f"files=0/{self._files} ({percent:.1f}%) "
+            f"bytes=0/{self._total_bytes} ({percent:.1f}%) "
+            f"files/s=0.0 MiB/s=0.0 raw_hits=0 validated=0 "
+            f"skipped={skipped}",
+            file=sys.stderr,
+        )
+
+    def update(self, outcome: _ScanOutcome) -> None:
+        with self._lock:
+            self._completed += 1
+            self._completed_bytes += outcome.size
+            if outcome.report is not None:
+                self._raw_hits += int(outcome.report.get("raw_hit_count", 0))
+                findings = outcome.report.get("target_findings", ())
+                if isinstance(findings, list):
+                    self._validated += sum(
+                        item.get("validation_status") not in (
+                            None, "UNVALIDATED", "NOT_APPLICABLE")
+                        for item in findings
+                        if isinstance(item, dict)
+                    )
+            now = time.monotonic()
+            complete = self._completed >= self._files
+            if not complete and now - self._last_rendered < 0.5:
+                return
+            self._last_rendered = now
+            elapsed = max(now - self._started, 1e-9)
+            file_percent = (100.0 if self._files == 0 else
+                            self._completed * 100.0 / self._files)
+            byte_percent = (100.0 if self._total_bytes == 0 else
+                            self._completed_bytes * 100.0 / self._total_bytes)
+            try:
+                current = outcome.source.relative_to(self._root).as_posix()
+            except ValueError:
+                current = str(outcome.source)
+            print(
+                "\rFolder scan: "
+                f"files={self._completed}/{self._files} ({file_percent:.1f}%) "
+                f"bytes={self._completed_bytes}/{self._total_bytes} "
+                f"({byte_percent:.1f}%) files/s={self._completed / elapsed:.1f} "
+                f"MiB/s={self._completed_bytes / 2**20 / elapsed:.1f} "
+                f"raw_hits={self._raw_hits} validated={self._validated} "
+                f"current={current}",
+                end="\n" if complete else "",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._rendered = not complete
+
+    def finish(self) -> None:
+        with self._lock:
+            if self._rendered:
+                print(file=sys.stderr)
+                self._rendered = False
 
 
 def _is_junction(path: Path) -> bool:
@@ -105,21 +202,142 @@ def _merge_recovery(total: dict, current: dict, prefix: Path) -> None:
         total["outputs"].append(row)
 
 
+def _file_batches(
+    files: Sequence[tuple[Path, int, int]],
+    workers: int,
+) -> Iterator[tuple[tuple[int, Path, int, int], ...]]:
+    # Keep enough batches to occupy small worker pools while retaining a hard
+    # cap that amortizes scheduling for directories with hundreds of thousands
+    # of tiny files.
+    adaptive_file_limit = min(
+        _BATCH_FILE_LIMIT,
+        max(1, (len(files) + workers * 4 - 1) // (workers * 4)),
+    )
+    batch: list[tuple[int, Path, int, int]] = []
+    batch_bytes = 0
+    for index, (source, size, mtime_ns) in enumerate(files, 1):
+        if batch and (len(batch) >= adaptive_file_limit or
+                      batch_bytes + size > _BATCH_BYTE_LIMIT):
+            yield tuple(batch)
+            batch = []
+            batch_bytes = 0
+        batch.append((index, source, size, mtime_ns))
+        batch_bytes += size
+    if batch:
+        yield tuple(batch)
+
+
+def _scan_batch(
+    batch: tuple[tuple[int, Path, int, int], ...],
+    temporary_root: Path,
+    arguments,
+    child_main: Callable[[Sequence[str] | None], int],
+    progress: Callable[[_ScanOutcome], None],
+) -> list[_ScanOutcome]:
+    outcomes = []
+    for index, source, size, mtime_ns in batch:
+        child_report_path = temporary_root / f"report-{index:09d}.json"
+        try:
+            code = child_main(_child_arguments(arguments, source, child_report_path))
+            if code != 0:
+                raise OSError(f"CHILD_SCAN_EXIT_{code}")
+            child_report = json.loads(child_report_path.read_text(encoding="utf-8"))
+            child_findings = child_report.get("target_findings", [])
+            if not isinstance(child_findings, list):
+                raise ValueError("INVALID_CHILD_REPORT")
+            outcome = _ScanOutcome(
+                index, source, size, mtime_ns, report=child_report)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+            outcome = _ScanOutcome(
+                index, source, size, mtime_ns,
+                error_reason=type(error).__name__,
+            )
+        outcomes.append(outcome)
+        progress(outcome)
+    return outcomes
+
+
+def _scan_files_bounded(
+    files: Sequence[tuple[Path, int, int]],
+    temporary_root: Path,
+    arguments,
+    child_main: Callable[[Sequence[str] | None], int],
+    progress: Callable[[_ScanOutcome], None],
+) -> list[_ScanOutcome]:
+    workers = arguments.file_workers
+    batches = iter(_file_batches(files, workers))
+    if workers == 1:
+        return [
+            outcome
+            for batch in batches
+            for outcome in _scan_batch(
+                batch, temporary_root, arguments, child_main, progress)
+        ]
+
+    outcomes: list[_ScanOutcome] = []
+    pending: dict[Future[list[_ScanOutcome]], tuple[tuple[int, Path, int, int], ...]] = {}
+    executor = ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="bfrs-file-worker")
+
+    def submit_next() -> bool:
+        try:
+            batch = next(batches)
+        except StopIteration:
+            return False
+        future = executor.submit(
+            _scan_batch, batch, temporary_root, arguments, child_main, progress)
+        pending[future] = batch
+        return True
+
+    try:
+        for _ in range(workers * _QUEUE_MULTIPLIER):
+            if not submit_next():
+                break
+        while pending:
+            completed, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+            for future in completed:
+                batch = pending.pop(future)
+                try:
+                    outcomes.extend(future.result())
+                except BaseException as error:
+                    for item in pending:
+                        item.cancel()
+                    paths = ", ".join(str(item[1]) for item in batch[:3])
+                    raise FolderWorkerError(
+                        f"file worker failed while scanning batch starting with {paths}: "
+                        f"{type(error).__name__}: {error}") from error
+                submit_next()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    return outcomes
+
+
+def _finding_sort_key(root: Path, finding: dict) -> tuple:
+    source = Path(str(finding.get("file_path", "")))
+    try:
+        relative = source.relative_to(root).as_posix()
+    except ValueError:
+        relative = str(source)
+    return (
+        relative.casefold(),
+        int(finding.get("file_offset_start", finding.get("start_offset", -1))),
+        int(finding.get("file_offset_end", finding.get("end_offset", -1))),
+        str(finding.get("target", "")),
+        str(finding.get("hit_type", finding.get("type", ""))),
+    )
+
+
 def scan_folder_source(
     arguments,
     child_main: Callable[[Sequence[str] | None], int],
 ) -> int:
     root = arguments.input.resolve()
     files, discovery_skips = discover_regular_files(root)
-    print(
-        f"Folder scan: files discovered={len(files)} files scanned=0 "
-        f"files skipped={len(discovery_skips)} bytes scanned=0 findings=0",
-        file=sys.stderr,
-    )
-    file_rows = []
-    flattened_findings = []
-    scanned = bytes_scanned = findings = 0
-    scan_failures = []
+    bytes_discovered = sum(size for _, size, _ in files)
+    started = time.monotonic()
+    progress = _FolderProgress(
+        root, files=len(files), total_bytes=bytes_discovered)
+    progress.initial(len(discovery_skips))
     wallet_recovery = recovery_not_requested()
     if arguments.recover_wallets:
         validate_recovery_destination(root, arguments.recovery_dir)
@@ -127,70 +345,77 @@ def scan_folder_source(
             "requested": True, "eligible_candidates": 0,
             "recovered_wallets": 0, "failed_wallets": 0, "outputs": [],
         }
-    with tempfile.TemporaryDirectory(prefix="bfrs-folder-scan-") as temporary:
-        temporary_root = Path(temporary)
-        for index, (source, size, mtime_ns) in enumerate(files, 1):
-            child_report_path = temporary_root / f"report-{index:06d}.json"
-            try:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    code = child_main(_child_arguments(arguments, source, child_report_path))
-                if code != 0:
-                    raise OSError(f"CHILD_SCAN_EXIT_{code}")
-                child_report = json.loads(child_report_path.read_text(encoding="utf-8"))
-                child_findings = child_report.get("target_findings", [])
-                if not isinstance(child_findings, list):
-                    raise ValueError("INVALID_CHILD_REPORT")
-                flattened_findings.extend(child_findings)
-                findings += len(child_findings)
-                scanned += 1
-                bytes_scanned += size
-                intact = child_report.get("intact_wallet", {})
-                wallet_targets = {"bitcoin-core", "electrum", "multibit", "armory"}
-                wallet_detected = bool(intact.get("detected")) or any(
-                    row.get("target") in wallet_targets for row in child_findings
+    try:
+        with tempfile.TemporaryDirectory(prefix="bfrs-folder-scan-") as temporary:
+            outcomes = _scan_files_bounded(
+                files, Path(temporary), arguments, child_main, progress.update)
+    except FolderWorkerError as error:
+        progress.finish()
+        print(f"folder worker error: {error}", file=sys.stderr)
+        return 3
+    progress.finish()
+    outcomes.sort(key=lambda item: item.index)
+
+    file_rows = []
+    flattened_findings = []
+    scan_failures = []
+    scanned = bytes_scanned = 0
+    for outcome in outcomes:
+        source = outcome.source
+        if outcome.report is None:
+            failure = {
+                "file_path": str(source.resolve(strict=False)),
+                "reason": outcome.error_reason or "UNKNOWN_FILE_ERROR",
+            }
+            scan_failures.append(failure)
+            file_rows.append({
+                "file_path": failure["file_path"],
+                "size": outcome.size,
+                "mtime_ns": outcome.mtime_ns,
+                "status": "SKIPPED",
+                "reason": failure["reason"],
+            })
+            continue
+
+        child_report = outcome.report
+        child_findings = child_report.get("target_findings", [])
+        relative_path = source.relative_to(root).as_posix()
+        for item in child_findings:
+            row = dict(item)
+            row.setdefault("relative_path", relative_path)
+            flattened_findings.append(row)
+        scanned += 1
+        bytes_scanned += outcome.size
+        intact = child_report.get("intact_wallet", {})
+        wallet_targets = {"bitcoin-core", "electrum", "multibit", "armory"}
+        wallet_detected = bool(intact.get("detected")) or any(
+            row.get("target") in wallet_targets for row in child_findings)
+        if arguments.recover_wallets:
+            prefix = Path(f"file_{outcome.index:09d}")
+            per_file_root = arguments.recovery_dir / prefix
+            if intact.get("detected"):
+                recovered = recover_intact_wallet(
+                    source, child_report, arguments.recovery_dir,
+                    relative_prefix=prefix,
                 )
-                if arguments.recover_wallets:
-                    prefix = Path(f"file_{index:06d}")
-                    per_file_root = arguments.recovery_dir / prefix
-                    if intact.get("detected"):
-                        recovered = recover_intact_wallet(
-                            source, child_report, arguments.recovery_dir,
-                            relative_prefix=prefix,
-                        )
-                        _merge_recovery(wallet_recovery, recovered, Path())
-                    else:
-                        recovered = recover_wallets(
-                            source, child_report, per_file_root
-                        )
-                        _merge_recovery(wallet_recovery, recovered, prefix)
-                file_rows.append({
-                    "file_path": str(source.resolve()),
-                    "size": size,
-                    "mtime_ns": mtime_ns,
-                    "status": "SCANNED",
-                    "finding_count": len(child_findings),
-                    "wallet_detected": wallet_detected,
-                    "intact_wallet": intact,
-                    "report": child_report,
-                })
-            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-                scan_failures.append({
-                    "file_path": str(source.resolve(strict=False)),
-                    "reason": type(error).__name__,
-                })
-                file_rows.append({
-                    "file_path": str(source.resolve(strict=False)),
-                    "size": size,
-                    "mtime_ns": mtime_ns,
-                    "status": "SKIPPED",
-                    "reason": type(error).__name__,
-                })
-            print(
-                f"Folder scan: files discovered={len(files)} files scanned={scanned} "
-                f"files skipped={len(discovery_skips) + len(scan_failures)} "
-                f"bytes scanned={bytes_scanned} current file={source} findings={findings}",
-                file=sys.stderr,
-            )
+                _merge_recovery(wallet_recovery, recovered, Path())
+            else:
+                recovered = recover_wallets(source, child_report, per_file_root)
+                _merge_recovery(wallet_recovery, recovered, prefix)
+        file_rows.append({
+            "file_path": str(source.resolve()),
+            "relative_path": relative_path,
+            "size": outcome.size,
+            "mtime_ns": outcome.mtime_ns,
+            "status": "SCANNED",
+            "finding_count": len(child_findings),
+            "wallet_detected": wallet_detected,
+            "intact_wallet": intact,
+            "report": child_report,
+        })
+
+    flattened_findings.sort(key=lambda item: _finding_sort_key(root, item))
+    elapsed = time.monotonic() - started
     payload = {
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "application": {"name": APP_NAME, "version": VERSION},
@@ -203,9 +428,12 @@ def scan_folder_source(
         "file_count": len(files),
         "files_discovered": len(files),
         "files_scanned": scanned,
+        "files_failed": len(scan_failures),
         "files_skipped": len(discovery_skips) + len(scan_failures),
+        "bytes_discovered": bytes_discovered,
         "bytes_scanned": bytes_scanned,
-        "findings_count": findings,
+        "elapsed_seconds": elapsed,
+        "findings_count": len(flattened_findings),
         "files": file_rows,
         "target_findings": flattened_findings,
         "skipped_entries": discovery_skips + scan_failures,
@@ -218,6 +446,10 @@ def scan_folder_source(
             "chunk_mib": arguments.chunk_mib,
             "overlap_kib": arguments.overlap_kib,
             "targets": arguments.targets or "default",
+            "file_workers": arguments.file_workers,
+            "file_batch_limit": _BATCH_FILE_LIMIT,
+            "file_batch_byte_limit": _BATCH_BYTE_LIMIT,
+            "maximum_queued_batches": arguments.file_workers * _QUEUE_MULTIPLIER,
         },
         "checkpoint": {
             "supported": False,
@@ -239,13 +471,13 @@ def scan_folder_source(
         temporary_output.unlink(missing_ok=True)
         print(f"report error: {error}", file=sys.stderr)
         return 4
-    print(f"source type: FOLDER")
+    print("source type: FOLDER")
     print(f"source root: {root}")
     print(f"files discovered: {len(files)}")
     print(f"files scanned: {scanned}")
     print(f"files skipped: {len(discovery_skips) + len(scan_failures)}")
     print(f"bytes scanned: {bytes_scanned}")
-    print(f"findings: {findings}")
+    print(f"findings: {len(flattened_findings)}")
     print(f"wallets detected: {sum(bool(row.get('wallet_detected')) for row in file_rows)}")
     print(f"report path: {output.resolve()}")
     return 0

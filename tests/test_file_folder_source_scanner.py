@@ -1,15 +1,25 @@
 import json
 import os
 from pathlib import Path
+import threading
+import time
 
 import pytest
 
 from bfrs.cli import main
 from bfrs.core.source_types import SourceType, detect_source_type
 from bfrs.scanners.folder_source_scanner import discover_regular_files, scan_folder_source
-from tests.test_cli import basic_arguments, valid_wif
+from tests.test_cli import (
+    armory_wallet,
+    basic_arguments,
+    encrypted_electrum,
+    multibit_classic_wallet,
+    structural_metadata,
+    valid_wif,
+)
 from tests.test_export_reconstructed_wallet import case
 from tests.test_logical_berkeley_database_pipeline import private_der
+from tests.test_mnemonic_recovery_v1 import bip39_phrase
 
 
 def intact_wallet_bytes(case) -> bytes:
@@ -260,3 +270,176 @@ def test_intact_recovery_never_overwrites_existing_output(case, tmp_path):
     assert second["wallet_recovery"]["failed_wallets"] == 1
     assert second["wallet_recovery"]["outputs"][0]["reason_code"] == "OUTPUT_EXISTS"
     assert output.read_bytes() == original
+
+
+def _semantic_findings(payload):
+    return payload["target_findings"]
+
+
+def _scan_fixture_with_file_workers(root, report, workers):
+    assert main(basic_arguments(root, report) + [
+        "--source-type", "folder",
+        "--targets", "all",
+        "--file-workers", str(workers),
+        "--workers", "1",
+        "--chunk-mib", "1",
+        "--overlap-kib", "64",
+    ]) == 0
+    return json.loads(report.read_text(encoding="utf-8"))
+
+
+def test_parallel_folder_scan_matches_sequential_for_every_target(tmp_path):
+    root = tmp_path / "source"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    fixtures = {
+        "bitcoin-core.bin": structural_metadata(),
+        "electrum.dat": encrypted_electrum(),
+        "multibit.wallet": multibit_classic_wallet(),
+        "suspicious.exe": armory_wallet(),
+        "no-extension": valid_wif(),
+        "mnemonic.txt": bip39_phrase("english").encode(),
+    }
+    for name, data in fixtures.items():
+        (nested / name).write_bytes(data)
+    boundary = 1024 * 1024
+    secret = valid_wif()
+    large = bytearray(boundary + 256)
+    start = boundary - len(secret) // 2
+    large[start:start + len(secret)] = secret
+    (root / "large.bin").write_bytes(large)
+
+    sequential = _scan_fixture_with_file_workers(
+        root, tmp_path / "sequential.json", 1)
+    parallel_two = _scan_fixture_with_file_workers(
+        root, tmp_path / "parallel-2.json", 2)
+    parallel_four = _scan_fixture_with_file_workers(
+        root, tmp_path / "parallel-4.json", 4)
+
+    expected = _semantic_findings(sequential)
+    assert _semantic_findings(parallel_two) == expected
+    assert _semantic_findings(parallel_four) == expected
+    assert {row["target"] for row in expected} >= {
+        "bitcoin-core", "electrum", "multibit", "armory", "secrets"
+    }
+    assert any(row.get("artifact_kind") == "mnemonic" for row in expected)
+    assert parallel_two["scanner_semantics"]["file_workers"] == 2
+    assert parallel_four["scanner_semantics"]["maximum_queued_batches"] == 8
+    assert [row["relative_path"] for row in parallel_four["files"]] == sorted(
+        row["relative_path"] for row in parallel_four["files"])
+
+
+def test_parallel_scan_keeps_identical_occurrences_per_source_file(tmp_path):
+    root = tmp_path / "source"
+    root.mkdir()
+    payload = valid_wif()
+    (root / "first").write_bytes(payload)
+    (root / "second").write_bytes(payload)
+    report = tmp_path / "report.json"
+    assert main(basic_arguments(root, report) + [
+        "--targets", "secrets", "--file-workers", "2",
+    ]) == 0
+    findings = [
+        row for row in json.loads(report.read_text())["target_findings"]
+        if row.get("artifact_kind") == "WIF_PRIVATE_KEY"
+    ]
+    assert len({row["file_path"] for row in findings}) == 2
+
+
+def test_parallel_scan_never_matches_across_file_boundary(tmp_path):
+    root = tmp_path / "source"
+    root.mkdir()
+    payload = valid_wif()
+    split = len(payload) // 2
+    (root / "part-a").write_bytes(payload[:split])
+    (root / "part-b").write_bytes(payload[split:])
+    report = tmp_path / "report.json"
+    assert main(basic_arguments(root, report) + [
+        "--targets", "secrets", "--file-workers", "2",
+    ]) == 0
+    findings = json.loads(report.read_text())["target_findings"]
+    assert not any(row.get("artifact_kind") == "WIF_PRIVATE_KEY"
+                   for row in findings)
+
+
+def test_parallel_progress_reports_file_and_byte_rates(tmp_path, capsys):
+    root = tmp_path / "source"
+    root.mkdir()
+    for index in range(40):
+        (root / f"file-{index:03d}").write_bytes(b"data")
+    report = tmp_path / "report.json"
+    assert main(basic_arguments(root, report) + [
+        "--targets", "secrets", "--file-workers", "4",
+    ]) == 0
+    stderr = capsys.readouterr().err
+    assert "files=40/40 (100.0%)" in stderr
+    assert "bytes=160/160 (100.0%)" in stderr
+    assert "files/s=" in stderr
+    assert "MiB/s=" in stderr
+    assert "raw_hits=" in stderr
+    assert "validated=" in stderr
+    assert "current=" in stderr
+
+
+def test_file_workers_rejected_for_single_file_and_image(tmp_path):
+    for name in ("ordinary.dat", "disk.img"):
+        source = tmp_path / name
+        source.write_bytes(b"data")
+        with pytest.raises(SystemExit) as raised:
+            main(basic_arguments(source, tmp_path / f"{name}.json") + [
+                "--file-workers", "2",
+            ])
+        assert raised.value.code == 2
+
+
+def test_unexpected_parallel_worker_failure_is_controlled(tmp_path, capsys):
+    root = tmp_path / "source"
+    root.mkdir()
+    for index in range(40):
+        (root / f"file-{index:03d}").write_bytes(b"data")
+    report = tmp_path / "report.json"
+    from bfrs.cli import build_parser
+    arguments = build_parser().parse_args(
+        basic_arguments(root, report) + ["--file-workers", "2"])
+
+    def child(_argv):
+        raise RuntimeError("synthetic worker failure")
+
+    assert scan_folder_source(arguments, child) == 3
+    assert "folder worker error" in capsys.readouterr().err
+    assert not report.exists()
+
+
+def test_file_workers_run_concurrently_with_bounded_worker_count(tmp_path):
+    root = tmp_path / "source"
+    root.mkdir()
+    for index in range(20):
+        (root / f"file-{index:03d}").write_bytes(b"data")
+    report = tmp_path / "report.json"
+    from bfrs.cli import build_parser
+    arguments = build_parser().parse_args(
+        basic_arguments(root, report) + ["--file-workers", "4"])
+    lock = threading.Lock()
+    active = maximum_active = 0
+
+    def child(argv):
+        nonlocal active, maximum_active
+        output = Path(argv[argv.index("--output") + 1])
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            time.sleep(0.02)
+            output.write_text(json.dumps({
+                "target_findings": [],
+                "intact_wallet": {"detected": False},
+                "finding_summary": {"crypto_valid_occurrences": 0},
+                "raw_hit_count": 0,
+            }), encoding="utf-8")
+            return 0
+        finally:
+            with lock:
+                active -= 1
+
+    assert scan_folder_source(arguments, child) == 0
+    assert 2 <= maximum_active <= 4
