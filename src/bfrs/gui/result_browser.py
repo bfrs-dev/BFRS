@@ -38,6 +38,17 @@ _DISCOVERY_STATES = ("ACCEPTED", "CANDIDATE", "REJECTED", "RAW")
 _CRYPTO_STATES = ("VALID", "UNCHECKED", "INVALID", "NOT_APPLICABLE")
 
 
+class _SortableItem(QTableWidgetItem):
+    """Use an optional numeric sort key while keeping human-readable text."""
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        left = self.data(Qt.ItemDataRole.UserRole + 1)
+        right = other.data(Qt.ItemDataRole.UserRole + 1)
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return left < right
+        return super().__lt__(other)
+
+
 class ResultBrowserWidget(QWidget):
     """Open, filter and inspect public BFRS report findings."""
 
@@ -321,7 +332,7 @@ class ResultBrowserWidget(QWidget):
                 finding.display_location,
             )
             for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
+                item = _SortableItem(value)
                 item.setToolTip(value)
                 item.setData(Qt.ItemDataRole.UserRole, row_index)
                 if column == 4:
