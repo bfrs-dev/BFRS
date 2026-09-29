@@ -42,6 +42,17 @@ def build_gui_scan_config(
     if resume_checkpoint and not checkpoint_text:
         raise ValueError("Wskaż checkpoint, który ma zostać wznowiony.")
     checkpoint = Path(checkpoint_text) if checkpoint_text else None
+    if checkpoint is not None:
+        if resume_checkpoint and not checkpoint.exists():
+            raise ValueError(
+                "Wybrany checkpoint nie istnieje. Wskaż istniejący plik "
+                "albo wyłącz opcję wznowienia."
+            )
+        if not resume_checkpoint and checkpoint.exists():
+            raise ValueError(
+                "Checkpoint już istnieje. Wybierz nową nazwę albo zaznacz "
+                "„Wznów z istniejącego checkpointu”."
+            )
 
     return ScanConfig(
         input_path=source,
