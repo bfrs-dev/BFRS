@@ -6,6 +6,7 @@ from bfrs.application.scan_config import ScanConfig
 from bfrs.application.scan_events import (
     ScanCompletedEvent,
     ScanFailedEvent,
+    ScanProgressEvent,
     ScanStartedEvent,
     ScanStoppedEvent,
 )
@@ -194,3 +195,40 @@ def test_service_rejects_explicit_folder_type_for_regular_file(tmp_path):
 
     assert len(events) == 1
     assert isinstance(events[0], ScanFailedEvent)
+
+
+def test_service_emits_real_progress_from_current_cli_backend(tmp_path):
+    events = []
+    source = tmp_path / "source.img"
+    source.write_bytes(b"ordinary data")
+    value = ScanConfig(
+        input_path=source,
+        output_path=tmp_path / "report.json",
+    )
+
+    result = ScanService(event_sink=events.append).run(value)
+
+    assert result.exit_code == 0
+    progress = [event for event in events if isinstance(event, ScanProgressEvent)]
+    assert progress
+    assert progress[-1].complete is True
+    assert progress[-1].scanned_bytes == progress[-1].total_bytes
+    assert isinstance(events[0], ScanStartedEvent)
+    assert isinstance(events[-1], ScanCompletedEvent)
+
+
+def test_service_progress_contains_safe_target_counters(tmp_path):
+    events = []
+    source = tmp_path / "source.img"
+    source.write_bytes(b"prefix\\x04ckeyinvalid")
+    value = ScanConfig(
+        input_path=source,
+        output_path=tmp_path / "report.json",
+    )
+
+    ScanService(event_sink=events.append).run(value)
+
+    progress = [event for event in events if isinstance(event, ScanProgressEvent)]
+    assert progress
+    assert all(not hasattr(event, "payload") for event in progress)
+    assert all(not hasattr(event, "secret") for event in progress)
