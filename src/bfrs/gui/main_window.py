@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -40,6 +41,7 @@ from bfrs.gui.i18n import (
     normalize_language,
     translate,
 )
+from bfrs.gui.result_browser import ResultBrowserWidget
 from bfrs.gui.scan_worker import ScanWorker
 
 
@@ -80,6 +82,15 @@ class MainWindow(QMainWindow):
         language_row.addWidget(self.language_combo)
         layout.addLayout(language_row)
 
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs, 1)
+
+        self.scan_tab = QWidget()
+        scan_layout = QVBoxLayout(self.scan_tab)
+        self.result_browser = ResultBrowserWidget(language=self._language)
+        self.tabs.addTab(self.scan_tab, "")
+        self.tabs.addTab(self.result_browser, "")
+
         self.source_box = QGroupBox()
         source_layout = QGridLayout(self.source_box)
 
@@ -109,7 +120,7 @@ class MainWindow(QMainWindow):
         source_layout.addWidget(self.report_label, 2, 0)
         source_layout.addWidget(self.output_edit, 2, 1, 1, 2)
         source_layout.addWidget(self.output_button, 2, 3)
-        layout.addWidget(self.source_box)
+        scan_layout.addWidget(self.source_box)
 
         self.target_box = QGroupBox()
         target_layout = QGridLayout(self.target_box)
@@ -125,7 +136,7 @@ class MainWindow(QMainWindow):
         self.bitcoin_context_check = QCheckBox()
         target_layout.addWidget(self.mnemonic_check, 2, 0, 1, 2)
         target_layout.addWidget(self.bitcoin_context_check, 2, 2)
-        layout.addWidget(self.target_box)
+        scan_layout.addWidget(self.target_box)
 
         self.settings_box = QGroupBox()
         settings_layout = QFormLayout(self.settings_box)
@@ -157,7 +168,7 @@ class MainWindow(QMainWindow):
         settings_layout.addRow(self.file_workers_label, self.file_workers_spin)
         settings_layout.addRow(self.checkpoint_label, checkpoint_row)
         settings_layout.addRow("", self.resume_check)
-        layout.addWidget(self.settings_box)
+        scan_layout.addWidget(self.settings_box)
 
         self.progress_box = QGroupBox()
         progress_layout = QVBoxLayout(self.progress_box)
@@ -170,7 +181,7 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.progress_bar)
         progress_layout.addWidget(self.status_label)
         progress_layout.addWidget(self.detail_label)
-        layout.addWidget(self.progress_box)
+        scan_layout.addWidget(self.progress_box)
 
         button_row = QHBoxLayout()
         self.start_button = QPushButton()
@@ -181,7 +192,7 @@ class MainWindow(QMainWindow):
         button_row.addStretch(1)
         button_row.addWidget(self.start_button)
         button_row.addWidget(self.stop_button)
-        layout.addLayout(button_row)
+        scan_layout.addLayout(button_row)
 
         self._retranslate_ui()
 
@@ -195,6 +206,9 @@ class MainWindow(QMainWindow):
 
     def _retranslate_ui(self) -> None:
         self.language_label.setText(self._t("language"))
+        self.tabs.setTabText(0, self._t("tab_scan"))
+        self.tabs.setTabText(1, self._t("tab_results"))
+        self.result_browser.set_language(self._language)
         self.source_box.setTitle(self._t("source_report_group"))
         self.source_edit.setPlaceholderText(self._t("source_placeholder"))
         self.source_file_button.setText(self._t("choose_file"))
@@ -372,12 +386,15 @@ class MainWindow(QMainWindow):
         if getattr(result, "status", "") == "stopped":
             self.status_label.setText(self._t("scan_stopped"))
         elif getattr(result, "completed", False):
+            report_path = getattr(result, "report_path", "")
             self.status_label.setText(
                 self._t(
                     "scan_completed_report",
-                    path=getattr(result, "report_path", ""),
+                    path=report_path,
                 )
             )
+            if report_path and self.result_browser.load_report(report_path):
+                self.tabs.setCurrentWidget(self.result_browser)
 
     @Slot(str)
     def _scan_failed(self, message: str) -> None:
