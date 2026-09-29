@@ -15,6 +15,8 @@ SUPPORTED_LANGUAGES: Mapping[str, str] = {
 _TRANSLATIONS: dict[str, dict[str, str]] = {
     "pl": {
         "language": "Język:",
+        "tab_scan": "Skanowanie",
+        "tab_results": "Wyniki",
         "source_report_group": "Źródło i raport",
         "source_placeholder": "Obraz dysku, plik lub folder",
         "choose_file": "Wybierz plik…",
@@ -106,6 +108,8 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     },
     "en": {
         "language": "Language:",
+        "tab_scan": "Scan",
+        "tab_results": "Results",
         "source_report_group": "Source and report",
         "source_placeholder": "Disk image, file, or folder",
         "choose_file": "Choose file…",
