@@ -150,3 +150,87 @@ def test_invalid_json_is_rejected(tmp_path):
 
     with pytest.raises(ResultServiceError, match="valid UTF-8 JSON"):
         ResultService().load(path)
+
+
+def test_result_summary_prefers_canonical_report_counts(tmp_path):
+    payload = image_report()
+    payload["finding_summary"] = {
+        "accepted_candidates": 7,
+        "review_candidates": 3,
+        "rejected": 11,
+        "crypto_valid_occurrences": 5,
+    }
+    service = ResultService()
+    report = service.load(write_report(tmp_path, payload))
+
+    summary = service.summary(report)
+
+    assert summary.displayed_findings == 2
+    assert summary.accepted == 7
+    assert summary.review == 3
+    assert summary.rejected == 11
+    assert summary.crypto_valid == 5
+
+
+def test_result_summary_falls_back_to_visible_findings(tmp_path):
+    payload = image_report()
+    payload["finding_summary"] = {}
+    service = ResultService()
+    report = service.load(write_report(tmp_path, payload))
+
+    summary = service.summary(report)
+
+    assert summary.displayed_findings == 2
+    assert summary.accepted == 1
+    assert summary.review == 0
+    assert summary.rejected == 1
+    assert summary.crypto_valid == 1
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_target"),
+    [
+        ("accepted", "secrets"),
+        ("rejected", "bitcoin-core"),
+        ("crypto-valid", "secrets"),
+    ],
+)
+def test_quick_filter_profiles(tmp_path, profile, expected_target):
+    service = ResultService()
+    report = service.load(write_report(tmp_path, image_report()))
+
+    result = service.filter(report, profile=profile)
+
+    assert len(result) == 1
+    assert result[0].target == expected_target
+
+
+def test_review_profile_includes_candidate_and_context_review_accepted(tmp_path):
+    payload = image_report()
+    accepted = payload["target_findings"][1]
+    accepted["normalized_state"]["recovery_relevance"] = "CONTEXT_REVIEW"
+    candidate = {
+        **payload["target_findings"][0],
+        "target": "electrum",
+        "normalized_state": {
+            "discovery_state": "CANDIDATE",
+            "structural_state": "FRAGMENT",
+            "crypto_state": "UNCHECKED",
+            "recovery_relevance": "CONTEXT_REVIEW",
+        },
+    }
+    payload["target_findings"].append(candidate)
+    service = ResultService()
+    report = service.load(write_report(tmp_path, payload))
+
+    result = service.filter(report, profile="review")
+
+    assert {item.target for item in result} == {"secrets", "electrum"}
+
+
+def test_unknown_quick_filter_profile_is_rejected(tmp_path):
+    service = ResultService()
+    report = service.load(write_report(tmp_path, image_report()))
+
+    with pytest.raises(ValueError, match="unknown result filter profile"):
+        service.filter(report, profile="surprise")
