@@ -111,14 +111,15 @@ class ScanCompletedEvent:
 
     report_path: Path
     status: str
-    processed_bytes: int
-    total_bytes: int
+    processed_bytes: int | None = None
+    total_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if not self.status:
             raise ValueError("status must not be empty")
-        if self.processed_bytes < 0 or self.total_bytes < 0:
-            raise ValueError("byte counts must be nonnegative")
+        for value in (self.processed_bytes, self.total_bytes):
+            if value is not None and value < 0:
+                raise ValueError("byte counts must be nonnegative")
 
 
 @dataclass(frozen=True, slots=True)
