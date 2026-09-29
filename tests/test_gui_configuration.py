@@ -41,6 +41,10 @@ def test_gui_config_maps_checkpoint_create_and_resume(tmp_path):
     )
 
     created = build_gui_scan_config(**base, resume_checkpoint=False)
+
+    # Creating ScanConfig does not write the checkpoint.  Simulate the state
+    # after the first scan has actually created it before testing resume mode.
+    checkpoint.write_bytes(b"synthetic checkpoint placeholder")
     resumed = build_gui_scan_config(**base, resume_checkpoint=True)
 
     assert created.checkpoint == checkpoint
