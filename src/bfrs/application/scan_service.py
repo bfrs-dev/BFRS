@@ -13,8 +13,10 @@ from bfrs.application.scan_events import (
     ScanCompletedEvent,
     ScanEvent,
     ScanFailedEvent,
+    ScanProgressEvent,
     ScanStartedEvent,
     ScanStoppedEvent,
+    freeze_counts,
 )
 from bfrs.core.source_types import SourceType, detect_source_type
 from bfrs.scanners.target_registry import AVAILABLE_TARGETS
@@ -71,7 +73,13 @@ class ScanService:
         ))
 
         try:
-            exit_code = self._cli_runner(build_cli_arguments(config))
+            if self._cli_runner is _run_current_cli:
+                exit_code = self._cli_runner(
+                    build_cli_arguments(config),
+                    progress_callback=self._on_progress,
+                )
+            else:
+                exit_code = self._cli_runner(build_cli_arguments(config))
         except KeyboardInterrupt:
             self._emit(ScanStoppedEvent(
                 processed_bytes=0,
@@ -128,6 +136,27 @@ class ScanService:
                 recoverable=True,
             ))
             raise ScanServiceError(str(error)) from error
+
+    def _on_progress(self, update) -> None:
+        self._emit(ScanProgressEvent(
+            scanned_bytes=update.scanned_bytes,
+            total_bytes=update.total_bytes,
+            raw_hits=update.raw_hits,
+            anchors_total=update.anchors_total,
+            stage=update.stage,
+            complete=update.complete,
+            raw_by_target=freeze_counts(update.raw_by_target),
+            rejected_by_target=freeze_counts(update.rejected_by_target),
+            pending_validation_by_target=freeze_counts(
+                update.pending_validation_by_target
+            ),
+            validated_occurrences_by_target=freeze_counts(
+                update.validated_occurrences_by_target
+            ),
+            validated_unique_by_target=freeze_counts(
+                update.validated_unique_by_target
+            ),
+        ))
 
     def _emit(self, event: ScanEvent) -> None:
         if self._event_sink is not None:
@@ -192,12 +221,16 @@ def build_cli_arguments(config: ScanConfig) -> list[str]:
     return arguments
 
 
-def _run_current_cli(arguments: list[str]) -> int:
+def _run_current_cli(
+    arguments: list[str],
+    *,
+    progress_callback=None,
+) -> int:
     # Delayed import keeps the application contract independent at import time
     # and makes the temporary CLI adapter easy to remove in the next migration.
     from bfrs.cli import main
 
-    return main(arguments)
+    return main(arguments, _scan_progress=progress_callback)
 
 
 def _read_completion_metadata(
