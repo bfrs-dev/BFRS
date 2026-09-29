@@ -22,6 +22,12 @@ from bfrs.application.scan_events import (
     freeze_counts,
     thaw_counts,
 )
+from bfrs.application.scan_service import (
+    ScanRunResult,
+    ScanService,
+    ScanServiceError,
+    build_cli_arguments,
+)
 
 __all__ = [
     "DEFAULT_CHUNK_MIB",
@@ -37,9 +43,13 @@ __all__ = [
     "ScanEvent",
     "ScanFailedEvent",
     "ScanProgressEvent",
+    "ScanRunResult",
+    "ScanService",
+    "ScanServiceError",
     "ScanStartedEvent",
     "ScanStoppedEvent",
     "TargetCounts",
+    "build_cli_arguments",
     "freeze_counts",
     "thaw_counts",
 ]
