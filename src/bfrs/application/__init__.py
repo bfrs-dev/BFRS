@@ -23,6 +23,7 @@ from bfrs.application.scan_events import (
     thaw_counts,
 )
 from bfrs.application.scan_service import (
+    ScanController,
     ScanRunResult,
     ScanService,
     ScanServiceError,
@@ -43,6 +44,7 @@ __all__ = [
     "ScanEvent",
     "ScanFailedEvent",
     "ScanProgressEvent",
+    "ScanController",
     "ScanRunResult",
     "ScanService",
     "ScanServiceError",
