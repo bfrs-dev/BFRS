@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import QUrl, Qt, Slot
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
@@ -71,7 +72,17 @@ class ResultBrowserWidget(QWidget):
         self.report_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
+        self.export_csv_button = QPushButton()
+        self.export_json_button = QPushButton()
+        self.export_csv_button.clicked.connect(
+            lambda: self._export_matching(".csv")
+        )
+        self.export_json_button.clicked.connect(
+            lambda: self._export_matching(".json")
+        )
         top_row.addWidget(self.open_button)
+        top_row.addWidget(self.export_csv_button)
+        top_row.addWidget(self.export_json_button)
         top_row.addWidget(self.report_label, 1)
         layout.addLayout(top_row)
 
@@ -164,6 +175,19 @@ class ResultBrowserWidget(QWidget):
         self.details = QPlainTextEdit()
         self.details.setReadOnly(True)
         details_layout.addWidget(self.details)
+
+        detail_actions = QHBoxLayout()
+        self.copy_location_button = QPushButton()
+        self.copy_offset_button = QPushButton()
+        self.open_folder_button = QPushButton()
+        self.copy_location_button.clicked.connect(self._copy_location)
+        self.copy_offset_button.clicked.connect(self._copy_offset)
+        self.open_folder_button.clicked.connect(self._open_source_folder)
+        detail_actions.addWidget(self.copy_location_button)
+        detail_actions.addWidget(self.copy_offset_button)
+        detail_actions.addWidget(self.open_folder_button)
+        detail_actions.addStretch(1)
+        details_layout.addLayout(detail_actions)
         splitter.addWidget(self.details_box)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
@@ -180,6 +204,11 @@ class ResultBrowserWidget(QWidget):
 
     def _retranslate(self) -> None:
         self.open_button.setText(self._t("open_report"))
+        self.export_csv_button.setText(self._t("export_csv"))
+        self.export_json_button.setText(self._t("export_json"))
+        self.copy_location_button.setText(self._t("copy_location"))
+        self.copy_offset_button.setText(self._t("copy_offset"))
+        self.open_folder_button.setText(self._t("open_source_folder"))
         self.filters_box.setTitle(self._t("results_group"))
         self.target_label.setText(self._t("filter_target"))
         self.state_label.setText(self._t("filter_state"))
@@ -293,6 +322,94 @@ class ResultBrowserWidget(QWidget):
         self.quick_buttons[None].setChecked(True)
         self._apply_filters()
         return True
+
+    def _selected_finding(self) -> FindingView | None:
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        anchor = self.table.item(row, 0)
+        if anchor is None:
+            return None
+        index = anchor.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(index, int) or not (0 <= index < len(self._visible_findings)):
+            return None
+        return self._visible_findings[index]
+
+    def _export_matching(self, suffix: str) -> None:
+        if self._report is None:
+            return
+        default_name = self._report.path.with_name(
+            self._report.path.stem + "-filtered" + suffix
+        )
+        title_key = "export_title_csv" if suffix == ".csv" else "export_title_json"
+        file_filter = "CSV (*.csv)" if suffix == ".csv" else "JSON (*.json)"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self._t(title_key),
+            str(default_name),
+            file_filter,
+        )
+        if not path:
+            return
+        if not Path(path).suffix:
+            path += suffix
+        try:
+            output = self._service.export_findings(path, self._matching_findings)
+        except (OSError, ResultServiceError, TypeError, ValueError) as error:
+            QMessageBox.critical(
+                self,
+                self._t("report_error_title"),
+                self._t("export_error", message=error),
+            )
+            return
+        QMessageBox.information(
+            self,
+            self._t("results_group"),
+            self._t(
+                "export_success",
+                count=len(self._matching_findings),
+                path=output,
+            ),
+        )
+
+    @Slot()
+    def _copy_location(self) -> None:
+        finding = self._selected_finding()
+        if finding is None or not finding.display_location:
+            return
+        QGuiApplication.clipboard().setText(finding.display_location)
+        self.render_notice.setText(self._t("location_copied"))
+        self.render_notice.setVisible(True)
+
+    @Slot()
+    def _copy_offset(self) -> None:
+        finding = self._selected_finding()
+        if finding is None or finding.start_offset is None:
+            return
+        QGuiApplication.clipboard().setText(str(finding.start_offset))
+        self.render_notice.setText(self._t("offset_copied"))
+        self.render_notice.setVisible(True)
+
+    @Slot()
+    def _open_source_folder(self) -> None:
+        finding = self._selected_finding()
+        if finding is None or not finding.file_path:
+            QMessageBox.information(
+                self,
+                self._t("results_group"),
+                self._t("source_folder_unavailable"),
+            )
+            return
+        source = Path(finding.file_path)
+        folder = source if source.is_dir() else source.parent
+        if not folder.exists():
+            QMessageBox.information(
+                self,
+                self._t("results_group"),
+                self._t("source_folder_unavailable"),
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     @Slot()
     def _set_quick_profile(self, profile: str | None) -> None:
