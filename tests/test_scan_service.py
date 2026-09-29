@@ -4,6 +4,7 @@ import pytest
 
 from bfrs.application.scan_config import ScanConfig
 from bfrs.application.scan_events import (
+    ScanCheckpointSavedEvent,
     ScanCompletedEvent,
     ScanFailedEvent,
     ScanProgressEvent,
@@ -11,6 +12,7 @@ from bfrs.application.scan_events import (
     ScanStoppedEvent,
 )
 from bfrs.application.scan_service import (
+    ScanController,
     ScanService,
     ScanServiceError,
     build_cli_arguments,
@@ -232,3 +234,104 @@ def test_service_progress_contains_safe_target_counters(tmp_path):
     assert progress
     assert all(not hasattr(event, "payload") for event in progress)
     assert all(not hasattr(event, "secret") for event in progress)
+
+
+def test_scan_controller_is_thread_safe_lifecycle_flag():
+    controller = ScanController()
+
+    assert controller.stop_requested is False
+    assert controller.should_stop() is False
+
+    controller.request_stop()
+    assert controller.stop_requested is True
+    assert controller.should_stop() is True
+
+    controller.reset_stop()
+    assert controller.stop_requested is False
+
+
+def test_service_can_stop_at_safe_boundary_and_resume_checkpoint(tmp_path):
+    source = tmp_path / "source.img"
+    source.write_bytes(b"x" * (3 * 1024 * 1024))
+    checkpoint = tmp_path / "scan.checkpoint.sqlite"
+    stopped_report = tmp_path / "stopped.json"
+    events = []
+    controller = ScanController()
+    service = ScanService(event_sink=events.append, controller=controller)
+
+    def stop_after_first_completed_unit(event):
+        events.append(event)
+        if (
+            isinstance(event, ScanProgressEvent)
+            and event.stage is None
+            and event.scanned_bytes > 0
+            and not event.complete
+        ):
+            controller.request_stop()
+
+    service = ScanService(
+        event_sink=stop_after_first_completed_unit,
+        controller=controller,
+    )
+    stopped = service.run(ScanConfig(
+        input_path=source,
+        output_path=stopped_report,
+        chunk_mib=1,
+        overlap_kib=64,
+        checkpoint=checkpoint,
+    ))
+
+    assert stopped.status == "stopped"
+    assert checkpoint.exists()
+    assert not stopped_report.exists()
+    saved = [event for event in events if isinstance(
+        event, ScanCheckpointSavedEvent)]
+    stopped_events = [event for event in events if isinstance(
+        event, ScanStoppedEvent)]
+    assert saved
+    assert stopped_events
+    assert saved[-1].completed_bytes > 0
+    assert stopped_events[-1].processed_bytes == saved[-1].completed_bytes
+
+    controller.reset_stop()
+    resumed_events = []
+    resumed = ScanService(
+        event_sink=resumed_events.append,
+        controller=controller,
+    ).run(ScanConfig(
+        input_path=source,
+        output_path=tmp_path / "resumed.json",
+        chunk_mib=1,
+        overlap_kib=64,
+        resume_checkpoint=checkpoint,
+    ))
+
+    assert resumed.completed is True
+    assert resumed.report_path.exists()
+    assert isinstance(resumed_events[-1], ScanCompletedEvent)
+
+
+def test_stop_without_checkpoint_is_clean_but_not_resumable(tmp_path):
+    source = tmp_path / "source.img"
+    source.write_bytes(b"x" * (2 * 1024 * 1024))
+    events = []
+    controller = ScanController()
+
+    def request_stop(event):
+        events.append(event)
+        if isinstance(event, ScanProgressEvent) and event.scanned_bytes > 0:
+            controller.request_stop()
+
+    result = ScanService(
+        event_sink=request_stop,
+        controller=controller,
+    ).run(ScanConfig(
+        input_path=source,
+        output_path=tmp_path / "report.json",
+        chunk_mib=1,
+        overlap_kib=64,
+    ))
+
+    assert result.status == "stopped"
+    assert any(isinstance(event, ScanStoppedEvent) for event in events)
+    assert not any(isinstance(event, ScanCheckpointSavedEvent) for event in events)
