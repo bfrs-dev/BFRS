@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from collections.abc import Callable
 from pathlib import Path
 import sys
 import time
@@ -491,7 +492,12 @@ def _configuration(arguments, selection=None) -> dict[str, object]:
     }
 
 
-def main(argv: Sequence[str] | None = None, *, _folder_child: bool = False) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    _folder_child: bool = False,
+    _scan_progress: Callable[[ScanProgress], None] | None = None,
+) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
     _validate_arguments(parser, arguments)
@@ -515,7 +521,10 @@ def main(argv: Sequence[str] | None = None, *, _folder_child: bool = False) -> i
             parser.error("folder report output must be outside the source root")
         from bfrs.scanners.folder_source_scanner import scan_folder_source
         return scan_folder_source(
-            arguments, lambda child_argv: main(child_argv, _folder_child=True))
+            arguments,
+            lambda child_argv: main(child_argv, _folder_child=True),
+            progress_callback=_scan_progress,
+        )
     if arguments.file_workers != 1:
         parser.error("--file-workers is only supported for FOLDER sources")
     if arguments.revalidate_wallet_records is not None:
@@ -593,12 +602,23 @@ def main(argv: Sequence[str] | None = None, *, _folder_child: bool = False) -> i
             enabled=not _folder_child,
         )
 
+        def seed_progress_update(processed: int, total: int) -> None:
+            seed_progress.update(processed, total)
+            if _scan_progress is not None:
+                _scan_progress(ScanProgress(
+                    scanned_bytes=processed,
+                    total_bytes=total,
+                    raw_hits=0,
+                    stage="seed-scan",
+                    complete=(total == 0 or processed >= total),
+                ))
+
         try:
             result = MnemonicRecoveryPipeline(
                 chunk_size=chunk_size,
                 overlap=overlap,
             ).scan(arguments.input, start=arguments.start, end=arguments.end,
-                   progress=seed_progress.update, workers=arguments.workers,
+                   progress=seed_progress_update, workers=arguments.workers,
                    resume_results=(checkpoint.completed_results if checkpoint else None),
                    unit_complete=(checkpoint.record if checkpoint else None))
         except KeyboardInterrupt:
@@ -704,6 +724,12 @@ def main(argv: Sequence[str] | None = None, *, _folder_child: bool = False) -> i
         enabled=not _folder_child,
     )
     electrum_progress = _ElectrumProgressLine(enabled=not _folder_child)
+
+    def target_progress(update: ScanProgress) -> None:
+        scan_progress(update)
+        if _scan_progress is not None:
+            _scan_progress(update)
+
     try:
         result = coordinator.scan(
             arguments.input,
@@ -712,7 +738,7 @@ def main(argv: Sequence[str] | None = None, *, _folder_child: bool = False) -> i
             electrum_only=arguments.electrum_only,
             intact_file_mode=(source_type is SourceType.FILE),
             targets=selection.targets,
-            progress=scan_progress,
+            progress=target_progress,
             ntfs_progress=ntfs_progress,
             electrum_progress=electrum_progress,
             resume_results=(unified_checkpoint.completed_results
