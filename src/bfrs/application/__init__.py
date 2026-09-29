@@ -26,6 +26,7 @@ from bfrs.application.result_service import (
     FindingView,
     ResultReport,
     ResultService,
+    ResultSummary,
     ResultServiceError,
 )
 from bfrs.application.scan_service import (
@@ -46,6 +47,7 @@ __all__ = [
     "FindingView",
     "ResultReport",
     "ResultService",
+    "ResultSummary",
     "ResultServiceError",
     "ScanCheckpointSavedEvent",
     "ScanCompletedEvent",
