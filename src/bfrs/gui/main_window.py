@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Slot
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -43,6 +44,7 @@ from bfrs.gui.i18n import (
 )
 from bfrs.gui.result_browser import ResultBrowserWidget
 from bfrs.gui.scan_worker import ScanWorker
+from bfrs.gui.settings import GuiPreferences, GuiSettingsStore
 
 
 _TARGET_KEYS = {
@@ -55,9 +57,17 @@ _TARGET_KEYS = {
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, *, language: str = DEFAULT_LANGUAGE) -> None:
+    def __init__(
+        self,
+        *,
+        language: str | None = None,
+        settings_store: GuiSettingsStore | None = None,
+    ) -> None:
         super().__init__()
-        self._language = normalize_language(language)
+        self._settings_store = settings_store or GuiSettingsStore()
+        preferences = self._settings_store.load()
+        self._last_result_report = preferences.last_result_report
+        self._language = normalize_language(language or preferences.language)
         self.setWindowTitle("BFRS 2.0")
         self.resize(860, 660)
 
@@ -87,7 +97,10 @@ class MainWindow(QMainWindow):
 
         self.scan_tab = QWidget()
         scan_layout = QVBoxLayout(self.scan_tab)
-        self.result_browser = ResultBrowserWidget(language=self._language)
+        self.result_browser = ResultBrowserWidget(
+            language=self._language,
+            report_loaded=self._remember_result_report,
+        )
         self.tabs.addTab(self.scan_tab, "")
         self.tabs.addTab(self.result_browser, "")
 
@@ -143,12 +156,12 @@ class MainWindow(QMainWindow):
 
         self.workers_spin = QSpinBox()
         self.workers_spin.setRange(0, 32)
-        self.workers_spin.setValue(4)
+        self.workers_spin.setValue(preferences.workers)
         self.workers_spin.setSpecialValueText("Auto")
 
         self.file_workers_spin = QSpinBox()
         self.file_workers_spin.setRange(1, 32)
-        self.file_workers_spin.setValue(1)
+        self.file_workers_spin.setValue(preferences.file_workers)
 
         checkpoint_row = QWidget()
         checkpoint_layout = QHBoxLayout(checkpoint_row)
@@ -194,7 +207,18 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.stop_button)
         scan_layout.addLayout(button_row)
 
+        self.source_edit.setText(preferences.last_source)
+        self.output_edit.setText(preferences.last_output)
+
+        self.language_combo.currentIndexChanged.connect(self._save_preferences)
+        self.workers_spin.valueChanged.connect(self._save_preferences)
+        self.file_workers_spin.valueChanged.connect(self._save_preferences)
+        self.source_edit.textChanged.connect(self._save_preferences)
+        self.output_edit.textChanged.connect(self._save_preferences)
+
         self._retranslate_ui()
+        if self._last_result_report and Path(self._last_result_report).is_file():
+            self.result_browser.load_report(self._last_result_report)
 
     def _t(self, key: str, **values: object) -> str:
         return translate(self._language, key, **values)
@@ -203,6 +227,28 @@ class MainWindow(QMainWindow):
     def _change_language(self) -> None:
         self._language = normalize_language(self.language_combo.currentData())
         self._retranslate_ui()
+
+    def _current_preferences(self) -> GuiPreferences:
+        return GuiPreferences(
+            language=self._language,
+            workers=self.workers_spin.value(),
+            file_workers=self.file_workers_spin.value(),
+            last_source=self.source_edit.text().strip(),
+            last_output=self.output_edit.text().strip(),
+            last_result_report=self._last_result_report,
+        )
+
+    @Slot()
+    def _save_preferences(self) -> None:
+        try:
+            self._settings_store.save(self._current_preferences())
+        except OSError:
+            # Preferences are optional and must never block scanning.
+            pass
+
+    def _remember_result_report(self, path: Path) -> None:
+        self._last_result_report = str(path)
+        self._save_preferences()
 
     def _retranslate_ui(self) -> None:
         self.language_label.setText(self._t("language"))
@@ -400,6 +446,10 @@ class MainWindow(QMainWindow):
     def _scan_failed(self, message: str) -> None:
         self.status_label.setText(self._t("scan_failed"))
         QMessageBox.critical(self, self._t("scan_error_title"), message)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._save_preferences()
+        super().closeEvent(event)
 
     @Slot()
     def _cleanup_thread(self) -> None:
