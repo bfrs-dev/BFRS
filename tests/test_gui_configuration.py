@@ -103,3 +103,40 @@ def test_gui_config_requires_checkpoint_when_resume_is_selected(tmp_path):
             file_workers=1,
             resume_checkpoint=True,
         )
+
+
+def test_gui_config_rejects_existing_checkpoint_in_create_mode(tmp_path):
+    checkpoint = tmp_path / "existing.checkpoint.sqlite"
+    checkpoint.write_bytes(b"existing")
+
+    with pytest.raises(ValueError, match="Checkpoint już istnieje"):
+        build_gui_scan_config(
+            input_path=str(tmp_path / "disk.img"),
+            output_path=str(tmp_path / "report.json"),
+            source_type="image",
+            targets=frozenset({"bitcoin-core"}),
+            include_mnemonic=False,
+            include_bitcoin_context=False,
+            workers=1,
+            file_workers=1,
+            checkpoint_path=str(checkpoint),
+            resume_checkpoint=False,
+        )
+
+
+def test_gui_config_rejects_missing_checkpoint_in_resume_mode(tmp_path):
+    checkpoint = tmp_path / "missing.checkpoint.sqlite"
+
+    with pytest.raises(ValueError, match="nie istnieje"):
+        build_gui_scan_config(
+            input_path=str(tmp_path / "disk.img"),
+            output_path=str(tmp_path / "report.json"),
+            source_type="image",
+            targets=frozenset({"bitcoin-core"}),
+            include_mnemonic=False,
+            include_bitcoin_context=False,
+            workers=1,
+            file_workers=1,
+            checkpoint_path=str(checkpoint),
+            resume_checkpoint=True,
+        )
