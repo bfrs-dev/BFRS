@@ -311,3 +311,56 @@ def test_review_priority_uses_confidence_then_location_for_stable_order(tmp_path
         "bitcoin-core",
         "electrum",
     ]
+
+
+def test_export_filtered_findings_to_json(tmp_path):
+    service = ResultService()
+    report = service.load(write_report(tmp_path, image_report()))
+    findings = service.filter(report, profile="crypto-valid")
+    output = tmp_path / "filtered.json"
+
+    result = service.export_findings(output, findings)
+
+    assert result == output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert len(payload) == 1
+    row = payload[0]
+    assert row["target"] == "secrets"
+    assert row["priority"] == "CRYPTO_VALID"
+    assert row["start_offset"] == 500
+    assert row["reason_codes"] == ["BASE58CHECK_VALID"]
+    assert "safe_metadata" in row
+    assert "raw_bytes" not in row
+    assert "secret" not in row
+
+
+def test_export_filtered_findings_to_csv(tmp_path):
+    service = ResultService()
+    report = service.load(write_report(tmp_path, image_report()))
+    findings = service.filter(report, profile="rejected")
+    output = tmp_path / "filtered.csv"
+
+    service.export_findings(output, findings)
+
+    text = output.read_text(encoding="utf-8")
+    assert "priority,target,artifact_kind" in text
+    assert "REJECTED,bitcoin-core,wallet_record" in text
+    assert "BITCOIN_RECORD_PUBKEY_LENGTH_INVALID" in text
+
+
+def test_export_findings_creates_parent_directory(tmp_path):
+    service = ResultService()
+    report = service.load(write_report(tmp_path, image_report()))
+    output = tmp_path / "nested" / "filtered.json"
+
+    service.export_findings(output, report.findings)
+
+    assert output.exists()
+
+
+def test_export_findings_rejects_unknown_extension(tmp_path):
+    service = ResultService()
+    report = service.load(write_report(tmp_path, image_report()))
+
+    with pytest.raises(ResultServiceError, match="must end with"):
+        service.export_findings(tmp_path / "filtered.txt", report.findings)
