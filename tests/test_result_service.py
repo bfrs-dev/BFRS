@@ -234,3 +234,80 @@ def test_unknown_quick_filter_profile_is_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="unknown result filter profile"):
         service.filter(report, profile="surprise")
+
+
+def test_review_priority_orders_crypto_valid_before_accepted_review_and_rejected(tmp_path):
+    payload = image_report()
+    accepted = payload["target_findings"][1]
+    accepted["normalized_state"]["crypto_state"] = "UNCHECKED"
+
+    crypto_valid = {
+        **accepted,
+        "target": "electrum",
+        "physical_start": 50,
+        "confidence": 0.2,
+        "normalized_state": {
+            "discovery_state": "CANDIDATE",
+            "structural_state": "FRAGMENT",
+            "crypto_state": "VALID",
+            "recovery_relevance": "CONTEXT_REVIEW",
+        },
+    }
+    review = {
+        **payload["target_findings"][0],
+        "target": "armory",
+        "physical_start": 200,
+        "normalized_state": {
+            "discovery_state": "CANDIDATE",
+            "structural_state": "FRAGMENT",
+            "crypto_state": "UNCHECKED",
+            "recovery_relevance": "CONTEXT_REVIEW",
+        },
+    }
+    payload["target_findings"].extend([crypto_valid, review])
+
+    service = ResultService()
+    report = service.load(write_report(tmp_path, payload))
+    ordered = service.prioritize(report.findings)
+
+    assert [item.review_priority_label for item in ordered] == [
+        "CRYPTO_VALID",
+        "ACCEPTED",
+        "REVIEW",
+        "REJECTED",
+    ]
+
+
+def test_review_priority_uses_confidence_then_location_for_stable_order(tmp_path):
+    payload = image_report()
+    template = payload["target_findings"][1]
+    payload["target_findings"] = [
+        {
+            **template,
+            "target": "electrum",
+            "physical_start": 300,
+            "confidence": 0.8,
+        },
+        {
+            **template,
+            "target": "bitcoin-core",
+            "physical_start": 100,
+            "confidence": 0.9,
+        },
+        {
+            **template,
+            "target": "armory",
+            "physical_start": 50,
+            "confidence": 0.9,
+        },
+    ]
+
+    service = ResultService()
+    report = service.load(write_report(tmp_path, payload))
+    ordered = service.prioritize(report.findings)
+
+    assert [item.target for item in ordered] == [
+        "armory",
+        "bitcoin-core",
+        "electrum",
+    ]
