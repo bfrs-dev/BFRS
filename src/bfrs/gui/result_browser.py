@@ -36,6 +36,7 @@ from bfrs.gui.i18n import DEFAULT_LANGUAGE, normalize_language, translate
 
 _DISCOVERY_STATES = ("ACCEPTED", "CANDIDATE", "REJECTED", "RAW")
 _CRYPTO_STATES = ("VALID", "UNCHECKED", "INVALID", "NOT_APPLICABLE")
+_MAX_RENDERED_FINDINGS = 5000
 
 
 class _SortableItem(QTableWidgetItem):
@@ -57,6 +58,7 @@ class ResultBrowserWidget(QWidget):
         self._language = normalize_language(language)
         self._service = ResultService()
         self._report: ResultReport | None = None
+        self._matching_findings: tuple[FindingView, ...] = ()
         self._visible_findings: tuple[FindingView, ...] = ()
         self._quick_profile: str | None = None
 
@@ -130,6 +132,10 @@ class ResultBrowserWidget(QWidget):
         summary_row.addStretch(1)
         layout.addLayout(summary_row)
 
+        self.render_notice = QLabel()
+        self.render_notice.setWordWrap(True)
+        layout.addWidget(self.render_notice)
+
         self.target_combo.currentIndexChanged.connect(self._apply_filters)
         self.state_combo.currentIndexChanged.connect(self._apply_filters)
         self.crypto_combo.currentIndexChanged.connect(self._apply_filters)
@@ -137,7 +143,7 @@ class ResultBrowserWidget(QWidget):
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
         )
@@ -149,6 +155,7 @@ class ResultBrowserWidget(QWidget):
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setSortingEnabled(True)
+        self.table.sortItems(0, Qt.SortOrder.AscendingOrder)
         self.table.itemSelectionChanged.connect(self._show_selected_details)
         splitter.addWidget(self.table)
 
@@ -199,6 +206,7 @@ class ResultBrowserWidget(QWidget):
         self._rebuild_target_combo()
 
         headers = (
+            "column_priority",
             "column_target",
             "column_artifact",
             "column_state",
@@ -294,6 +302,7 @@ class ResultBrowserWidget(QWidget):
     @Slot()
     def _apply_filters(self) -> None:
         if self._report is None:
+            self._matching_findings = ()
             self._visible_findings = ()
             self.table.setRowCount(0)
             self._update_summary_labels()
@@ -303,7 +312,7 @@ class ResultBrowserWidget(QWidget):
         state = self.state_combo.currentData()
         crypto = self.crypto_combo.currentData()
 
-        self._visible_findings = self._service.filter(
+        filtered = self._service.filter(
             self._report,
             targets=({target} if target else None),
             discovery_states=({state} if state else None),
@@ -311,6 +320,8 @@ class ResultBrowserWidget(QWidget):
             profile=self._quick_profile,
             search=self.search_edit.text(),
         )
+        self._matching_findings = self._service.prioritize(filtered)
+        self._visible_findings = self._matching_findings[:_MAX_RENDERED_FINDINGS]
         self._populate_table()
         self._update_summary_labels()
 
@@ -320,6 +331,7 @@ class ResultBrowserWidget(QWidget):
         self.table.setRowCount(len(self._visible_findings))
         for row_index, finding in enumerate(self._visible_findings):
             values = (
+                finding.review_priority_label,
                 finding.target,
                 finding.artifact_kind,
                 finding.discovery_state,
@@ -335,12 +347,17 @@ class ResultBrowserWidget(QWidget):
                 item = _SortableItem(value)
                 item.setToolTip(value)
                 item.setData(Qt.ItemDataRole.UserRole, row_index)
-                if column == 4:
+                if column == 0:
+                    item.setData(
+                        Qt.ItemDataRole.UserRole + 1,
+                        finding.review_priority,
+                    )
+                elif column == 5:
                     item.setData(
                         Qt.ItemDataRole.UserRole + 1,
                         finding.confidence if finding.confidence is not None else -1.0,
                     )
-                elif column == 5:
+                elif column == 6:
                     item.setData(
                         Qt.ItemDataRole.UserRole + 1,
                         finding.start_offset if finding.start_offset is not None else -1,
@@ -380,6 +397,7 @@ class ResultBrowserWidget(QWidget):
         )
         reasons = ", ".join(finding.reason_codes) or "-"
         lines = [
+            f"{self._t('column_priority')}: {finding.review_priority_label}",
             f"{self._t('column_target')}: {finding.target}",
             f"{self._t('column_artifact')}: {finding.artifact_kind}",
             f"{self._t('column_state')}: {finding.discovery_state}",
@@ -404,7 +422,7 @@ class ResultBrowserWidget(QWidget):
             displayed = accepted = review = rejected = crypto_valid = 0
         else:
             summary = self._service.summary(self._report)
-            displayed = len(self._visible_findings)
+            displayed = len(self._matching_findings)
             accepted = summary.accepted
             review = summary.review
             rejected = summary.rejected
@@ -420,3 +438,13 @@ class ResultBrowserWidget(QWidget):
         self.summary_crypto_valid.setText(
             self._t("summary_crypto_valid", count=crypto_valid)
         )
+        matching = len(self._matching_findings)
+        shown = len(self._visible_findings)
+        if matching > shown:
+            self.render_notice.setText(
+                self._t("render_limit", shown=shown, matching=matching)
+            )
+            self.render_notice.setVisible(True)
+        else:
+            self.render_notice.clear()
+            self.render_notice.setVisible(False)
