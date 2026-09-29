@@ -59,6 +59,14 @@ DEFAULT_MINIMUM_HITS = 1
 DEFAULT_MINIMUM_DISTINCT_TYPES = 1
 
 
+class _ScanStopRequested(Exception):
+    """Internal cooperative stop raised only at a safe progress boundary."""
+
+
+def _stop_requested(callback: Callable[[], bool] | None) -> bool:
+    return bool(callback is not None and callback())
+
+
 class _ProgressLine:
     """Render throttled aggregate scan progress on one stderr line."""
 
@@ -497,11 +505,14 @@ def main(
     *,
     _folder_child: bool = False,
     _scan_progress: Callable[[ScanProgress], None] | None = None,
+    _scan_should_stop: Callable[[], bool] | None = None,
 ) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
     _validate_arguments(parser, arguments)
     _validate_path_collisions(parser, arguments)
+    if _stop_requested(_scan_should_stop):
+        return 130
     try:
         source_type = detect_source_type(arguments.input, arguments.source_type)
     except ValueError as error:
@@ -522,7 +533,11 @@ def main(
         from bfrs.scanners.folder_source_scanner import scan_folder_source
         return scan_folder_source(
             arguments,
-            lambda child_argv: main(child_argv, _folder_child=True),
+            lambda child_argv: main(
+                child_argv,
+                _folder_child=True,
+                _scan_should_stop=_scan_should_stop,
+            ),
             progress_callback=_scan_progress,
         )
     if arguments.file_workers != 1:
@@ -612,6 +627,8 @@ def main(
                     stage="seed-scan",
                     complete=(total == 0 or processed >= total),
                 ))
+            if _stop_requested(_scan_should_stop):
+                raise _ScanStopRequested
 
         try:
             result = MnemonicRecoveryPipeline(
@@ -621,6 +638,12 @@ def main(
                    progress=seed_progress_update, workers=arguments.workers,
                    resume_results=(checkpoint.completed_results if checkpoint else None),
                    unit_complete=(checkpoint.record if checkpoint else None))
+        except _ScanStopRequested:
+            if checkpoint is not None:
+                checkpoint.save(force=True)
+            seed_progress.finish()
+            print("scan stopped by request", file=sys.stderr)
+            return 130
         except KeyboardInterrupt:
             if checkpoint is not None:
                 checkpoint.save(force=True)
@@ -729,6 +752,11 @@ def main(
         scan_progress(update)
         if _scan_progress is not None:
             _scan_progress(update)
+        # Stage callbacks can occur inside one ownership unit.  Defer stopping
+        # until the ordinary unit-complete progress callback, after checkpoint
+        # state for that unit has already been persisted.
+        if update.stage is None and _stop_requested(_scan_should_stop):
+            raise _ScanStopRequested
 
     try:
         result = coordinator.scan(
@@ -746,6 +774,13 @@ def main(
             unit_complete=(unified_checkpoint.record
                            if unified_checkpoint else None),
         )
+    except _ScanStopRequested:
+        if unified_checkpoint is not None:
+            unified_checkpoint.save(force=True)
+        ntfs_progress.finish()
+        scan_progress.finish()
+        print("scan stopped by request", file=sys.stderr)
+        return 130
     except KeyboardInterrupt:
         if unified_checkpoint is not None:
             unified_checkpoint.save(force=True)
