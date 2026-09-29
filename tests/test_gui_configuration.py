@@ -76,3 +76,18 @@ def test_gui_configuration_module_does_not_require_qt():
     # This test intentionally imports only the pure adapter.  CLI/test installs
     # must remain usable without the optional PySide6 dependency.
     assert Path.__module__ == "pathlib"
+
+
+def test_gui_config_requires_checkpoint_when_resume_is_selected(tmp_path):
+    with pytest.raises(ValueError, match="checkpoint"):
+        build_gui_scan_config(
+            input_path=str(tmp_path / "disk.img"),
+            output_path=str(tmp_path / "report.json"),
+            source_type="image",
+            targets=frozenset({"bitcoin-core"}),
+            include_mnemonic=False,
+            include_bitcoin_context=False,
+            workers=1,
+            file_workers=1,
+            resume_checkpoint=True,
+        )
