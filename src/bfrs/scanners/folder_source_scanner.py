@@ -34,6 +34,10 @@ class FolderWorkerError(RuntimeError):
     """A file-worker failed outside the normal per-file error boundary."""
 
 
+class FolderScanStopped(Exception):
+    """A child file scan cooperatively stopped by user request."""
+
+
 @dataclass(frozen=True, slots=True)
 class _ScanOutcome:
     index: int
@@ -264,6 +268,8 @@ def _scan_batch(
         child_report_path = temporary_root / f"report-{index:09d}.json"
         try:
             code = child_main(_child_arguments(arguments, source, child_report_path))
+            if code == 130:
+                raise FolderScanStopped
             if code != 0:
                 raise OSError(f"CHILD_SCAN_EXIT_{code}")
             child_report = json.loads(child_report_path.read_text(encoding="utf-8"))
@@ -272,6 +278,8 @@ def _scan_batch(
                 raise ValueError("INVALID_CHILD_REPORT")
             outcome = _ScanOutcome(
                 index, source, size, mtime_ns, report=child_report)
+        except FolderScanStopped:
+            raise
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
             outcome = _ScanOutcome(
                 index, source, size, mtime_ns,
@@ -324,6 +332,10 @@ def _scan_files_bounded(
                 batch = pending.pop(future)
                 try:
                     outcomes.extend(future.result())
+                except FolderScanStopped:
+                    for item in pending:
+                        item.cancel()
+                    raise
                 except BaseException as error:
                     for item in pending:
                         item.cancel()
@@ -380,6 +392,10 @@ def scan_folder_source(
         with tempfile.TemporaryDirectory(prefix="bfrs-folder-scan-") as temporary:
             outcomes = _scan_files_bounded(
                 files, Path(temporary), arguments, child_main, progress.update)
+    except FolderScanStopped:
+        progress.finish()
+        print("folder scan stopped by request", file=sys.stderr)
+        return 130
     except FolderWorkerError as error:
         progress.finish()
         print(f"folder worker error: {error}", file=sys.stderr)
