@@ -135,6 +135,12 @@ def test_completed_event_requires_nonempty_status(tmp_path):
         ScanCompletedEvent(tmp_path / "report.json", "", 1, 1)
 
 
+def test_completed_event_allows_unknown_byte_counts(tmp_path):
+    event = ScanCompletedEvent(tmp_path / "report.json", "completed")
+    assert event.processed_bytes is None
+    assert event.total_bytes is None
+
+
 def test_completed_event_rejects_negative_byte_counts(tmp_path):
     with pytest.raises(ValueError, match="byte counts"):
         ScanCompletedEvent(tmp_path / "report.json", "rejected", -1, 1)
