@@ -23,12 +23,14 @@ def build_gui_scan_config(
 ) -> ScanConfig:
     """Build the application contract from presentation-layer values."""
 
-    source = Path(input_path.strip())
-    output = Path(output_path.strip())
-    if not str(source):
+    input_text = input_path.strip()
+    output_text = output_path.strip()
+    if not input_text:
         raise ValueError("Wybierz źródło skanowania.")
-    if not str(output):
+    if not output_text:
         raise ValueError("Wybierz plik raportu JSON.")
+    source = Path(input_text)
+    output = Path(output_text)
     if not targets:
         raise ValueError("Wybierz co najmniej jeden typ danych do skanowania.")
 
@@ -37,6 +39,8 @@ def build_gui_scan_config(
     )
 
     checkpoint_text = checkpoint_path.strip()
+    if resume_checkpoint and not checkpoint_text:
+        raise ValueError("Wskaż checkpoint, który ma zostać wznowiony.")
     checkpoint = Path(checkpoint_text) if checkpoint_text else None
 
     return ScanConfig(
