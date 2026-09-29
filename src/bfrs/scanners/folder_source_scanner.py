@@ -21,6 +21,7 @@ from bfrs.recovery.automatic_wallet_recovery import (
     validate_recovery_destination,
 )
 from bfrs.reporting.json_report import REPORT_SCHEMA_VERSION
+from bfrs.scanners.fast_scanner import ScanProgress
 from bfrs.version import APP_NAME, VERSION
 
 
@@ -46,10 +47,18 @@ class _ScanOutcome:
 class _FolderProgress:
     """Thread-safe, throttled aggregate folder progress."""
 
-    def __init__(self, root: Path, *, files: int, total_bytes: int) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        files: int,
+        total_bytes: int,
+        progress_callback: Callable[[ScanProgress], None] | None = None,
+    ) -> None:
         self._root = root
         self._files = files
         self._total_bytes = total_bytes
+        self._progress_callback = progress_callback
         self._started = time.monotonic()
         self._last_rendered = 0.0
         self._completed = 0
@@ -61,6 +70,14 @@ class _FolderProgress:
 
     def initial(self, skipped: int) -> None:
         percent = 100.0 if self._files == 0 else 0.0
+        if self._progress_callback is not None:
+            self._progress_callback(ScanProgress(
+                scanned_bytes=0,
+                total_bytes=self._total_bytes,
+                raw_hits=0,
+                stage="folder-scan",
+                complete=(self._files == 0),
+            ))
         print(
             "Folder scan: "
             f"files=0/{self._files} ({percent:.1f}%) "
@@ -84,8 +101,16 @@ class _FolderProgress:
                         for item in findings
                         if isinstance(item, dict)
                     )
-            now = time.monotonic()
             complete = self._completed >= self._files
+            if self._progress_callback is not None:
+                self._progress_callback(ScanProgress(
+                    scanned_bytes=self._completed_bytes,
+                    total_bytes=self._total_bytes,
+                    raw_hits=self._raw_hits,
+                    stage="folder-scan",
+                    complete=complete,
+                ))
+            now = time.monotonic()
             if not complete and now - self._last_rendered < 0.5:
                 return
             self._last_rendered = now
@@ -330,13 +355,19 @@ def _finding_sort_key(root: Path, finding: dict) -> tuple:
 def scan_folder_source(
     arguments,
     child_main: Callable[[Sequence[str] | None], int],
+    *,
+    progress_callback: Callable[[ScanProgress], None] | None = None,
 ) -> int:
     root = arguments.input.resolve()
     files, discovery_skips = discover_regular_files(root)
     bytes_discovered = sum(size for _, size, _ in files)
     started = time.monotonic()
     progress = _FolderProgress(
-        root, files=len(files), total_bytes=bytes_discovered)
+        root,
+        files=len(files),
+        total_bytes=bytes_discovered,
+        progress_callback=progress_callback,
+    )
     progress.initial(len(discovery_skips))
     wallet_recovery = recovery_not_requested()
     if arguments.recover_wallets:
