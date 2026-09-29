@@ -67,6 +67,15 @@ def _stop_requested(callback: Callable[[], bool] | None) -> bool:
     return bool(callback is not None and callback())
 
 
+def _report_error(
+    message: str,
+    callback: Callable[[str], None] | None = None,
+) -> None:
+    print(message, file=sys.stderr)
+    if callback is not None:
+        callback(message)
+
+
 class _ProgressLine:
     """Render throttled aggregate scan progress on one stderr line."""
 
@@ -506,6 +515,7 @@ def main(
     _folder_child: bool = False,
     _scan_progress: Callable[[ScanProgress], None] | None = None,
     _scan_should_stop: Callable[[], bool] | None = None,
+    _scan_error: Callable[[str], None] | None = None,
 ) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
@@ -537,6 +547,7 @@ def main(
                 child_argv,
                 _folder_child=True,
                 _scan_should_stop=_scan_should_stop,
+                _scan_error=_scan_error,
             ),
             progress_callback=_scan_progress,
         )
@@ -557,14 +568,14 @@ def main(
                 source_report=arguments.revalidate_wallet_records,
             )
         except (OSError, UnicodeError, ValueError) as error:
-            print(f"wallet-record revalidation error: {error}", file=sys.stderr)
+            _report_error(f"wallet-record revalidation error: {error}", _scan_error)
             return 3
         try:
             report_path = write_wallet_record_revalidation_report(
                 payload, arguments.output
             )
         except OSError as error:
-            print(f"report error: {error}", file=sys.stderr)
+            _report_error(f"report error: {error}", _scan_error)
             return 4
         print(f"source: {payload['source_image']}")
         print(f"source report: {payload['source_report']}")
@@ -581,7 +592,7 @@ def main(
     try:
         file_size = arguments.input.stat().st_size
     except OSError as error:
-        print(f"input error: {error}", file=sys.stderr)
+        _report_error(f"input error: {error}", _scan_error)
         return 3
     if arguments.end is not None and arguments.end > file_size:
         parser.error("--end must not exceed input size")
@@ -606,7 +617,7 @@ def main(
                     start=arguments.start, end=range_end,
                     chunk_size=chunk_size, overlap=overlap)
         except (OSError, CheckpointError) as error:
-            print(f"checkpoint error: {error}", file=sys.stderr)
+            _report_error(f"checkpoint error: {error}", _scan_error)
             return 3
         resumed_bytes = checkpoint.completed_bytes if arguments.resume_checkpoint else 0
         seed_progress = _ProgressLine(
@@ -654,10 +665,10 @@ def main(
             if checkpoint is not None:
                 checkpoint.save(force=True)
             seed_progress.finish()
-            print(f"worker error: {error}", file=sys.stderr)
+            _report_error(f"worker error: {error}", _scan_error)
             return 3
         except (OSError, ValueError) as error:
-            print(f"input error: {error}", file=sys.stderr)
+            _report_error(f"input error: {error}", _scan_error)
             return 3
         if checkpoint is not None:
             checkpoint.mark_complete()
@@ -674,7 +685,7 @@ def main(
             arguments.output.write_text(json.dumps(payload, indent=2, sort_keys=True),
                                         encoding="utf-8")
         except OSError as error:
-            print(f"report error: {error}", file=sys.stderr)
+            _report_error(f"report error: {error}", _scan_error)
             return 4
         summary = result.recovery
         if not _folder_child:
@@ -736,7 +747,7 @@ def main(
                 overlap=arguments.overlap_kib * 1024,
                 scanner_identity=scanner_identity)
     except (OSError, UnifiedCheckpointError) as error:
-        print(f"checkpoint error: {error}", file=sys.stderr)
+        _report_error(f"checkpoint error: {error}", _scan_error)
         return 3
     ntfs_progress = _NTFSProgressLine(enabled=not _folder_child)
     scan_progress = _ProgressLine(
@@ -793,14 +804,14 @@ def main(
             unified_checkpoint.save(force=True)
         ntfs_progress.finish()
         scan_progress.finish()
-        print(f"worker error: {error}", file=sys.stderr)
+        _report_error(f"worker error: {error}", _scan_error)
         return 3
     except OSError as error:
         if unified_checkpoint is not None:
             unified_checkpoint.close()
         ntfs_progress.finish()
         scan_progress.finish()
-        print(f"input error: {error}", file=sys.stderr)
+        _report_error(f"input error: {error}", _scan_error)
         return 3
     except BaseException:
         if unified_checkpoint is not None:
@@ -841,7 +852,7 @@ def main(
             wallet_recovery,
         )
     except OSError as error:
-        print(f"report error: {error}", file=sys.stderr)
+        _report_error(f"report error: {error}", _scan_error)
         return 4
 
     public_report = serialize_full_image_result(result, configuration, wallet_recovery)
