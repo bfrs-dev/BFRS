@@ -86,9 +86,11 @@ class ScanService:
         self._cli_runner = cli_runner or _run_current_cli
         self._controller = controller or ScanController()
         self._last_progress_bytes = 0
+        self._last_error_message: str | None = None
 
     def run(self, config: ScanConfig) -> ScanRunResult:
         self._last_progress_bytes = 0
+        self._last_error_message = None
         source_type = self._resolve_source_type(config)
         self._emit(ScanStartedEvent(
             input_path=config.input_path,
@@ -104,6 +106,7 @@ class ScanService:
                     build_cli_arguments(config),
                     progress_callback=self._on_progress,
                     should_stop=self._controller.should_stop,
+                    error_callback=self._on_backend_error,
                 )
             else:
                 exit_code = self._cli_runner(build_cli_arguments(config))
@@ -138,7 +141,10 @@ class ScanService:
 
         if exit_code != 0:
             self._emit(ScanFailedEvent(
-                message=f"BFRS scan exited with code {exit_code}",
+                message=(
+                    self._last_error_message
+                    or f"BFRS scan exited with code {exit_code}"
+                ),
                 error_type="ScanExitCode",
                 recoverable=exit_code in {3, 4},
             ))
@@ -179,6 +185,9 @@ class ScanService:
                 recoverable=True,
             ))
             raise ScanServiceError(str(error)) from error
+
+    def _on_backend_error(self, message: str) -> None:
+        self._last_error_message = message
 
     def _on_progress(self, update) -> None:
         self._last_progress_bytes = max(
@@ -272,6 +281,7 @@ def _run_current_cli(
     *,
     progress_callback=None,
     should_stop=None,
+    error_callback=None,
 ) -> int:
     # Delayed import keeps the application contract independent at import time
     # and makes the temporary CLI adapter easy to remove in the next migration.
@@ -281,6 +291,7 @@ def _run_current_cli(
         arguments,
         _scan_progress=progress_callback,
         _scan_should_stop=should_stop,
+        _scan_error=error_callback,
     )
 
 
