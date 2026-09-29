@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -223,6 +224,86 @@ class ResultService:
                 continue
             result.append(item)
         return tuple(result)
+
+    @staticmethod
+    def export_findings(
+        path: str | Path,
+        findings: Iterable[FindingView],
+    ) -> Path:
+        """Export only the public FindingView contract to JSON or CSV."""
+        output = Path(path)
+        rows = [ResultService._export_row(item) for item in findings]
+        suffix = output.suffix.casefold()
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        if suffix == ".json":
+            output.write_text(
+                json.dumps(rows, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return output
+        if suffix == ".csv":
+            fieldnames = (
+                "priority",
+                "target",
+                "artifact_kind",
+                "discovery_state",
+                "structural_state",
+                "crypto_state",
+                "recovery_relevance",
+                "validation_status",
+                "structural_status",
+                "confidence",
+                "start_offset",
+                "end_offset",
+                "file_path",
+                "relative_path",
+                "reason_codes",
+                "correlated_evidence",
+                "recommended_recovery_action",
+                "safe_metadata",
+            )
+            with output.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    csv_row = dict(row)
+                    csv_row["reason_codes"] = ";".join(row["reason_codes"])
+                    csv_row["correlated_evidence"] = ";".join(
+                        row["correlated_evidence"]
+                    )
+                    csv_row["safe_metadata"] = json.dumps(
+                        row["safe_metadata"],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    writer.writerow(csv_row)
+            return output
+        raise ResultServiceError("export path must end with .json or .csv")
+
+    @staticmethod
+    def _export_row(item: FindingView) -> dict[str, Any]:
+        return {
+            "priority": item.review_priority_label,
+            "target": item.target,
+            "artifact_kind": item.artifact_kind,
+            "discovery_state": item.discovery_state,
+            "structural_state": item.structural_state,
+            "crypto_state": item.crypto_state,
+            "recovery_relevance": item.recovery_relevance,
+            "validation_status": item.validation_status,
+            "structural_status": item.structural_status,
+            "confidence": item.confidence,
+            "start_offset": item.start_offset,
+            "end_offset": item.end_offset,
+            "file_path": item.file_path,
+            "relative_path": item.relative_path,
+            "reason_codes": list(item.reason_codes),
+            "correlated_evidence": list(item.correlated_evidence),
+            "recommended_recovery_action": item.recommended_recovery_action,
+            "safe_metadata": dict(item.safe_metadata),
+        }
 
     @staticmethod
     def prioritize(findings: Iterable[FindingView]) -> tuple[FindingView, ...]:
