@@ -22,6 +22,12 @@ from bfrs.application.scan_events import (
     freeze_counts,
     thaw_counts,
 )
+from bfrs.application.result_service import (
+    FindingView,
+    ResultReport,
+    ResultService,
+    ResultServiceError,
+)
 from bfrs.application.scan_service import (
     ScanController,
     ScanRunResult,
@@ -37,6 +43,10 @@ __all__ = [
     "DEFAULT_MINIMUM_HITS",
     "DEFAULT_OVERLAP_KIB",
     "DEFAULT_PADDING_MIB",
+    "FindingView",
+    "ResultReport",
+    "ResultService",
+    "ResultServiceError",
     "ScanCheckpointSavedEvent",
     "ScanCompletedEvent",
     "ScanConfig",
