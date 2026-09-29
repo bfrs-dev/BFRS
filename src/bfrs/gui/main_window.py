@@ -118,7 +118,7 @@ class MainWindow(QMainWindow):
 
         self.file_workers_spin = QSpinBox()
         self.file_workers_spin.setRange(1, 32)
-        self.file_workers_spin.setValue(2)
+        self.file_workers_spin.setValue(1)
 
         checkpoint_row = QWidget()
         checkpoint_layout = QHBoxLayout(checkpoint_row)
