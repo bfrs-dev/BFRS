@@ -11,6 +11,7 @@ from typing import Protocol
 
 from bfrs.application.scan_config import ScanConfig
 from bfrs.application.scan_events import (
+    ScanCheckpointSavedEvent,
     ScanCompletedEvent,
     ScanEvent,
     ScanFailedEvent,
@@ -84,8 +85,10 @@ class ScanService:
         self._event_sink = event_sink
         self._cli_runner = cli_runner or _run_current_cli
         self._controller = controller or ScanController()
+        self._last_progress_bytes = 0
 
     def run(self, config: ScanConfig) -> ScanRunResult:
+        self._last_progress_bytes = 0
         source_type = self._resolve_source_type(config)
         self._emit(ScanStartedEvent(
             input_path=config.input_path,
@@ -120,9 +123,15 @@ class ScanService:
             raise
 
         if exit_code == 130:
+            checkpoint_path = config.checkpoint_path
+            if checkpoint_path is not None and checkpoint_path.exists():
+                self._emit(ScanCheckpointSavedEvent(
+                    checkpoint_path=checkpoint_path,
+                    completed_bytes=self._last_progress_bytes,
+                ))
             self._emit(ScanStoppedEvent(
-                processed_bytes=0,
-                checkpoint_path=config.checkpoint_path,
+                processed_bytes=self._last_progress_bytes,
+                checkpoint_path=checkpoint_path,
                 reason="user_requested",
             ))
             return ScanRunResult(exit_code, config.output_path, "stopped")
@@ -172,6 +181,9 @@ class ScanService:
             raise ScanServiceError(str(error)) from error
 
     def _on_progress(self, update) -> None:
+        self._last_progress_bytes = max(
+            self._last_progress_bytes, update.scanned_bytes
+        )
         self._emit(ScanProgressEvent(
             scanned_bytes=update.scanned_bytes,
             total_bytes=update.total_bytes,
