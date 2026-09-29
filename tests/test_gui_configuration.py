@@ -1,4 +1,5 @@
-from pathlib import Path
+import builtins
+import importlib
 
 import pytest
 
@@ -72,10 +73,21 @@ def test_gui_config_rejects_incomplete_form(
         )
 
 
-def test_gui_configuration_module_does_not_require_qt():
-    # This test intentionally imports only the pure adapter.  CLI/test installs
-    # must remain usable without the optional PySide6 dependency.
-    assert Path.__module__ == "pathlib"
+def test_gui_configuration_module_does_not_require_qt(monkeypatch):
+    # Reload the pure adapter while actively rejecting any PySide6 import.
+    # This verifies the real contract without depending on pathlib internals,
+    # which changed in Python 3.13.
+    import bfrs.gui.configuration as configuration_module
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "PySide6" or name.startswith("PySide6."):
+            raise AssertionError("configuration adapter must not import PySide6")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    importlib.reload(configuration_module)
 
 
 def test_gui_config_requires_checkpoint_when_resume_is_selected(tmp_path):
