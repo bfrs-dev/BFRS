@@ -144,3 +144,37 @@ def test_gui_config_rejects_missing_checkpoint_in_resume_mode(tmp_path):
             checkpoint_path=str(checkpoint),
             resume_checkpoint=True,
         )
+
+
+def test_gui_config_uses_english_validation_messages(tmp_path):
+    with pytest.raises(ValueError, match="Choose a scan source"):
+        build_gui_scan_config(
+            input_path="",
+            output_path=str(tmp_path / "report.json"),
+            source_type="image",
+            targets=frozenset({"bitcoin-core"}),
+            include_mnemonic=False,
+            include_bitcoin_context=False,
+            workers=1,
+            file_workers=1,
+            language="en",
+        )
+
+
+def test_gui_config_uses_english_checkpoint_preflight(tmp_path):
+    checkpoint = tmp_path / "existing.checkpoint.sqlite"
+    checkpoint.write_bytes(b"existing")
+
+    with pytest.raises(ValueError, match="checkpoint already exists"):
+        build_gui_scan_config(
+            input_path=str(tmp_path / "disk.img"),
+            output_path=str(tmp_path / "report.json"),
+            source_type="image",
+            targets=frozenset({"bitcoin-core"}),
+            include_mnemonic=False,
+            include_bitcoin_context=False,
+            workers=1,
+            file_workers=1,
+            checkpoint_path=str(checkpoint),
+            language="en",
+        )
