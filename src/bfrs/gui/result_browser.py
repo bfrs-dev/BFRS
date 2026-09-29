@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -46,6 +47,7 @@ class ResultBrowserWidget(QWidget):
         self._service = ResultService()
         self._report: ResultReport | None = None
         self._visible_findings: tuple[FindingView, ...] = ()
+        self._quick_profile: str | None = None
 
         layout = QVBoxLayout(self)
 
@@ -80,6 +82,43 @@ class ResultBrowserWidget(QWidget):
         filter_layout.addRow(self.search_label, self.search_edit)
         layout.addWidget(filters)
 
+        quick_row = QHBoxLayout()
+        self.quick_filter_label = QLabel()
+        quick_row.addWidget(self.quick_filter_label)
+        self.quick_group = QButtonGroup(self)
+        self.quick_group.setExclusive(True)
+        self.quick_buttons: dict[str | None, QPushButton] = {}
+        for profile in (None, "accepted", "review", "rejected", "crypto-valid"):
+            button = QPushButton()
+            button.setCheckable(True)
+            if profile is None:
+                button.setChecked(True)
+            button.clicked.connect(
+                lambda checked=False, value=profile: self._set_quick_profile(value)
+            )
+            self.quick_group.addButton(button)
+            self.quick_buttons[profile] = button
+            quick_row.addWidget(button)
+        quick_row.addStretch(1)
+        layout.addLayout(quick_row)
+
+        summary_row = QHBoxLayout()
+        self.summary_total = QLabel()
+        self.summary_accepted = QLabel()
+        self.summary_review = QLabel()
+        self.summary_rejected = QLabel()
+        self.summary_crypto_valid = QLabel()
+        for label in (
+            self.summary_total,
+            self.summary_accepted,
+            self.summary_review,
+            self.summary_rejected,
+            self.summary_crypto_valid,
+        ):
+            summary_row.addWidget(label)
+        summary_row.addStretch(1)
+        layout.addLayout(summary_row)
+
         self.target_combo.currentIndexChanged.connect(self._apply_filters)
         self.state_combo.currentIndexChanged.connect(self._apply_filters)
         self.crypto_combo.currentIndexChanged.connect(self._apply_filters)
@@ -98,6 +137,7 @@ class ResultBrowserWidget(QWidget):
             QTableWidget.EditTrigger.NoEditTriggers
         )
         self.table.verticalHeader().setVisible(False)
+        self.table.setSortingEnabled(True)
         self.table.itemSelectionChanged.connect(self._show_selected_details)
         splitter.addWidget(self.table)
 
@@ -128,6 +168,12 @@ class ResultBrowserWidget(QWidget):
         self.crypto_label.setText(self._t("filter_crypto"))
         self.search_label.setText(self._t("filter_search"))
         self.details_box.setTitle(self._t("details_group"))
+        self.quick_filter_label.setText(self._t("quick_filters"))
+        self.quick_buttons[None].setText(self._t("filter_all"))
+        self.quick_buttons["accepted"].setText("Accepted")
+        self.quick_buttons["review"].setText("Review")
+        self.quick_buttons["rejected"].setText("Rejected")
+        self.quick_buttons["crypto-valid"].setText("Crypto-valid")
 
         self._rebuild_filter_combo(
             self.state_combo,
@@ -166,6 +212,7 @@ class ResultBrowserWidget(QWidget):
                 )
             )
             self._show_selected_details()
+        self._update_summary_labels()
 
     @staticmethod
     def _rebuild_filter_combo(
@@ -223,14 +270,22 @@ class ResultBrowserWidget(QWidget):
                 count=report.finding_count,
             )
         )
+        self._quick_profile = None
+        self.quick_buttons[None].setChecked(True)
         self._apply_filters()
         return True
+
+    @Slot()
+    def _set_quick_profile(self, profile: str | None) -> None:
+        self._quick_profile = profile
+        self._apply_filters()
 
     @Slot()
     def _apply_filters(self) -> None:
         if self._report is None:
             self._visible_findings = ()
             self.table.setRowCount(0)
+            self._update_summary_labels()
             return
 
         target = self.target_combo.currentData()
@@ -242,11 +297,15 @@ class ResultBrowserWidget(QWidget):
             targets=({target} if target else None),
             discovery_states=({state} if state else None),
             crypto_states=({crypto} if crypto else None),
+            profile=self._quick_profile,
             search=self.search_edit.text(),
         )
         self._populate_table()
+        self._update_summary_labels()
 
     def _populate_table(self) -> None:
+        sorting = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(len(self._visible_findings))
         for row_index, finding in enumerate(self._visible_findings):
             values = (
@@ -264,7 +323,19 @@ class ResultBrowserWidget(QWidget):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
+                item.setData(Qt.ItemDataRole.UserRole, row_index)
+                if column == 4:
+                    item.setData(
+                        Qt.ItemDataRole.UserRole + 1,
+                        finding.confidence if finding.confidence is not None else -1.0,
+                    )
+                elif column == 5:
+                    item.setData(
+                        Qt.ItemDataRole.UserRole + 1,
+                        finding.start_offset if finding.start_offset is not None else -1,
+                    )
                 self.table.setItem(row_index, column, item)
+        self.table.setSortingEnabled(sorting)
         self.table.resizeColumnsToContents()
         if self._visible_findings:
             self.table.selectRow(0)
@@ -274,12 +345,22 @@ class ResultBrowserWidget(QWidget):
     @Slot()
     def _show_selected_details(self) -> None:
         selected = self.table.currentRow()
-        if selected < 0 or selected >= len(self._visible_findings):
+        if selected < 0:
             if self._report is not None:
                 self.details.setPlainText(self._t("details_empty"))
             return
+        anchor = self.table.item(selected, 0)
+        if anchor is None:
+            self.details.setPlainText(self._t("details_empty"))
+            return
+        finding_index = anchor.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(finding_index, int) or not (
+            0 <= finding_index < len(self._visible_findings)
+        ):
+            self.details.setPlainText(self._t("details_empty"))
+            return
 
-        finding = self._visible_findings[selected]
+        finding = self._visible_findings[finding_index]
         metadata = json.dumps(
             dict(finding.safe_metadata),
             ensure_ascii=False,
@@ -305,3 +386,26 @@ class ResultBrowserWidget(QWidget):
             metadata,
         ]
         self.details.setPlainText("\n".join(lines))
+
+
+    def _update_summary_labels(self) -> None:
+        if self._report is None:
+            displayed = accepted = review = rejected = crypto_valid = 0
+        else:
+            summary = self._service.summary(self._report)
+            displayed = len(self._visible_findings)
+            accepted = summary.accepted
+            review = summary.review
+            rejected = summary.rejected
+            crypto_valid = summary.crypto_valid
+        self.summary_total.setText(self._t("summary_total", count=displayed))
+        self.summary_accepted.setText(
+            self._t("summary_accepted", count=accepted)
+        )
+        self.summary_review.setText(self._t("summary_review", count=review))
+        self.summary_rejected.setText(
+            self._t("summary_rejected", count=rejected)
+        )
+        self.summary_crypto_valid.setText(
+            self._t("summary_crypto_valid", count=crypto_valid)
+        )
