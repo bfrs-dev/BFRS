@@ -168,6 +168,7 @@ class ResultBrowserWidget(QWidget):
         self.table.setSortingEnabled(True)
         self.table.sortItems(0, Qt.SortOrder.AscendingOrder)
         self.table.itemSelectionChanged.connect(self._show_selected_details)
+        self.table.itemSelectionChanged.connect(self._update_action_state)
         splitter.addWidget(self.table)
 
         self.details_box = QGroupBox()
@@ -194,6 +195,7 @@ class ResultBrowserWidget(QWidget):
 
         layout.addWidget(splitter, 1)
         self._retranslate()
+        self._update_action_state()
 
     def set_language(self, language: str) -> None:
         self._language = normalize_language(language)
@@ -261,6 +263,7 @@ class ResultBrowserWidget(QWidget):
             )
             self._show_selected_details()
         self._update_summary_labels()
+        self._update_action_state()
 
     @staticmethod
     def _rebuild_filter_combo(
@@ -321,7 +324,36 @@ class ResultBrowserWidget(QWidget):
         self._quick_profile = None
         self.quick_buttons[None].setChecked(True)
         self._apply_filters()
+        self._update_action_state()
         return True
+
+    def _update_action_state(self) -> None:
+        has_report = self._report is not None
+        has_matches = bool(self._matching_findings)
+
+        self.export_csv_button.setEnabled(has_report and has_matches)
+        self.export_json_button.setEnabled(has_report and has_matches)
+
+        for widget in (
+            self.target_combo,
+            self.state_combo,
+            self.crypto_combo,
+            self.search_edit,
+        ):
+            widget.setEnabled(has_report)
+        for button in self.quick_buttons.values():
+            button.setEnabled(has_report)
+
+        finding = self._selected_finding()
+        self.copy_location_button.setEnabled(
+            finding is not None and bool(finding.display_location)
+        )
+        self.copy_offset_button.setEnabled(
+            finding is not None and finding.start_offset is not None
+        )
+        self.open_folder_button.setEnabled(
+            finding is not None and bool(finding.file_path)
+        )
 
     def _selected_finding(self) -> FindingView | None:
         row = self.table.currentRow()
@@ -423,6 +455,7 @@ class ResultBrowserWidget(QWidget):
             self._visible_findings = ()
             self.table.setRowCount(0)
             self._update_summary_labels()
+            self._update_action_state()
             return
 
         target = self.target_combo.currentData()
@@ -441,6 +474,7 @@ class ResultBrowserWidget(QWidget):
         self._visible_findings = self._matching_findings[:_MAX_RENDERED_FINDINGS]
         self._populate_table()
         self._update_summary_labels()
+        self._update_action_state()
 
     def _populate_table(self) -> None:
         sorting = self.table.isSortingEnabled()
