@@ -46,6 +46,38 @@ class FindingView:
     safe_metadata: Mapping[str, Any]
 
     @property
+    def review_priority(self) -> int:
+        """Presentation-only triage rank; lower values are shown first."""
+        if self.crypto_state == "VALID":
+            return 0
+        if (
+            self.discovery_state == "ACCEPTED"
+            and self.recovery_relevance != "CONTEXT_REVIEW"
+        ):
+            return 1
+        if (
+            self.discovery_state == "CANDIDATE"
+            or (
+                self.discovery_state == "ACCEPTED"
+                and self.recovery_relevance == "CONTEXT_REVIEW"
+            )
+        ):
+            return 2
+        if self.discovery_state == "REJECTED":
+            return 4
+        return 3
+
+    @property
+    def review_priority_label(self) -> str:
+        return (
+            "CRYPTO_VALID",
+            "ACCEPTED",
+            "REVIEW",
+            "OTHER",
+            "REJECTED",
+        )[self.review_priority]
+
+    @property
     def location_kind(self) -> str:
         return "file_offset" if self.file_path else "physical_offset"
 
@@ -191,6 +223,21 @@ class ResultService:
                 continue
             result.append(item)
         return tuple(result)
+
+    @staticmethod
+    def prioritize(findings: Iterable[FindingView]) -> tuple[FindingView, ...]:
+        """Order findings for human review without changing their state."""
+        return tuple(sorted(
+            findings,
+            key=lambda item: (
+                item.review_priority,
+                -(item.confidence if item.confidence is not None else -1.0),
+                item.file_path or "",
+                item.start_offset if item.start_offset is not None else -1,
+                item.target,
+                item.artifact_kind,
+            ),
+        ))
 
     @staticmethod
     def _summary_int(
