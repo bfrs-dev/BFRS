@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from collections.abc import Callable
 
 from PySide6.QtCore import QUrl, Qt, Slot
 from PySide6.QtGui import QDesktopServices, QGuiApplication
@@ -54,9 +55,15 @@ class _SortableItem(QTableWidgetItem):
 class ResultBrowserWidget(QWidget):
     """Open, filter and inspect public BFRS report findings."""
 
-    def __init__(self, *, language: str = DEFAULT_LANGUAGE) -> None:
+    def __init__(
+        self,
+        *,
+        language: str = DEFAULT_LANGUAGE,
+        report_loaded: Callable[[Path], None] | None = None,
+    ) -> None:
         super().__init__()
         self._language = normalize_language(language)
+        self._report_loaded_callback = report_loaded
         self._service = ResultService()
         self._report: ResultReport | None = None
         self._matching_findings: tuple[FindingView, ...] = ()
@@ -325,6 +332,8 @@ class ResultBrowserWidget(QWidget):
         self.quick_buttons[None].setChecked(True)
         self._apply_filters()
         self._update_action_state()
+        if self._report_loaded_callback is not None:
+            self._report_loaded_callback(report.path)
         return True
 
     def _update_action_state(self) -> None:
