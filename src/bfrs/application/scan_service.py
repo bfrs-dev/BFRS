@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from threading import Event
 from typing import Protocol
 
 from bfrs.application.scan_config import ScanConfig
@@ -28,6 +29,26 @@ CliRunner = Callable[[list[str]], int]
 
 class ScanServiceError(RuntimeError):
     """The application service could not execute a scan request."""
+
+
+class ScanController:
+    """Thread-safe cooperative lifecycle control for one or more scan runs."""
+
+    def __init__(self) -> None:
+        self._stop_requested = Event()
+
+    def request_stop(self) -> None:
+        self._stop_requested.set()
+
+    def reset_stop(self) -> None:
+        self._stop_requested.clear()
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested.is_set()
+
+    def should_stop(self) -> bool:
+        return self._stop_requested.is_set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,9 +79,11 @@ class ScanService:
         *,
         event_sink: EventSink | None = None,
         cli_runner: CliRunner | None = None,
+        controller: ScanController | None = None,
     ) -> None:
         self._event_sink = event_sink
         self._cli_runner = cli_runner or _run_current_cli
+        self._controller = controller or ScanController()
 
     def run(self, config: ScanConfig) -> ScanRunResult:
         source_type = self._resolve_source_type(config)
@@ -77,6 +100,7 @@ class ScanService:
                 exit_code = self._cli_runner(
                     build_cli_arguments(config),
                     progress_callback=self._on_progress,
+                    should_stop=self._controller.should_stop,
                 )
             else:
                 exit_code = self._cli_runner(build_cli_arguments(config))
@@ -121,6 +145,16 @@ class ScanService:
             total_bytes=total_bytes,
         ))
         return ScanRunResult(exit_code, config.output_path, status)
+
+    def request_stop(self) -> None:
+        self._controller.request_stop()
+
+    def reset_stop(self) -> None:
+        self._controller.reset_stop()
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._controller.stop_requested
 
     def _resolve_source_type(self, config: ScanConfig) -> SourceType:
         explicit = (
@@ -225,12 +259,17 @@ def _run_current_cli(
     arguments: list[str],
     *,
     progress_callback=None,
+    should_stop=None,
 ) -> int:
     # Delayed import keeps the application contract independent at import time
     # and makes the temporary CLI adapter easy to remove in the next migration.
     from bfrs.cli import main
 
-    return main(arguments, _scan_progress=progress_callback)
+    return main(
+        arguments,
+        _scan_progress=progress_callback,
+        _scan_should_stop=should_stop,
+    )
 
 
 def _read_completion_metadata(
