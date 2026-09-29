@@ -15,6 +15,17 @@ class ResultServiceError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class ResultSummary:
+    """Safe counts used by the result browser."""
+
+    displayed_findings: int
+    accepted: int
+    review: int
+    rejected: int
+    crypto_valid: int
+
+
+@dataclass(frozen=True, slots=True)
 class FindingView:
     target: str
     artifact_kind: str
@@ -128,6 +139,24 @@ class ResultService:
             finding_summary=summary,
         )
 
+    def summary(self, report: ResultReport) -> ResultSummary:
+        """Return report-wide safe counts, preferring canonical report summary."""
+        computed = self._computed_summary(report.findings)
+        raw = report.finding_summary
+        return ResultSummary(
+            displayed_findings=report.finding_count,
+            accepted=self._summary_int(
+                raw, "accepted_candidates", computed.accepted
+            ),
+            review=self._summary_int(
+                raw, "review_candidates", computed.review
+            ),
+            rejected=self._summary_int(raw, "rejected", computed.rejected),
+            crypto_valid=self._summary_int(
+                raw, "crypto_valid_occurrences", computed.crypto_valid
+            ),
+        )
+
     def filter(
         self,
         report: ResultReport,
@@ -135,6 +164,7 @@ class ResultService:
         targets: Iterable[str] | None = None,
         discovery_states: Iterable[str] | None = None,
         crypto_states: Iterable[str] | None = None,
+        profile: str | None = None,
         search: str = "",
     ) -> tuple[FindingView, ...]:
         target_filter = frozenset(targets or ())
@@ -143,6 +173,9 @@ class ResultService:
         )
         crypto_filter = frozenset(value.upper() for value in (crypto_states or ()))
         needle = search.strip().casefold()
+        profile_name = (profile or "").strip().casefold()
+        if profile_name not in {"", "accepted", "review", "rejected", "crypto-valid"}:
+            raise ValueError(f"unknown result filter profile: {profile}")
 
         result = []
         for item in report.findings:
@@ -152,10 +185,62 @@ class ResultService:
                 continue
             if crypto_filter and item.crypto_state not in crypto_filter:
                 continue
+            if profile_name and not self._matches_profile(item, profile_name):
+                continue
             if needle and needle not in self._search_text(item):
                 continue
             result.append(item)
         return tuple(result)
+
+    @staticmethod
+    def _summary_int(
+        summary: Mapping[str, Any], key: str, fallback: int
+    ) -> int:
+        value = summary.get(key)
+        return value if isinstance(value, int) and value >= 0 else fallback
+
+    @staticmethod
+    def _computed_summary(findings: Iterable[FindingView]) -> ResultSummary:
+        displayed = accepted = review = rejected = crypto_valid = 0
+        for item in findings:
+            displayed += 1
+            is_accepted = item.discovery_state == "ACCEPTED"
+            is_rejected = item.discovery_state == "REJECTED"
+            accepted += is_accepted
+            rejected += is_rejected
+            review += (
+                item.discovery_state == "CANDIDATE"
+                or (
+                    is_accepted
+                    and item.recovery_relevance == "CONTEXT_REVIEW"
+                )
+            )
+            crypto_valid += item.crypto_state == "VALID"
+        return ResultSummary(
+            displayed_findings=displayed,
+            accepted=accepted,
+            review=review,
+            rejected=rejected,
+            crypto_valid=crypto_valid,
+        )
+
+    @staticmethod
+    def _matches_profile(item: FindingView, profile: str) -> bool:
+        if profile == "accepted":
+            return item.discovery_state == "ACCEPTED"
+        if profile == "review":
+            return (
+                item.discovery_state == "CANDIDATE"
+                or (
+                    item.discovery_state == "ACCEPTED"
+                    and item.recovery_relevance == "CONTEXT_REVIEW"
+                )
+            )
+        if profile == "rejected":
+            return item.discovery_state == "REJECTED"
+        if profile == "crypto-valid":
+            return item.crypto_state == "VALID"
+        return True
 
     @staticmethod
     def _search_text(item: FindingView) -> str:
