@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import multiprocessing
 import sys
 
@@ -15,8 +14,7 @@ def _prepare_multiprocessing() -> None:
 def main() -> int:
     _prepare_multiprocessing()
     try:
-        from PySide6.QtCore import QByteArray
-        from PySide6.QtGui import QIcon, QPixmap
+        from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication
     except ImportError as error:
         print(
@@ -26,14 +24,14 @@ def main() -> int:
         )
         return 2
 
-    from bfrs.gui.icon_data import ICON_PNG_BASE64
+    from importlib.resources import files
+
     from bfrs.gui.main_window import MainWindow
 
     application = QApplication.instance() or QApplication(sys.argv)
     application.setApplicationName("BFRS")
-    pixmap = QPixmap()
-    if pixmap.loadFromData(QByteArray(base64.b64decode(ICON_PNG_BASE64)), "PNG"):
-        application.setWindowIcon(QIcon(pixmap))
+    icon_path = files("bfrs.gui").joinpath("assets", "bfrs.png")
+    application.setWindowIcon(QIcon(str(icon_path)))
     window = MainWindow()
     window.show()
     return application.exec()
