@@ -174,6 +174,88 @@ class MainWindow(QMainWindow):
 
         self.resume_check = QCheckBox()
 
+        self.advanced_toggle = QPushButton()
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setChecked(preferences.advanced_expanded)
+        self.advanced_toggle.clicked.connect(self._toggle_advanced)
+
+        self.advanced_box = QGroupBox()
+        advanced_layout = QFormLayout(self.advanced_box)
+
+        self.start_offset_edit = QLineEdit(preferences.start_offset)
+        self.end_offset_edit = QLineEdit(preferences.end_offset)
+
+        self.chunk_mib_spin = QSpinBox()
+        self.chunk_mib_spin.setRange(1, 4096)
+        self.chunk_mib_spin.setValue(preferences.chunk_mib)
+
+        self.overlap_kib_spin = QSpinBox()
+        self.overlap_kib_spin.setRange(0, 4_194_303)
+        self.overlap_kib_spin.setValue(preferences.overlap_kib)
+
+        self.cluster_mib_spin = QSpinBox()
+        self.cluster_mib_spin.setRange(1, 1024)
+        self.cluster_mib_spin.setValue(preferences.cluster_mib)
+
+        self.padding_mib_spin = QSpinBox()
+        self.padding_mib_spin.setRange(0, 1024)
+        self.padding_mib_spin.setValue(preferences.padding_mib)
+
+        self.minimum_hits_spin = QSpinBox()
+        self.minimum_hits_spin.setRange(1, 999)
+        self.minimum_hits_spin.setValue(preferences.minimum_hits)
+
+        self.minimum_distinct_types_spin = QSpinBox()
+        self.minimum_distinct_types_spin.setRange(1, 999)
+        self.minimum_distinct_types_spin.setValue(
+            preferences.minimum_distinct_types
+        )
+
+        self.recover_wallets_check = QCheckBox()
+        self.recover_wallets_check.setChecked(preferences.recover_wallets)
+        self.recover_wallets_check.toggled.connect(
+            self._update_recovery_controls
+        )
+
+        recovery_row = QWidget()
+        recovery_layout = QHBoxLayout(recovery_row)
+        recovery_layout.setContentsMargins(0, 0, 0, 0)
+        self.recovery_dir_edit = QLineEdit(preferences.recovery_dir)
+        self.recovery_dir_button = QPushButton()
+        self.recovery_dir_button.clicked.connect(self._choose_recovery_dir)
+        recovery_layout.addWidget(self.recovery_dir_edit)
+        recovery_layout.addWidget(self.recovery_dir_button)
+
+        self.restore_defaults_button = QPushButton()
+        self.restore_defaults_button.clicked.connect(
+            self._restore_advanced_defaults
+        )
+
+        self.start_offset_label = QLabel()
+        self.end_offset_label = QLabel()
+        self.chunk_mib_label = QLabel()
+        self.overlap_kib_label = QLabel()
+        self.cluster_mib_label = QLabel()
+        self.padding_mib_label = QLabel()
+        self.minimum_hits_label = QLabel()
+        self.minimum_distinct_types_label = QLabel()
+        self.recovery_dir_label = QLabel()
+
+        advanced_layout.addRow(self.start_offset_label, self.start_offset_edit)
+        advanced_layout.addRow(self.end_offset_label, self.end_offset_edit)
+        advanced_layout.addRow(self.chunk_mib_label, self.chunk_mib_spin)
+        advanced_layout.addRow(self.overlap_kib_label, self.overlap_kib_spin)
+        advanced_layout.addRow(self.cluster_mib_label, self.cluster_mib_spin)
+        advanced_layout.addRow(self.padding_mib_label, self.padding_mib_spin)
+        advanced_layout.addRow(self.minimum_hits_label, self.minimum_hits_spin)
+        advanced_layout.addRow(
+            self.minimum_distinct_types_label,
+            self.minimum_distinct_types_spin,
+        )
+        advanced_layout.addRow("", self.recover_wallets_check)
+        advanced_layout.addRow(self.recovery_dir_label, recovery_row)
+        advanced_layout.addRow("", self.restore_defaults_button)
+
         self.workers_label = QLabel()
         self.file_workers_label = QLabel()
         self.checkpoint_label = QLabel()
@@ -181,7 +263,11 @@ class MainWindow(QMainWindow):
         settings_layout.addRow(self.file_workers_label, self.file_workers_spin)
         settings_layout.addRow(self.checkpoint_label, checkpoint_row)
         settings_layout.addRow("", self.resume_check)
+        settings_layout.addRow("", self.advanced_toggle)
         scan_layout.addWidget(self.settings_box)
+        scan_layout.addWidget(self.advanced_box)
+        self.advanced_box.setVisible(preferences.advanced_expanded)
+        self._update_recovery_controls()
 
         self.progress_box = QGroupBox()
         progress_layout = QVBoxLayout(self.progress_box)
@@ -215,6 +301,23 @@ class MainWindow(QMainWindow):
         self.file_workers_spin.valueChanged.connect(self._save_preferences)
         self.source_edit.textChanged.connect(self._save_preferences)
         self.output_edit.textChanged.connect(self._save_preferences)
+        for widget in (
+            self.start_offset_edit,
+            self.end_offset_edit,
+            self.recovery_dir_edit,
+        ):
+            widget.textChanged.connect(self._save_preferences)
+        for widget in (
+            self.chunk_mib_spin,
+            self.overlap_kib_spin,
+            self.cluster_mib_spin,
+            self.padding_mib_spin,
+            self.minimum_hits_spin,
+            self.minimum_distinct_types_spin,
+        ):
+            widget.valueChanged.connect(self._save_preferences)
+        self.recover_wallets_check.toggled.connect(self._save_preferences)
+        self.advanced_toggle.toggled.connect(self._save_preferences)
 
         self._retranslate_ui()
         if self._last_result_report and Path(self._last_result_report).is_file():
@@ -236,6 +339,17 @@ class MainWindow(QMainWindow):
             last_source=self.source_edit.text().strip(),
             last_output=self.output_edit.text().strip(),
             last_result_report=self._last_result_report,
+            advanced_expanded=self.advanced_toggle.isChecked(),
+            start_offset=self.start_offset_edit.text().strip() or "0",
+            end_offset=self.end_offset_edit.text().strip(),
+            chunk_mib=self.chunk_mib_spin.value(),
+            overlap_kib=self.overlap_kib_spin.value(),
+            cluster_mib=self.cluster_mib_spin.value(),
+            padding_mib=self.padding_mib_spin.value(),
+            minimum_hits=self.minimum_hits_spin.value(),
+            minimum_distinct_types=self.minimum_distinct_types_spin.value(),
+            recover_wallets=self.recover_wallets_check.isChecked(),
+            recovery_dir=self.recovery_dir_edit.text().strip(),
         )
 
     @Slot()
@@ -282,6 +396,22 @@ class MainWindow(QMainWindow):
         self.checkpoint_edit.setPlaceholderText(self._t("checkpoint_placeholder"))
         self.checkpoint_button.setText(self._t("choose"))
         self.resume_check.setText(self._t("resume_checkpoint"))
+        self.advanced_toggle.setText(self._t("advanced_toggle"))
+        self.advanced_box.setTitle(self._t("advanced_group"))
+        self.start_offset_label.setText(self._t("start_offset"))
+        self.end_offset_label.setText(self._t("end_offset"))
+        self.chunk_mib_label.setText(self._t("chunk_mib"))
+        self.overlap_kib_label.setText(self._t("overlap_kib"))
+        self.cluster_mib_label.setText(self._t("cluster_mib"))
+        self.padding_mib_label.setText(self._t("padding_mib"))
+        self.minimum_hits_label.setText(self._t("minimum_hits"))
+        self.minimum_distinct_types_label.setText(
+            self._t("minimum_distinct_types")
+        )
+        self.recover_wallets_check.setText(self._t("recover_wallets"))
+        self.recovery_dir_label.setText(self._t("recovery_dir"))
+        self.recovery_dir_button.setText(self._t("choose"))
+        self.restore_defaults_button.setText(self._t("restore_defaults"))
 
         self.progress_box.setTitle(self._t("progress_group"))
         if self._thread is None:
@@ -315,6 +445,38 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.output_edit.setText(path)
+
+    @Slot()
+    def _choose_recovery_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, self._t("choose_recovery_dir")
+        )
+        if path:
+            self.recovery_dir_edit.setText(path)
+
+    @Slot()
+    def _toggle_advanced(self) -> None:
+        self.advanced_box.setVisible(self.advanced_toggle.isChecked())
+
+    @Slot()
+    def _update_recovery_controls(self) -> None:
+        enabled = self.recover_wallets_check.isChecked()
+        self.recovery_dir_edit.setEnabled(enabled)
+        self.recovery_dir_button.setEnabled(enabled)
+
+    @Slot()
+    def _restore_advanced_defaults(self) -> None:
+        self.start_offset_edit.setText("0")
+        self.end_offset_edit.clear()
+        self.chunk_mib_spin.setValue(64)
+        self.overlap_kib_spin.setValue(64)
+        self.cluster_mib_spin.setValue(2)
+        self.padding_mib_spin.setValue(1)
+        self.minimum_hits_spin.setValue(1)
+        self.minimum_distinct_types_spin.setValue(1)
+        self.recover_wallets_check.setChecked(False)
+        self.recovery_dir_edit.clear()
+        self._save_preferences()
 
     @Slot()
     def _choose_checkpoint(self) -> None:
@@ -351,6 +513,16 @@ class MainWindow(QMainWindow):
                 include_bitcoin_context=self.bitcoin_context_check.isChecked(),
                 workers=self.workers_spin.value(),
                 file_workers=self.file_workers_spin.value(),
+                start_offset=self.start_offset_edit.text(),
+                end_offset=self.end_offset_edit.text(),
+                chunk_mib=self.chunk_mib_spin.value(),
+                overlap_kib=self.overlap_kib_spin.value(),
+                cluster_mib=self.cluster_mib_spin.value(),
+                padding_mib=self.padding_mib_spin.value(),
+                minimum_hits=self.minimum_hits_spin.value(),
+                minimum_distinct_types=self.minimum_distinct_types_spin.value(),
+                recover_wallets=self.recover_wallets_check.isChecked(),
+                recovery_dir=self.recovery_dir_edit.text(),
                 checkpoint_path=self.checkpoint_edit.text(),
                 resume_checkpoint=self.resume_check.isChecked(),
                 language=self._language,
