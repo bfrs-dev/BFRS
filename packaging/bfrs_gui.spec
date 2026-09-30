@@ -34,6 +34,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=str(ROOT / "packaging" / "bfrs.ico"),
 )
 
 collection = COLLECT(
