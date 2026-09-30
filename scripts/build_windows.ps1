@@ -123,17 +123,17 @@ try {
     Write-Host "SHA256: $zipHash"
 
     if ($Installer) {
-        $isccCandidates = @(
+        $iscc = @(
             "$env:ProgramFiles\Inno Setup 7\ISCC.exe",
             "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe",
             "$env:LOCALAPPDATA\Programs\Inno Setup 7\ISCC.exe"
-        ) | Where-Object { $_ -and (Test-Path $_ -PathType Leaf) }
+        ) | Where-Object { $_ -and (Test-Path $_ -PathType Leaf) } | Select-Object -First 1
 
-        if (-not $isccCandidates) {
+        if (-not $iscc) {
             throw "Inno Setup compiler (ISCC.exe) not found. Install Inno Setup 7 or rerun without -Installer."
         }
 
-        $iscc = $isccCandidates[0]
+        $iscc = [string]$iscc
         Write-Host "Building installer with: $iscc"
         $isccArgs = @(
             "/DMyAppVersion=$version",
