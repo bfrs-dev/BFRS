@@ -47,8 +47,7 @@ For normal/release builds, do not use `-SkipTests`.
 If `py` resolves to the wrong architecture, pass a native interpreter:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 \
-  -PythonExe "C:\Path\To\python.exe"
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 -PythonExe "C:\Path\To\python.exe"
 ```
 
 You can check the interpreter platform first:
