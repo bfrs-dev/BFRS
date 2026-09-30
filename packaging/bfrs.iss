@@ -10,6 +10,9 @@
 #ifndef OutputDir
   #define OutputDir "..\artifacts"
 #endif
+#ifndef IconFile
+  #define IconFile "bfrs.ico"
+#endif
 
 #if BuildArch == "win-arm64"
   #define AllowedArch "arm64"
@@ -35,6 +38,7 @@ ArchitecturesAllowed={#AllowedArch}
 ArchitecturesInstallIn64BitMode={#AllowedArch}
 PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\BFRS.exe
+SetupIconFile={#IconFile}
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
