@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import sys
 
 
+def _prepare_multiprocessing() -> None:
+    """Let frozen Windows worker processes bypass normal GUI startup."""
+    multiprocessing.freeze_support()
+
+
 def main() -> int:
+    _prepare_multiprocessing()
     try:
         from PySide6.QtWidgets import QApplication
     except ImportError as error:
