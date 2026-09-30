@@ -1,10 +1,9 @@
-import base64
-
-from bfrs.gui.icon_data import ICON_PNG_BASE64
+from importlib.resources import files
 
 
-def test_embedded_application_icon_is_png():
-    payload = base64.b64decode(ICON_PNG_BASE64)
+def test_packaged_application_icon_is_png():
+    icon = files("bfrs.gui").joinpath("assets", "bfrs.png")
+    payload = icon.read_bytes()
 
     assert payload.startswith(b"\x89PNG\r\n\x1a\n")
     assert len(payload) > 1024
