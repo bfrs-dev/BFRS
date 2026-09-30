@@ -1,28 +1,24 @@
-"""Generate Windows icon assets from the embedded BFRS artwork."""
+"""Generate the Windows .ico file from the packaged BFRS PNG asset."""
 
 from __future__ import annotations
 
-import base64
-from io import BytesIO
 from pathlib import Path
-import sys
 
 from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-from bfrs.gui.icon_data import ICON_PNG_BASE64  # noqa: E402
+SOURCE_PNG = ROOT / "src" / "bfrs" / "gui" / "assets" / "bfrs.png"
 
 
 def build_icon_assets(output_dir: str | Path | None = None) -> tuple[Path, Path]:
     target = Path(output_dir) if output_dir is not None else ROOT / "packaging"
     target.mkdir(parents=True, exist_ok=True)
 
-    source = Image.open(BytesIO(base64.b64decode(ICON_PNG_BASE64))).convert("RGBA")
+    if not SOURCE_PNG.is_file():
+        raise FileNotFoundError(f"BFRS icon source is missing: {SOURCE_PNG}")
+
+    source = Image.open(SOURCE_PNG).convert("RGBA")
     png_path = target / "bfrs.png"
     ico_path = target / "bfrs.ico"
 
