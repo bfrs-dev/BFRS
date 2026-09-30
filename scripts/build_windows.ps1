@@ -42,6 +42,12 @@ try {
         throw "pip install failed."
     }
 
+    Write-Host "Generating application icon assets..."
+    & $PythonExe "scripts\build_icon_assets.py"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Application icon generation failed."
+    }
+
     if (-not $SkipTests) {
         Write-Host "Running test suite..."
         & $PythonExe -m pytest -q
@@ -140,6 +146,7 @@ try {
             "/DBuildArch=$artifactArch",
             "/DSourceDir=$appDir",
             "/DOutputDir=$artifactRoot",
+            "/DIconFile=$(Join-Path $Root 'packaging\bfrs.ico')",
             "packaging\bfrs.iss"
         )
         & $iscc @isccArgs
