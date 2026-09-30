@@ -44,3 +44,7 @@ wallet.dat.manifest.json
 build/
 dist/
 artifacts/
+
+# Generated application icon assets
+packaging/bfrs.ico
+packaging/bfrs.png
