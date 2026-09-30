@@ -56,6 +56,14 @@ try {
 
     Remove-Item $buildRoot -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item $distRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+    if (Test-Path $distRoot) {
+        throw (
+            "Unable to clean '$distRoot'. Close every running BFRS window " +
+            "and any Explorer window opened inside that folder, then rerun the build."
+        )
+    }
+
     New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
