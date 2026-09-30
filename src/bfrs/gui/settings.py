@@ -19,6 +19,17 @@ class GuiPreferences:
     last_source: str = ""
     last_output: str = ""
     last_result_report: str = ""
+    advanced_expanded: bool = False
+    start_offset: str = "0"
+    end_offset: str = ""
+    chunk_mib: int = 64
+    overlap_kib: int = 64
+    cluster_mib: int = 2
+    padding_mib: int = 1
+    minimum_hits: int = 1
+    minimum_distinct_types: int = 1
+    recover_wallets: bool = False
+    recovery_dir: str = ""
 
 
 def default_settings_path() -> Path:
@@ -55,6 +66,33 @@ class GuiSettingsStore:
             last_source=self._text(payload, "last_source"),
             last_output=self._text(payload, "last_output"),
             last_result_report=self._text(payload, "last_result_report"),
+            advanced_expanded=self._boolean(
+                payload, "advanced_expanded", default=False
+            ),
+            start_offset=self._numeric_text(payload, "start_offset", default="0"),
+            end_offset=self._numeric_text(payload, "end_offset", default=""),
+            chunk_mib=self._integer(
+                payload, "chunk_mib", default=64, minimum=1, maximum=4096
+            ),
+            overlap_kib=self._integer(
+                payload, "overlap_kib", default=64, minimum=0, maximum=4_194_303
+            ),
+            cluster_mib=self._integer(
+                payload, "cluster_mib", default=2, minimum=1, maximum=1024
+            ),
+            padding_mib=self._integer(
+                payload, "padding_mib", default=1, minimum=0, maximum=1024
+            ),
+            minimum_hits=self._integer(
+                payload, "minimum_hits", default=1, minimum=1, maximum=999
+            ),
+            minimum_distinct_types=self._integer(
+                payload, "minimum_distinct_types", default=1, minimum=1, maximum=999
+            ),
+            recover_wallets=self._boolean(
+                payload, "recover_wallets", default=False
+            ),
+            recovery_dir=self._text(payload, "recovery_dir"),
         )
 
     def save(self, preferences: GuiPreferences) -> Path:
@@ -80,6 +118,31 @@ class GuiSettingsStore:
     def _text(payload: dict[str, object], key: str) -> str:
         value = payload.get(key, "")
         return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _boolean(
+        payload: dict[str, object],
+        key: str,
+        *,
+        default: bool,
+    ) -> bool:
+        value = payload.get(key)
+        return value if isinstance(value, bool) else default
+
+    @staticmethod
+    def _numeric_text(
+        payload: dict[str, object],
+        key: str,
+        *,
+        default: str,
+    ) -> str:
+        value = payload.get(key)
+        if not isinstance(value, str):
+            return default
+        text = value.strip()
+        if text == "":
+            return "" if default == "" else default
+        return text if text.isdecimal() else default
 
     @staticmethod
     def _integer(
