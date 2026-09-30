@@ -13,6 +13,17 @@ def test_settings_round_trip(tmp_path):
         last_source=r"C:\\images\\disk.img",
         last_output=r"C:\\reports\\scan.json",
         last_result_report=r"C:\\reports\\previous.json",
+        advanced_expanded=True,
+        start_offset="4096",
+        end_offset="8192",
+        chunk_mib=32,
+        overlap_kib=128,
+        cluster_mib=4,
+        padding_mib=2,
+        minimum_hits=3,
+        minimum_distinct_types=2,
+        recover_wallets=True,
+        recovery_dir=r"C:\\recovery",
     )
 
     result = store.save(preferences)
@@ -82,3 +93,37 @@ def test_save_creates_parent_directory(tmp_path):
 
 def test_default_settings_path_has_stable_filename():
     assert default_settings_path().name == "gui-settings.json"
+
+
+def test_settings_validate_advanced_values(tmp_path):
+    path = tmp_path / "gui-settings.json"
+    path.write_text(
+        json.dumps({
+            "advanced_expanded": "yes",
+            "start_offset": "bad",
+            "end_offset": "-1",
+            "chunk_mib": 0,
+            "overlap_kib": -5,
+            "cluster_mib": 0,
+            "padding_mib": -1,
+            "minimum_hits": 0,
+            "minimum_distinct_types": 0,
+            "recover_wallets": "yes",
+            "recovery_dir": 123,
+        }),
+        encoding="utf-8",
+    )
+
+    loaded = GuiSettingsStore(path).load()
+
+    assert loaded.advanced_expanded is False
+    assert loaded.start_offset == "0"
+    assert loaded.end_offset == ""
+    assert loaded.chunk_mib == 1
+    assert loaded.overlap_kib == 0
+    assert loaded.cluster_mib == 1
+    assert loaded.padding_mib == 0
+    assert loaded.minimum_hits == 1
+    assert loaded.minimum_distinct_types == 1
+    assert loaded.recover_wallets is False
+    assert loaded.recovery_dir == ""
