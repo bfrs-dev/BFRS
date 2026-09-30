@@ -178,3 +178,82 @@ def test_gui_config_uses_english_checkpoint_preflight(tmp_path):
             checkpoint_path=str(checkpoint),
             language="en",
         )
+
+
+def test_gui_config_maps_advanced_scan_settings(tmp_path):
+    recovery = tmp_path / "recovery"
+    config = build_gui_scan_config(
+        input_path=str(tmp_path / "disk.img"),
+        output_path=str(tmp_path / "report.json"),
+        source_type="image",
+        targets=frozenset({"bitcoin-core"}),
+        include_mnemonic=True,
+        include_bitcoin_context=True,
+        workers=2,
+        file_workers=1,
+        start_offset="4096",
+        end_offset="8192",
+        chunk_mib=32,
+        overlap_kib=128,
+        cluster_mib=4,
+        padding_mib=2,
+        minimum_hits=3,
+        minimum_distinct_types=2,
+        recover_wallets=True,
+        recovery_dir=str(recovery),
+    )
+
+    assert config.start == 4096
+    assert config.end == 8192
+    assert config.chunk_mib == 32
+    assert config.overlap_kib == 128
+    assert config.cluster_mib == 4
+    assert config.padding_mib == 2
+    assert config.minimum_hits == 3
+    assert config.minimum_distinct_types == 2
+    assert config.recover_wallets is True
+    assert config.recovery_dir == recovery
+
+
+@pytest.mark.parametrize(
+    ("start_offset", "end_offset", "message"),
+    [
+        ("abc", "", "Start offset"),
+        ("-1", "", "Start offset"),
+        ("100", "abc", "End offset"),
+        ("100", "100", "End offset"),
+        ("100", "99", "End offset"),
+    ],
+)
+def test_gui_config_rejects_invalid_advanced_ranges(
+    tmp_path, start_offset, end_offset, message
+):
+    with pytest.raises(ValueError, match=message):
+        build_gui_scan_config(
+            input_path=str(tmp_path / "disk.img"),
+            output_path=str(tmp_path / "report.json"),
+            source_type="image",
+            targets=frozenset({"bitcoin-core"}),
+            include_mnemonic=False,
+            include_bitcoin_context=False,
+            workers=1,
+            file_workers=1,
+            start_offset=start_offset,
+            end_offset=end_offset,
+        )
+
+
+def test_gui_config_requires_recovery_directory(tmp_path):
+    with pytest.raises(ValueError, match="katalog odzysku"):
+        build_gui_scan_config(
+            input_path=str(tmp_path / "disk.img"),
+            output_path=str(tmp_path / "report.json"),
+            source_type="image",
+            targets=frozenset({"bitcoin-core"}),
+            include_mnemonic=False,
+            include_bitcoin_context=False,
+            workers=1,
+            file_workers=1,
+            recover_wallets=True,
+            recovery_dir="",
+        )
