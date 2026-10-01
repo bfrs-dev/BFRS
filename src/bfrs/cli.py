@@ -532,10 +532,6 @@ def main(
             parser.error("wallet-record revalidation requires a regular file source")
         if arguments.start != 0 or arguments.end is not None:
             parser.error("--start/--end are not supported for FOLDER sources")
-        if arguments.checkpoint or arguments.resume_checkpoint:
-            parser.error(
-                "FOLDER checkpoint/resume is deferred to P2.7.1; IMAGE resume is unchanged"
-            )
         root = arguments.input.resolve(strict=False)
         output = arguments.output.resolve(strict=False)
         if root == output or root in output.parents:
