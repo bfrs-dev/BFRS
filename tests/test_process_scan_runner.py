@@ -78,12 +78,13 @@ def _crash_worker(config, messages, stop_event):
     raise SystemExit(7)
 
 
-def test_process_runner_reports_unexpected_child_exit(tmp_path, monkeypatch):
-    import bfrs.application.process_scan_runner as module
-
-    monkeypatch.setattr(module, "_worker_entry", _crash_worker)
+def test_process_runner_reports_unexpected_child_exit(tmp_path):
     events = []
-    runner = ProcessScanRunner(event_sink=events.append, poll_seconds=0.01)
+    runner = ProcessScanRunner(
+        event_sink=events.append,
+        poll_seconds=0.01,
+        worker_entry=_crash_worker,
+    )
 
     with pytest.raises(ProcessScanError, match="exited unexpectedly"):
         runner.run(_config(tmp_path))
