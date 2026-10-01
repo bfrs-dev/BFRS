@@ -39,3 +39,12 @@ wallet.dat
 wallet.dat.manifest.json
 .wallet-export-*.tmp
 .wallet-manifest-*.tmp
+
+# Standalone application build output
+build/
+dist/
+artifacts/
+
+# Generated application icon assets
+packaging/bfrs.ico
+packaging/bfrs.png

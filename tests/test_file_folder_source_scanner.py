@@ -155,15 +155,145 @@ def test_broken_file_does_not_abort_other_file(monkeypatch, tmp_path):
     assert {row["status"] for row in payload["files"]} == {"SCANNED", "SKIPPED"}
 
 
-def test_folder_checkpoint_is_explicitly_deferred(tmp_path, capsys):
+def _write_empty_child_report(output: Path) -> None:
+    output.write_text(json.dumps({
+        "raw_hit_count": 0,
+        "target_findings": [],
+        "intact_wallet": {"detected": False},
+        "finding_summary": {"accepted_candidates": 0},
+    }), encoding="utf-8")
+
+
+def test_folder_checkpoint_resume_skips_completed_files(tmp_path):
     root = tmp_path / "source"
     root.mkdir()
+    for index in range(5):
+        (root / f"file-{index}.bin").write_bytes(
+            f"payload-{index}".encode("ascii")
+        )
+
+    checkpoint = tmp_path / "folder.checkpoint.sqlite"
+    first_report = tmp_path / "first.json"
+
+    from bfrs.cli import build_parser
+    first_arguments = build_parser().parse_args(
+        basic_arguments(root, first_report) + [
+            "--source-type", "folder",
+            "--targets", "secrets",
+            "--file-workers", "1",
+            "--checkpoint", str(checkpoint),
+        ]
+    )
+
+    first_seen = []
+
+    def first_child(argv):
+        source = Path(argv[argv.index("--input") + 1])
+        output = Path(argv[argv.index("--output") + 1])
+        first_seen.append(source.name)
+        if len(first_seen) == 3:
+            return 130
+        _write_empty_child_report(output)
+        return 0
+
+    assert scan_folder_source(first_arguments, first_child) == 130
+    assert first_seen == ["file-0.bin", "file-1.bin", "file-2.bin"]
+    assert checkpoint.is_file()
+    assert not first_report.exists()
+
+    resumed_report = tmp_path / "resumed.json"
+    resumed_arguments = build_parser().parse_args(
+        basic_arguments(root, resumed_report) + [
+            "--source-type", "folder",
+            "--targets", "secrets",
+            "--file-workers", "1",
+            "--resume-checkpoint", str(checkpoint),
+        ]
+    )
+
+    resumed_seen = []
+
+    def resumed_child(argv):
+        source = Path(argv[argv.index("--input") + 1])
+        output = Path(argv[argv.index("--output") + 1])
+        resumed_seen.append(source.name)
+        _write_empty_child_report(output)
+        return 0
+
+    assert scan_folder_source(resumed_arguments, resumed_child) == 0
+    assert resumed_seen == ["file-2.bin", "file-3.bin", "file-4.bin"]
+
+    payload = json.loads(resumed_report.read_text(encoding="utf-8"))
+    assert payload["files_discovered"] == 5
+    assert payload["files_scanned"] == 5
+    assert payload["checkpoint"]["supported"] is True
+    assert payload["checkpoint"]["schema_version"] == 1
+    assert payload["checkpoint"]["resumed_files"] == 2
+
+
+def test_folder_resume_rejects_changed_source_snapshot(tmp_path, capsys):
+    root = tmp_path / "source"
+    root.mkdir()
+    source = root / "file.bin"
+    source.write_bytes(b"before")
+    checkpoint = tmp_path / "folder.checkpoint.sqlite"
+    report = tmp_path / "first.json"
+
+    assert main(basic_arguments(root, report) + [
+        "--source-type", "folder",
+        "--targets", "secrets",
+        "--checkpoint", str(checkpoint),
+    ]) == 0
+
+    source.write_bytes(b"after-change")
+    resumed = tmp_path / "resumed.json"
+    assert main(basic_arguments(root, resumed) + [
+        "--source-type", "folder",
+        "--targets", "secrets",
+        "--resume-checkpoint", str(checkpoint),
+    ]) == 3
+    assert "folder contents changed" in capsys.readouterr().err
+    assert not resumed.exists()
+
+
+def test_folder_checkpoint_must_be_outside_source_root(tmp_path, capsys):
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "file.bin").write_bytes(b"data")
+
     with pytest.raises(SystemExit) as raised:
         main(basic_arguments(root, tmp_path / "report.json") + [
-            "--checkpoint", str(tmp_path / "checkpoint.sqlite")
+            "--source-type", "folder",
+            "--targets", "secrets",
+            "--checkpoint", str(root / "checkpoint.sqlite"),
         ])
+
     assert raised.value.code == 2
-    assert "deferred to P2.7.1" in capsys.readouterr().err
+    assert "folder checkpoint must be outside" in capsys.readouterr().err
+
+
+def test_completed_folder_checkpoint_cannot_be_resumed(tmp_path, capsys):
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "file.bin").write_bytes(b"data")
+    checkpoint = tmp_path / "folder.checkpoint.sqlite"
+    report = tmp_path / "first.json"
+
+    assert main(basic_arguments(root, report) + [
+        "--source-type", "folder",
+        "--targets", "secrets",
+        "--checkpoint", str(checkpoint),
+    ]) == 0
+
+    second = tmp_path / "second.json"
+    assert main(basic_arguments(root, second) + [
+        "--source-type", "folder",
+        "--targets", "secrets",
+        "--resume-checkpoint", str(checkpoint),
+    ]) == 3
+
+    assert "already complete" in capsys.readouterr().err
+    assert not second.exists()
 
 
 def test_image_source_regression_remains_image(tmp_path):

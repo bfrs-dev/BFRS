@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
-from typing import Callable, Iterator, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 
 from bfrs.recovery.automatic_wallet_recovery import (
     recover_intact_wallet,
@@ -21,6 +21,12 @@ from bfrs.recovery.automatic_wallet_recovery import (
     validate_recovery_destination,
 )
 from bfrs.reporting.json_report import REPORT_SCHEMA_VERSION
+from bfrs.scanners.fast_scanner import ScanProgress
+from bfrs.scanners.folder_scan_checkpoint import (
+    FolderCheckpointError,
+    FolderScanCheckpoint,
+    folder_snapshot_digest,
+)
 from bfrs.version import APP_NAME, VERSION
 
 
@@ -31,6 +37,10 @@ _QUEUE_MULTIPLIER = 2
 
 class FolderWorkerError(RuntimeError):
     """A file-worker failed outside the normal per-file error boundary."""
+
+
+class FolderScanStopped(Exception):
+    """A child file scan cooperatively stopped by user request."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,10 +56,18 @@ class _ScanOutcome:
 class _FolderProgress:
     """Thread-safe, throttled aggregate folder progress."""
 
-    def __init__(self, root: Path, *, files: int, total_bytes: int) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        files: int,
+        total_bytes: int,
+        progress_callback: Callable[[ScanProgress], None] | None = None,
+    ) -> None:
         self._root = root
         self._files = files
         self._total_bytes = total_bytes
+        self._progress_callback = progress_callback
         self._started = time.monotonic()
         self._last_rendered = 0.0
         self._completed = 0
@@ -59,13 +77,40 @@ class _FolderProgress:
         self._rendered = False
         self._lock = threading.Lock()
 
+    def restore(self, outcomes: Sequence[_ScanOutcome]) -> None:
+        for outcome in outcomes:
+            self._completed += 1
+            self._completed_bytes += outcome.size
+            if outcome.report is not None:
+                self._raw_hits += int(outcome.report.get("raw_hit_count", 0))
+                findings = outcome.report.get("target_findings", ())
+                if isinstance(findings, list):
+                    self._validated += sum(
+                        item.get("validation_status") not in (
+                            None, "UNVALIDATED", "NOT_APPLICABLE")
+                        for item in findings
+                        if isinstance(item, dict)
+                    )
+
     def initial(self, skipped: int) -> None:
-        percent = 100.0 if self._files == 0 else 0.0
+        percent = (
+            100.0 if self._files == 0
+            else self._completed * 100.0 / self._files
+        )
+        if self._progress_callback is not None:
+            self._progress_callback(ScanProgress(
+                scanned_bytes=self._completed_bytes,
+                total_bytes=self._total_bytes,
+                raw_hits=self._raw_hits,
+                stage="folder-scan",
+                complete=(self._completed >= self._files),
+            ))
         print(
             "Folder scan: "
-            f"files=0/{self._files} ({percent:.1f}%) "
-            f"bytes=0/{self._total_bytes} ({percent:.1f}%) "
-            f"files/s=0.0 MiB/s=0.0 raw_hits=0 validated=0 "
+            f"files={self._completed}/{self._files} ({percent:.1f}%) "
+            f"bytes={self._completed_bytes}/{self._total_bytes} ({percent:.1f}%) "
+            f"files/s=0.0 MiB/s=0.0 raw_hits={self._raw_hits} "
+            f"validated={self._validated} "
             f"skipped={skipped}",
             file=sys.stderr,
         )
@@ -84,8 +129,16 @@ class _FolderProgress:
                         for item in findings
                         if isinstance(item, dict)
                     )
-            now = time.monotonic()
             complete = self._completed >= self._files
+            if self._progress_callback is not None:
+                self._progress_callback(ScanProgress(
+                    scanned_bytes=self._completed_bytes,
+                    total_bytes=self._total_bytes,
+                    raw_hits=self._raw_hits,
+                    stage="folder-scan",
+                    complete=complete,
+                ))
+            now = time.monotonic()
             if not complete and now - self._last_rendered < 0.5:
                 return
             self._last_rendered = now
@@ -205,6 +258,8 @@ def _merge_recovery(total: dict, current: dict, prefix: Path) -> None:
 def _file_batches(
     files: Sequence[tuple[Path, int, int]],
     workers: int,
+    *,
+    index_map: Mapping[Path, int] | None = None,
 ) -> Iterator[tuple[tuple[int, Path, int, int], ...]]:
     # Keep enough batches to occupy small worker pools while retaining a hard
     # cap that amortizes scheduling for directories with hundreds of thousands
@@ -215,7 +270,12 @@ def _file_batches(
     )
     batch: list[tuple[int, Path, int, int]] = []
     batch_bytes = 0
-    for index, (source, size, mtime_ns) in enumerate(files, 1):
+    for fallback_index, (source, size, mtime_ns) in enumerate(files, 1):
+        index = (
+            index_map.get(source, fallback_index)
+            if index_map is not None
+            else fallback_index
+        )
         if batch and (len(batch) >= adaptive_file_limit or
                       batch_bytes + size > _BATCH_BYTE_LIMIT):
             yield tuple(batch)
@@ -239,6 +299,8 @@ def _scan_batch(
         child_report_path = temporary_root / f"report-{index:09d}.json"
         try:
             code = child_main(_child_arguments(arguments, source, child_report_path))
+            if code == 130:
+                raise FolderScanStopped
             if code != 0:
                 raise OSError(f"CHILD_SCAN_EXIT_{code}")
             child_report = json.loads(child_report_path.read_text(encoding="utf-8"))
@@ -247,6 +309,8 @@ def _scan_batch(
                 raise ValueError("INVALID_CHILD_REPORT")
             outcome = _ScanOutcome(
                 index, source, size, mtime_ns, report=child_report)
+        except FolderScanStopped:
+            raise
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
             outcome = _ScanOutcome(
                 index, source, size, mtime_ns,
@@ -263,9 +327,11 @@ def _scan_files_bounded(
     arguments,
     child_main: Callable[[Sequence[str] | None], int],
     progress: Callable[[_ScanOutcome], None],
+    *,
+    index_map: Mapping[Path, int] | None = None,
 ) -> list[_ScanOutcome]:
     workers = arguments.file_workers
-    batches = iter(_file_batches(files, workers))
+    batches = iter(_file_batches(files, workers, index_map=index_map))
     if workers == 1:
         return [
             outcome
@@ -299,6 +365,10 @@ def _scan_files_bounded(
                 batch = pending.pop(future)
                 try:
                     outcomes.extend(future.result())
+                except FolderScanStopped:
+                    for item in pending:
+                        item.cancel()
+                    raise
                 except BaseException as error:
                     for item in pending:
                         item.cancel()
@@ -327,16 +397,125 @@ def _finding_sort_key(root: Path, finding: dict) -> tuple:
     )
 
 
+def _folder_checkpoint_semantics(arguments) -> dict:
+    return {
+        "chunk_mib": arguments.chunk_mib,
+        "overlap_kib": arguments.overlap_kib,
+        "cluster_mib": arguments.cluster_mib,
+        "padding_mib": arguments.padding_mib,
+        "minimum_hits": arguments.minimum_hits,
+        "minimum_distinct_types": arguments.minimum_distinct_types,
+        "workers": arguments.workers,
+        "file_workers": arguments.file_workers,
+        "targets": arguments.targets or "default",
+        "electrum_only": bool(arguments.electrum_only),
+        "seed_scan_only": bool(arguments.seed_scan_only),
+        "include_mnemonic": bool(arguments.include_mnemonic),
+        "include_bitcoin_context": bool(arguments.include_bitcoin_context),
+        "skip_mnemonic": bool(arguments.skip_mnemonic),
+        "recover_wallets": bool(arguments.recover_wallets),
+        "recovery_dir": (
+            str(arguments.recovery_dir.resolve(strict=False))
+            if arguments.recovery_dir is not None
+            else None
+        ),
+    }
+
+
+def _checkpoint_outcome(
+    checkpoint: FolderScanCheckpoint,
+    root: Path,
+    outcome: _ScanOutcome,
+) -> None:
+    checkpoint.save_outcome(
+        relative_path=outcome.source.relative_to(root).as_posix(),
+        size=outcome.size,
+        mtime_ns=outcome.mtime_ns,
+        report=outcome.report,
+        error_reason=outcome.error_reason,
+    )
+
+
 def scan_folder_source(
     arguments,
     child_main: Callable[[Sequence[str] | None], int],
+    *,
+    progress_callback: Callable[[ScanProgress], None] | None = None,
 ) -> int:
     root = arguments.input.resolve()
     files, discovery_skips = discover_regular_files(root)
     bytes_discovered = sum(size for _, size, _ in files)
+    snapshot_sha256 = folder_snapshot_digest(root, files)
+    semantics = _folder_checkpoint_semantics(arguments)
+    index_map = {
+        source: index
+        for index, (source, _, _) in enumerate(files, 1)
+    }
+    checkpoint: FolderScanCheckpoint | None = None
+    resumed_outcomes: list[_ScanOutcome] = []
+    remaining_files = list(files)
+
+    try:
+        if arguments.checkpoint is not None:
+            checkpoint = FolderScanCheckpoint.create(
+                arguments.checkpoint,
+                root=root,
+                snapshot_sha256=snapshot_sha256,
+                semantics=semantics,
+            )
+        elif arguments.resume_checkpoint is not None:
+            checkpoint = FolderScanCheckpoint.resume(
+                arguments.resume_checkpoint,
+                root=root,
+                snapshot_sha256=snapshot_sha256,
+                semantics=semantics,
+            )
+            by_relative = {
+                source.relative_to(root).as_posix(): (source, size, mtime_ns)
+                for source, size, mtime_ns in files
+            }
+            completed_paths: set[str] = set()
+            for record in checkpoint.records():
+                source_info = by_relative.get(record.relative_path)
+                if source_info is None:
+                    raise FolderCheckpointError(
+                        "checkpoint references a file missing from current folder"
+                    )
+                source, size, mtime_ns = source_info
+                if size != record.size or mtime_ns != record.mtime_ns:
+                    raise FolderCheckpointError(
+                        "checkpoint file metadata mismatch"
+                    )
+                resumed_outcomes.append(_ScanOutcome(
+                    index_map[source],
+                    source,
+                    size,
+                    mtime_ns,
+                    report=record.report,
+                    error_reason=record.error_reason,
+                ))
+                completed_paths.add(record.relative_path)
+            remaining_files = [
+                item for item in files
+                if item[0].relative_to(root).as_posix() not in completed_paths
+            ]
+    except FolderCheckpointError as error:
+        print(f"folder checkpoint error: {error}", file=sys.stderr)
+        if checkpoint is not None:
+            try:
+                checkpoint.close()
+            except FolderCheckpointError:
+                pass
+        return 3
+
     started = time.monotonic()
     progress = _FolderProgress(
-        root, files=len(files), total_bytes=bytes_discovered)
+        root,
+        files=len(files),
+        total_bytes=bytes_discovered,
+        progress_callback=progress_callback,
+    )
+    progress.restore(resumed_outcomes)
     progress.initial(len(discovery_skips))
     wallet_recovery = recovery_not_requested()
     if arguments.recover_wallets:
@@ -345,13 +524,42 @@ def scan_folder_source(
             "requested": True, "eligible_candidates": 0,
             "recovered_wallets": 0, "failed_wallets": 0, "outputs": [],
         }
+
+    def on_outcome(outcome: _ScanOutcome) -> None:
+        progress.update(outcome)
+        if checkpoint is not None:
+            _checkpoint_outcome(checkpoint, root, outcome)
+
     try:
         with tempfile.TemporaryDirectory(prefix="bfrs-folder-scan-") as temporary:
-            outcomes = _scan_files_bounded(
-                files, Path(temporary), arguments, child_main, progress.update)
-    except FolderWorkerError as error:
+            scanned_outcomes = _scan_files_bounded(
+                remaining_files,
+                Path(temporary),
+                arguments,
+                child_main,
+                on_outcome,
+                index_map=index_map,
+            )
+        outcomes = resumed_outcomes + scanned_outcomes
+    except FolderScanStopped:
         progress.finish()
-        print(f"folder worker error: {error}", file=sys.stderr)
+        if checkpoint is not None:
+            checkpoint.close()
+        print("folder scan stopped by request", file=sys.stderr)
+        return 130
+    except (FolderWorkerError, FolderCheckpointError) as error:
+        progress.finish()
+        if checkpoint is not None:
+            try:
+                checkpoint.close()
+            except FolderCheckpointError:
+                pass
+        label = (
+            "folder checkpoint error"
+            if isinstance(error, FolderCheckpointError)
+            else "folder worker error"
+        )
+        print(f"{label}: {error}", file=sys.stderr)
         return 3
     progress.finish()
     outcomes.sort(key=lambda item: item.index)
@@ -452,8 +660,17 @@ def scan_folder_source(
             "maximum_queued_batches": arguments.file_workers * _QUEUE_MULTIPLIER,
         },
         "checkpoint": {
-            "supported": False,
-            "status": "DEFERRED_TO_P2.7.1",
+            "supported": True,
+            "schema_version": 1,
+            "path": (
+                str(
+                    (arguments.checkpoint or arguments.resume_checkpoint)
+                    .resolve(strict=False)
+                )
+                if (arguments.checkpoint or arguments.resume_checkpoint)
+                else None
+            ),
+            "resumed_files": len(resumed_outcomes),
             "image_checkpoint_unchanged": True,
         },
     }
@@ -469,8 +686,22 @@ def scan_folder_source(
         os.replace(temporary_output, output)
     except OSError as error:
         temporary_output.unlink(missing_ok=True)
+        if checkpoint is not None:
+            try:
+                checkpoint.close()
+            except FolderCheckpointError:
+                pass
         print(f"report error: {error}", file=sys.stderr)
         return 4
+
+    if checkpoint is not None:
+        try:
+            checkpoint.mark_complete()
+            checkpoint.close()
+        except FolderCheckpointError as error:
+            print(f"folder checkpoint error: {error}", file=sys.stderr)
+            return 3
+
     print("source type: FOLDER")
     print(f"source root: {root}")
     print(f"files discovered: {len(files)}")
