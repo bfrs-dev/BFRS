@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from bfrs.application import ScanConfig, ScanController, ScanService
+from bfrs.application import ScanConfig, ScanController
+from bfrs.application.process_scan_runner import ProcessScanRunner
 
 
 class ScanWorker(QObject):
-    """Execute one ScanService run inside a dedicated QThread."""
+    """Supervise one process-isolated ScanService run from a QThread."""
 
     event = Signal(object)
     finished = Signal(object)
@@ -25,12 +26,12 @@ class ScanWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        service = ScanService(
+        runner = ProcessScanRunner(
             event_sink=self.event.emit,
-            controller=self._controller,
+            should_stop=self._controller.should_stop,
         )
         try:
-            result = service.run(self._config)
+            result = runner.run(self._config)
         except Exception as error:
             self.failed.emit(
                 f"{type(error).__name__}: {error or 'nieznany błąd'}"
