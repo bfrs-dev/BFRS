@@ -42,7 +42,6 @@ include = ["bfrs*"]
 
 [tool.setuptools.package-data]
 "bfrs.recovery.mnemonic" = ["wordlists/*.txt"]
-"bfrs.gui" = ["assets/*.png"]
 
 [tool.setuptools.dynamic]
 version = {attr = "bfrs.version.VERSION"}
