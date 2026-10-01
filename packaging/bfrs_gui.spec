@@ -7,7 +7,6 @@ from PyInstaller.utils.hooks import collect_data_files
 
 ROOT = Path.cwd()
 DATAS = collect_data_files("bfrs.recovery.mnemonic", include_py_files=False)
-DATAS += collect_data_files("bfrs.gui", include_py_files=False, includes=["assets/*.png"])
 
 analysis = Analysis(
     [str(ROOT / "src" / "bfrs" / "gui" / "app.py")],
