@@ -335,3 +335,56 @@ def test_stop_without_checkpoint_is_clean_but_not_resumable(tmp_path):
     assert result.status == "stopped"
     assert any(isinstance(event, ScanStoppedEvent) for event in events)
     assert not any(isinstance(event, ScanCheckpointSavedEvent) for event in events)
+
+
+
+def test_scan_service_cli_adapter_supports_folder_checkpoint(tmp_path):
+    source = tmp_path / "folder"
+    source.mkdir()
+    checkpoint = tmp_path / "folder.checkpoint.sqlite"
+    value = ScanConfig(
+        input_path=source,
+        output_path=tmp_path / "folder-report.json",
+        source_type=SourceType.FOLDER,
+        targets=frozenset({"bitcoin-core", "secrets"}),
+        workers=2,
+        file_workers=4,
+        checkpoint=checkpoint,
+    )
+
+    arguments = build_cli_arguments(value)
+
+    assert arguments[arguments.index("--source-type") + 1] == "folder"
+    assert arguments[arguments.index("--file-workers") + 1] == "4"
+    assert arguments[arguments.index("--checkpoint") + 1] == str(checkpoint)
+    assert "--resume-checkpoint" not in arguments
+
+
+def test_scan_service_reports_folder_checkpoint_on_controlled_stop(tmp_path):
+    source = tmp_path / "folder"
+    source.mkdir()
+    checkpoint = tmp_path / "folder.checkpoint.sqlite"
+    checkpoint.write_bytes(b"synthetic checkpoint")
+    events = []
+
+    value = ScanConfig(
+        input_path=source,
+        output_path=tmp_path / "folder-report.json",
+        source_type=SourceType.FOLDER,
+        targets=frozenset({"secrets"}),
+        checkpoint=checkpoint,
+    )
+
+    result = ScanService(
+        event_sink=events.append,
+        cli_runner=lambda arguments: 130,
+    ).run(value)
+
+    assert result.status == "stopped"
+    saved = [
+        event for event in events
+        if isinstance(event, ScanCheckpointSavedEvent)
+    ]
+    assert saved
+    assert saved[-1].checkpoint_path == checkpoint
+    assert isinstance(events[-1], ScanStoppedEvent)
