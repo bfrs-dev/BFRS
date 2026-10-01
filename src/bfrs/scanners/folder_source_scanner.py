@@ -103,7 +103,7 @@ class _FolderProgress:
                 total_bytes=self._total_bytes,
                 raw_hits=self._raw_hits,
                 stage="folder-scan",
-                complete=(self._files == 0),
+                complete=(self._completed >= self._files),
             ))
         print(
             "Folder scan: "
