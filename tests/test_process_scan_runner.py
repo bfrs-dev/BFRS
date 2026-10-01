@@ -126,3 +126,45 @@ def test_process_runner_state_reports_child_pid_while_running(tmp_path):
     assert state_seen[0].running is True
     assert isinstance(state_seen[0].pid, int)
     assert state_seen[0].pid > 0
+
+
+
+def test_process_runner_relays_external_stop_callback(tmp_path):
+    source = tmp_path / "source.img"
+    source.write_bytes(b"x" * (16 * 1024 * 1024))
+    config = ScanConfig(
+        input_path=source,
+        output_path=tmp_path / "report.json",
+        chunk_mib=1,
+        overlap_kib=64,
+        checkpoint=tmp_path / "scan.checkpoint.sqlite",
+    )
+
+    stop_requested = False
+    events = []
+
+    def should_stop():
+        return stop_requested
+
+    def collect(event):
+        nonlocal stop_requested
+        events.append(event)
+        if (
+            isinstance(event, ScanProgressEvent)
+            and event.scanned_bytes > 0
+            and not event.complete
+        ):
+            stop_requested = True
+
+    runner = ProcessScanRunner(
+        event_sink=collect,
+        should_stop=should_stop,
+        poll_seconds=0.01,
+    )
+
+    result = runner.run(config)
+
+    assert result.status == "stopped"
+    assert config.checkpoint is not None
+    assert config.checkpoint.exists()
+    assert any(isinstance(event, ScanStoppedEvent) for event in events)
