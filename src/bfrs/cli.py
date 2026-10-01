@@ -536,6 +536,13 @@ def main(
         output = arguments.output.resolve(strict=False)
         if root == output or root in output.parents:
             parser.error("folder report output must be outside the source root")
+        folder_checkpoint = arguments.checkpoint or arguments.resume_checkpoint
+        if folder_checkpoint is not None:
+            resolved_checkpoint = folder_checkpoint.resolve(strict=False)
+            if root == resolved_checkpoint or root in resolved_checkpoint.parents:
+                parser.error(
+                    "folder checkpoint must be outside the source root"
+                )
         from bfrs.scanners.folder_source_scanner import scan_folder_source
         return scan_folder_source(
             arguments,
