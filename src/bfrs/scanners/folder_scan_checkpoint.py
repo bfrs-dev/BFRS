@@ -155,6 +155,11 @@ class FolderScanCheckpoint:
                 else:
                     reason = "checkpoint schema mismatch"
                 raise FolderCheckpointError(reason)
+        if metadata.get("state") == "COMPLETE":
+            checkpoint.close()
+            raise FolderCheckpointError(
+                "folder checkpoint is already complete"
+            )
         return checkpoint
 
     def _configure(self) -> None:
