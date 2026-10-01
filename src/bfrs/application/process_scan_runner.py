@@ -88,6 +88,7 @@ class ProcessScanRunner:
         context: BaseContext | None = None,
         poll_seconds: float = 0.05,
         worker_entry: Callable | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be greater than zero")
@@ -95,6 +96,7 @@ class ProcessScanRunner:
         self._context = context or multiprocessing.get_context("spawn")
         self._poll_seconds = poll_seconds
         self._worker_entry = worker_entry or _worker_entry
+        self._should_stop = should_stop
         self._lock = threading.Lock()
         self._process = None
         self._stop_event = None
@@ -138,12 +140,18 @@ class ProcessScanRunner:
             process.start()
 
             while True:
+                if self._should_stop is not None and self._should_stop():
+                    stop_event.set()
+
                 try:
                     message = messages.get(timeout=self._poll_seconds)
                 except queue.Empty:
                     if not process.is_alive():
                         break
                     continue
+
+                if self._should_stop is not None and self._should_stop():
+                    stop_event.set()
 
                 kind = message[0]
                 if kind == "event":
