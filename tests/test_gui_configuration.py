@@ -257,3 +257,47 @@ def test_gui_config_requires_recovery_directory(tmp_path):
             recover_wallets=True,
             recovery_dir="",
         )
+
+
+
+def test_gui_config_maps_folder_checkpoint_and_resume(tmp_path):
+    source = tmp_path / "recovered"
+    source.mkdir()
+    checkpoint = tmp_path / "folder.checkpoint.sqlite"
+    report = tmp_path / "folder-report.json"
+
+    created = build_gui_scan_config(
+        input_path=str(source),
+        output_path=str(report),
+        source_type="folder",
+        targets=frozenset({"bitcoin-core", "electrum", "secrets"}),
+        include_mnemonic=True,
+        include_bitcoin_context=False,
+        workers=2,
+        file_workers=4,
+        checkpoint_path=str(checkpoint),
+        resume_checkpoint=False,
+    )
+
+    assert created.source_type is SourceType.FOLDER
+    assert created.file_workers == 4
+    assert created.checkpoint == checkpoint
+    assert created.resume_checkpoint is None
+
+    checkpoint.write_bytes(b"checkpoint placeholder")
+    resumed = build_gui_scan_config(
+        input_path=str(source),
+        output_path=str(report),
+        source_type="folder",
+        targets=frozenset({"bitcoin-core", "electrum", "secrets"}),
+        include_mnemonic=True,
+        include_bitcoin_context=False,
+        workers=2,
+        file_workers=4,
+        checkpoint_path=str(checkpoint),
+        resume_checkpoint=True,
+    )
+
+    assert resumed.source_type is SourceType.FOLDER
+    assert resumed.checkpoint is None
+    assert resumed.resume_checkpoint == checkpoint
