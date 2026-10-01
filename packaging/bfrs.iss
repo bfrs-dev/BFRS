@@ -37,15 +37,15 @@ WizardStyle=modern
 ArchitecturesAllowed={#AllowedArch}
 ArchitecturesInstallIn64BitMode={#AllowedArch}
 PrivilegesRequired=lowest
-UninstallDisplayIcon={app}\BFRS.exe
+UninstallDisplayIcon={app}\bfrs.ico
 SetupIconFile={#IconFile}
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\BFRS"; Filename: "{app}\BFRS.exe"
-Name: "{userdesktop}\BFRS"; Filename: "{app}\BFRS.exe"; Tasks: desktopicon
+Name: "{autoprograms}\BFRS"; Filename: "{app}\BFRS.exe"; IconFilename: "{app}\bfrs.ico"
+Name: "{userdesktop}\BFRS"; Filename: "{app}\BFRS.exe"; IconFilename: "{app}\bfrs.ico"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
