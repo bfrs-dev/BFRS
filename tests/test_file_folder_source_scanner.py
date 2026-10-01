@@ -256,6 +256,46 @@ def test_folder_resume_rejects_changed_source_snapshot(tmp_path, capsys):
     assert not resumed.exists()
 
 
+def test_folder_checkpoint_must_be_outside_source_root(tmp_path, capsys):
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "file.bin").write_bytes(b"data")
+
+    with pytest.raises(SystemExit) as raised:
+        main(basic_arguments(root, tmp_path / "report.json") + [
+            "--source-type", "folder",
+            "--targets", "secrets",
+            "--checkpoint", str(root / "checkpoint.sqlite"),
+        ])
+
+    assert raised.value.code == 2
+    assert "folder checkpoint must be outside" in capsys.readouterr().err
+
+
+def test_completed_folder_checkpoint_cannot_be_resumed(tmp_path, capsys):
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "file.bin").write_bytes(b"data")
+    checkpoint = tmp_path / "folder.checkpoint.sqlite"
+    report = tmp_path / "first.json"
+
+    assert main(basic_arguments(root, report) + [
+        "--source-type", "folder",
+        "--targets", "secrets",
+        "--checkpoint", str(checkpoint),
+    ]) == 0
+
+    second = tmp_path / "second.json"
+    assert main(basic_arguments(root, second) + [
+        "--source-type", "folder",
+        "--targets", "secrets",
+        "--resume-checkpoint", str(checkpoint),
+    ]) == 3
+
+    assert "already complete" in capsys.readouterr().err
+    assert not second.exists()
+
+
 def test_image_source_regression_remains_image(tmp_path):
     image = tmp_path / "source.img"
     image.write_bytes(b"no wallet")
