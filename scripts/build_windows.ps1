@@ -90,9 +90,15 @@ try {
 
     $appDir = Join-Path $distRoot "BFRS"
     $exe = Join-Path $appDir "BFRS.exe"
+    $iconFile = Join-Path $Root "packaging\bfrs.ico"
     if (-not (Test-Path $exe -PathType Leaf)) {
         throw "Expected executable not found: $exe"
     }
+    if (-not (Test-Path $iconFile -PathType Leaf)) {
+        throw "Expected application icon not found: $iconFile"
+    }
+
+    Copy-Item $iconFile (Join-Path $appDir "bfrs.ico") -Force
 
     Write-Host "Verifying executable architecture..."
     & $PythonExe "scripts\pe_machine.py" $exe --expect $expectedPe
