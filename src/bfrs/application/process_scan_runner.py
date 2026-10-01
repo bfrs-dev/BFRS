@@ -87,12 +87,14 @@ class ProcessScanRunner:
         event_sink: EventSink | None = None,
         context: BaseContext | None = None,
         poll_seconds: float = 0.05,
+        worker_entry: Callable | None = None,
     ) -> None:
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be greater than zero")
         self._event_sink = event_sink
         self._context = context or multiprocessing.get_context("spawn")
         self._poll_seconds = poll_seconds
+        self._worker_entry = worker_entry or _worker_entry
         self._lock = threading.Lock()
         self._process = None
         self._stop_event = None
@@ -122,7 +124,7 @@ class ProcessScanRunner:
             messages = self._context.Queue()
             stop_event = self._context.Event()
             process = self._context.Process(
-                target=_worker_entry,
+                target=self._worker_entry,
                 args=(config, messages, stop_event),
                 name="bfrs-scan-worker",
             )
