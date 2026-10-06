@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import threading
 import time
+import sqlite3
 
 import pytest
 
@@ -573,3 +574,141 @@ def test_file_workers_run_concurrently_with_bounded_worker_count(tmp_path):
 
     assert scan_folder_source(arguments, child) == 0
     assert 2 <= maximum_active <= 4
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("workers,file_workers", [(4, 2), (0, 4)])
+def test_resume_can_change_worker_counts_without_repeating_completed_files(
+    tmp_path, capsys, legacy, workers, file_workers,
+):
+    root = tmp_path / "source"
+    root.mkdir()
+    for index in range(5):
+        (root / f"file-{index}").write_bytes(valid_wif())
+    checkpoint = tmp_path / "folder.checkpoint.sqlite"
+    first = tmp_path / "first.json"
+    stopped = False
+
+    def stop_after_one(update):
+        nonlocal stopped
+        if update.scanned_bytes > 0:
+            stopped = True
+
+    options = ["--targets", "all", "--workers", "1", "--file-workers", "1"]
+    assert main(basic_arguments(root, first) + options + [
+        "--checkpoint", str(checkpoint),
+    ], _scan_progress=stop_after_one, _scan_should_stop=lambda: stopped) == 130
+    if legacy:
+        # Reproduce the original v1 schema with runtime fields in semantics.
+        with sqlite3.connect(checkpoint) as connection:
+            settings = json.loads(connection.execute(
+                "SELECT value FROM metadata WHERE key = 'semantics_json'"
+            ).fetchone()[0])
+            settings.update(workers=1, file_workers=1)
+            connection.execute("UPDATE metadata SET value=? WHERE key='semantics_json'",
+                               (json.dumps(settings),))
+            connection.execute("DELETE FROM metadata WHERE key='runtime_json'")
+
+    resumed = tmp_path / "resumed.json"
+    assert main(basic_arguments(root, resumed) + [
+        "--targets", "all", "--workers", str(workers),
+        "--file-workers", str(file_workers),
+        "--resume-checkpoint", str(checkpoint),
+    ]) == 0
+    payload = json.loads(resumed.read_text())
+    assert payload["checkpoint"]["resumed_files"] == 1
+    assert payload["files_scanned"] == 5
+    assert len({row["file_path"] for row in payload["target_findings"]
+                if row.get("artifact_kind") == "WIF_PRIVATE_KEY"}) == 5
+    assert "Checkpoint compatible. Runtime parameters changed:" in capsys.readouterr().err
+
+
+def test_resume_still_rejects_changed_detection_settings(tmp_path, capsys):
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "file").write_bytes(valid_wif())
+    checkpoint = tmp_path / "folder.checkpoint.sqlite"
+    from bfrs.cli import build_parser
+    arguments = build_parser().parse_args(basic_arguments(root, tmp_path / "first.json") + [
+        "--targets", "all", "--checkpoint", str(checkpoint),
+    ])
+    assert scan_folder_source(arguments, lambda argv: 130) == 130
+    assert main(basic_arguments(root, tmp_path / "resumed.json") + [
+        "--targets", "secrets", "--resume-checkpoint", str(checkpoint),
+        "--workers", "4", "--file-workers", "2",
+    ]) == 3
+    assert "scanner settings mismatch: targets" in capsys.readouterr().err
+
+
+def test_reused_folder_detectors_match_individual_full_file_scans(tmp_path, monkeypatch):
+    root = tmp_path / "source"
+    root.mkdir()
+    phrase = bip39_phrase("english")
+    fixtures = [
+        b"unrelated content\n" * 8000 + phrase.encode() + b"\n" + valid_wif(),
+        b"ordinary prefix\n" + phrase.encode("utf-16le"),
+        valid_wif(),
+    ]
+    expected = {}
+    for index, data in enumerate(fixtures):
+        source = root / f"file-{index}"
+        source.write_bytes(data)
+        report = tmp_path / f"single-{index}.json"
+        assert main(basic_arguments(source, report) + [
+            "--targets", "all", "--workers", "1",
+        ]) == 0
+        expected[str(source.resolve())] = json.loads(report.read_text())
+
+    # Small folder files must not create mnemonic process pools or child reports.
+    def unexpected(*args, **kwargs):
+        raise AssertionError("per-file process pool or disk report")
+
+    monkeypatch.setattr("bfrs.scanners.target_registry.ProcessPoolExecutor", unexpected)
+    monkeypatch.setattr("bfrs.recovery.mnemonic.raw_mnemonic_scanner.ProcessPoolExecutor", unexpected)
+    monkeypatch.setattr("bfrs.cli.write_json_report", unexpected)
+    report = tmp_path / "folder.json"
+    assert main(basic_arguments(root, report) + [
+        "--targets", "all", "--workers", "4", "--file-workers", "1",
+    ]) == 0
+    payload = json.loads(report.read_text())
+    for row in payload["files"]:
+        before = expected[row["file_path"]]
+        assert row["report"]["target_findings"] == before["target_findings"]
+        assert row["report"]["raw_hit_count"] == before["raw_hit_count"]
+        assert row["report"]["finding_summary"] == before["finding_summary"]
+    assert any(row.get("artifact_kind") == "mnemonic"
+               for row in payload["target_findings"])
+
+
+def test_seed_only_folder_reuses_pipeline_with_local_small_file_decode(tmp_path, monkeypatch):
+    root = tmp_path / "source"
+    root.mkdir()
+    for index in range(2):
+        (root / f"file-{index}").write_text(bip39_phrase("english"))
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("small seed-only file started a process pool")
+
+    monkeypatch.setattr("bfrs.recovery.mnemonic.raw_mnemonic_scanner.ProcessPoolExecutor", unexpected)
+    report = tmp_path / "folder.json"
+    assert main(basic_arguments(root, report) + [
+        "--seed-scan-only", "--workers", "4",
+    ]) == 0
+    payload = json.loads(report.read_text())
+    assert payload["files_scanned"] == 2
+    assert all(row["report"]["mnemonic_recovery"]["bip39_valid"] > 0
+               for row in payload["files"])
+
+
+def test_resumed_folder_rates_count_only_newly_scanned_data(tmp_path, monkeypatch, capsys):
+    from bfrs.scanners.folder_source_scanner import _FolderProgress, _ScanOutcome
+    clock = iter((100.0, 101.0))
+    monkeypatch.setattr("bfrs.scanners.folder_source_scanner.time.monotonic",
+                        lambda: next(clock))
+    progress = _FolderProgress(tmp_path, files=4, total_bytes=4 * 2**20)
+    progress.restore([
+        _ScanOutcome(index, tmp_path / f"file-{index}", 2**20, 0, report={})
+        for index in (1, 2)
+    ])
+    progress.update(_ScanOutcome(3, tmp_path / "file-3", 2**20, 0, report={}))
+    assert "files/s=1.0 MiB/s=1.0" in capsys.readouterr().err

@@ -516,6 +516,10 @@ def main(
     _scan_progress: Callable[[ScanProgress], None] | None = None,
     _scan_should_stop: Callable[[], bool] | None = None,
     _scan_error: Callable[[str], None] | None = None,
+    _selection_override=None,
+    _report_sink: Callable[[dict], None] | None = None,
+    _seed_pipeline: MnemonicRecoveryPipeline | None = None,
+    _seed_workers: int | None = None,
 ) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
@@ -544,13 +548,13 @@ def main(
                     "folder checkpoint must be outside the source root"
                 )
         from bfrs.scanners.folder_source_scanner import scan_folder_source
+        from bfrs.application.folder_file_scanner import FolderFileScanner
         return scan_folder_source(
             arguments,
-            lambda child_argv: main(
-                child_argv,
-                _folder_child=True,
-                _scan_should_stop=_scan_should_stop,
-                _scan_error=_scan_error,
+            FolderFileScanner(
+                arguments,
+                should_stop=_scan_should_stop,
+                on_error=_scan_error,
             ),
             progress_callback=_scan_progress,
         )
@@ -591,7 +595,8 @@ def main(
         print(f"report path: {report_path}")
         return 0
 
-    selection = _selection(parser, arguments)
+    selection = (_selection_override if _selection_override is not None
+                 else _selection(parser, arguments))
     try:
         file_size = arguments.input.stat().st_size
     except OSError as error:
@@ -604,7 +609,8 @@ def main(
 
     if arguments.seed_scan_only:
         range_end = file_size if arguments.end is None else arguments.end
-        worker_count = resolve_worker_count(arguments.workers)
+        seed_workers = arguments.workers if _seed_workers is None else _seed_workers
+        worker_count = resolve_worker_count(seed_workers)
         chunk_size = arguments.chunk_mib * 1024 * 1024
         overlap = arguments.overlap_kib * 1024
         checkpoint = None
@@ -645,11 +651,12 @@ def main(
                 raise _ScanStopRequested
 
         try:
-            result = MnemonicRecoveryPipeline(
+            pipeline = _seed_pipeline or MnemonicRecoveryPipeline(
                 chunk_size=chunk_size,
                 overlap=overlap,
-            ).scan(arguments.input, start=arguments.start, end=arguments.end,
-                   progress=seed_progress_update, workers=arguments.workers,
+            )
+            result = pipeline.scan(arguments.input, start=arguments.start, end=arguments.end,
+                   progress=seed_progress_update, workers=seed_workers,
                    resume_results=(checkpoint.completed_results if checkpoint else None),
                    unit_complete=(checkpoint.record if checkpoint else None))
         except _ScanStopRequested:
@@ -683,6 +690,9 @@ def main(
             "configuration": _configuration(arguments, selection),
             "mnemonic_recovery": result.recovery.safe_dict(),
         }
+        if _report_sink is not None:
+            _report_sink(payload)
+            return 0
         try:
             arguments.output.parent.mkdir(parents=True, exist_ok=True)
             arguments.output.write_text(json.dumps(payload, indent=2, sort_keys=True),
@@ -826,6 +836,9 @@ def main(
         unified_checkpoint.mark_complete()
 
     configuration = _configuration(arguments, selection)
+    if _report_sink is not None:
+        _report_sink(serialize_full_image_result(result, configuration))
+        return 0
     public_report = serialize_full_image_result(result, configuration)
     wallet_recovery = recovery_not_requested()
     if arguments.recover_wallets:

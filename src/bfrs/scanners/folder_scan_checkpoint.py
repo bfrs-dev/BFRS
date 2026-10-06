@@ -13,6 +13,17 @@ from typing import Mapping, Sequence
 
 
 _SCHEMA_VERSION = 1
+_RUNTIME_SETTINGS = frozenset({"workers", "file_workers"})
+
+
+def _scan_semantics(settings: Mapping[str, object]) -> dict[str, object]:
+    return {key: value for key, value in settings.items()
+            if key not in _RUNTIME_SETTINGS}
+
+
+def _runtime_settings(settings: Mapping[str, object]) -> dict[str, object]:
+    return {key: value for key, value in settings.items()
+            if key in _RUNTIME_SETTINGS}
 
 
 class FolderCheckpointError(RuntimeError):
@@ -61,6 +72,7 @@ class FolderScanCheckpoint:
         self.path = path
         self._connection = connection
         self._lock = threading.Lock()
+        self.runtime_changes: dict[str, tuple[object, object]] = {}
 
     @classmethod
     def create(
@@ -90,7 +102,8 @@ class FolderScanCheckpoint:
                 "schema_version": str(_SCHEMA_VERSION),
                 "source_root": str(root.resolve(strict=False)),
                 "snapshot_sha256": snapshot_sha256,
-                "semantics_json": _canonical_json(semantics),
+                "semantics_json": _canonical_json(_scan_semantics(semantics)),
+                "runtime_json": _canonical_json(_runtime_settings(semantics)),
                 "state": "IN_PROGRESS",
             })
             return checkpoint
@@ -136,14 +149,28 @@ class FolderScanCheckpoint:
                 f"cannot read folder checkpoint: {error}"
             ) from error
 
+        # Version 1 checkpoints originally included worker counts in semantics.
+        # Normalize both sides so existing in-progress scans remain resumable.
+        try:
+            stored_semantics = json.loads(metadata["semantics_json"])
+            stored_runtime = json.loads(metadata.get(
+                "runtime_json", _canonical_json(_runtime_settings(stored_semantics))
+            ))
+            if not isinstance(stored_semantics, dict) or not isinstance(stored_runtime, dict):
+                raise ValueError("settings must be objects")
+        except (KeyError, TypeError, ValueError, AttributeError) as error:
+            checkpoint.close()
+            raise FolderCheckpointError("invalid checkpoint scanner settings") from error
+
         expected = {
             "schema_version": str(_SCHEMA_VERSION),
             "source_root": str(root.resolve(strict=False)),
             "snapshot_sha256": snapshot_sha256,
-            "semantics_json": _canonical_json(semantics),
+            "semantics_json": _canonical_json(_scan_semantics(semantics)),
         }
         for key, value in expected.items():
-            actual = metadata.get(key)
+            actual = (_canonical_json(_scan_semantics(stored_semantics))
+                      if key == "semantics_json" else metadata.get(key))
             if actual != value:
                 checkpoint.close()
                 if key == "source_root":
@@ -151,7 +178,12 @@ class FolderScanCheckpoint:
                 elif key == "snapshot_sha256":
                     reason = "folder contents changed since checkpoint creation"
                 elif key == "semantics_json":
-                    reason = "scanner settings mismatch"
+                    requested = _scan_semantics(semantics)
+                    stored = _scan_semantics(stored_semantics)
+                    changed = sorted(key for key in stored.keys() | requested.keys()
+                                     if stored.get(key) != requested.get(key)
+                                     or (key in stored) != (key in requested))
+                    reason = "scanner settings mismatch: " + ", ".join(changed)
                 else:
                     reason = "checkpoint schema mismatch"
                 raise FolderCheckpointError(reason)
@@ -160,6 +192,11 @@ class FolderScanCheckpoint:
             raise FolderCheckpointError(
                 "folder checkpoint is already complete"
             )
+        checkpoint.runtime_changes = {
+            key: (stored_runtime[key], value)
+            for key, value in _runtime_settings(semantics).items()
+            if key in stored_runtime and stored_runtime[key] != value
+        }
         return checkpoint
 
     def _configure(self) -> None:
