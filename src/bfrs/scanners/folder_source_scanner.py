@@ -72,6 +72,8 @@ class _FolderProgress:
         self._last_rendered = 0.0
         self._completed = 0
         self._completed_bytes = 0
+        self._restored_files = 0
+        self._restored_bytes = 0
         self._raw_hits = 0
         self._validated = 0
         self._rendered = False
@@ -91,12 +93,16 @@ class _FolderProgress:
                         for item in findings
                         if isinstance(item, dict)
                     )
+        self._restored_files = self._completed
+        self._restored_bytes = self._completed_bytes
 
     def initial(self, skipped: int) -> None:
         percent = (
             100.0 if self._files == 0
             else self._completed * 100.0 / self._files
         )
+        byte_percent = (100.0 if self._total_bytes == 0 else
+                        self._completed_bytes * 100.0 / self._total_bytes)
         if self._progress_callback is not None:
             self._progress_callback(ScanProgress(
                 scanned_bytes=self._completed_bytes,
@@ -108,7 +114,7 @@ class _FolderProgress:
         print(
             "Folder scan: "
             f"files={self._completed}/{self._files} ({percent:.1f}%) "
-            f"bytes={self._completed_bytes}/{self._total_bytes} ({percent:.1f}%) "
+            f"bytes={self._completed_bytes}/{self._total_bytes} ({byte_percent:.1f}%) "
             f"files/s=0.0 MiB/s=0.0 raw_hits={self._raw_hits} "
             f"validated={self._validated} "
             f"skipped={skipped}",
@@ -143,6 +149,8 @@ class _FolderProgress:
                 return
             self._last_rendered = now
             elapsed = max(now - self._started, 1e-9)
+            new_files = self._completed - self._restored_files
+            new_bytes = self._completed_bytes - self._restored_bytes
             file_percent = (100.0 if self._files == 0 else
                             self._completed * 100.0 / self._files)
             byte_percent = (100.0 if self._total_bytes == 0 else
@@ -155,8 +163,8 @@ class _FolderProgress:
                 "\rFolder scan: "
                 f"files={self._completed}/{self._files} ({file_percent:.1f}%) "
                 f"bytes={self._completed_bytes}/{self._total_bytes} "
-                f"({byte_percent:.1f}%) files/s={self._completed / elapsed:.1f} "
-                f"MiB/s={self._completed_bytes / 2**20 / elapsed:.1f} "
+                f"({byte_percent:.1f}%) files/s={new_files / elapsed:.1f} "
+                f"MiB/s={new_bytes / 2**20 / elapsed:.1f} "
                 f"raw_hits={self._raw_hits} validated={self._validated} "
                 f"current={current}",
                 end="\n" if complete else "",
@@ -291,19 +299,23 @@ def _scan_batch(
     batch: tuple[tuple[int, Path, int, int], ...],
     temporary_root: Path,
     arguments,
-    child_main: Callable[[Sequence[str] | None], int],
+    child_main: Callable[[Sequence[str] | None], int | dict],
     progress: Callable[[_ScanOutcome], None],
 ) -> list[_ScanOutcome]:
     outcomes = []
     for index, source, size, mtime_ns in batch:
         child_report_path = temporary_root / f"report-{index:09d}.json"
         try:
-            code = child_main(_child_arguments(arguments, source, child_report_path))
-            if code == 130:
-                raise FolderScanStopped
-            if code != 0:
-                raise OSError(f"CHILD_SCAN_EXIT_{code}")
-            child_report = json.loads(child_report_path.read_text(encoding="utf-8"))
+            result = child_main(_child_arguments(arguments, source, child_report_path))
+            if isinstance(result, dict):
+                child_report = result
+            else:
+                if result == 130:
+                    raise FolderScanStopped
+                if result != 0:
+                    raise OSError(f"CHILD_SCAN_EXIT_{result}")
+                child_report = json.loads(child_report_path.read_text(encoding="utf-8"))
+                child_report_path.unlink()
             child_findings = child_report.get("target_findings", [])
             if not isinstance(child_findings, list):
                 raise ValueError("INVALID_CHILD_REPORT")
@@ -325,7 +337,7 @@ def _scan_files_bounded(
     files: Sequence[tuple[Path, int, int]],
     temporary_root: Path,
     arguments,
-    child_main: Callable[[Sequence[str] | None], int],
+    child_main: Callable[[Sequence[str] | None], int | dict],
     progress: Callable[[_ScanOutcome], None],
     *,
     index_map: Mapping[Path, int] | None = None,
@@ -438,7 +450,7 @@ def _checkpoint_outcome(
 
 def scan_folder_source(
     arguments,
-    child_main: Callable[[Sequence[str] | None], int],
+    child_main: Callable[[Sequence[str] | None], int | dict],
     *,
     progress_callback: Callable[[ScanProgress], None] | None = None,
 ) -> int:
@@ -470,6 +482,13 @@ def scan_folder_source(
                 snapshot_sha256=snapshot_sha256,
                 semantics=semantics,
             )
+            if checkpoint.runtime_changes:
+                changes = ", ".join(
+                    f"{key} {old} -> {new}"
+                    for key, (old, new) in sorted(checkpoint.runtime_changes.items())
+                )
+                print(f"Checkpoint compatible. Runtime parameters changed: {changes}",
+                      file=sys.stderr)
             by_relative = {
                 source.relative_to(root).as_posix(): (source, size, mtime_ns)
                 for source, size, mtime_ns in files
@@ -658,6 +677,7 @@ def scan_folder_source(
             "file_batch_limit": _BATCH_FILE_LIMIT,
             "file_batch_byte_limit": _BATCH_BYTE_LIMIT,
             "maximum_queued_batches": arguments.file_workers * _QUEUE_MULTIPLIER,
+            "small_file_mnemonic_workers": 1,
         },
         "checkpoint": {
             "supported": True,

@@ -101,7 +101,12 @@ overlap policy.
 `--file-workers` controls bounded parallel processing of separate files in a
 folder scan. Each worker creates isolated scanner and detector state; findings
 cannot cross file boundaries. `--workers` keeps its existing meaning and
-controls mnemonic processing inside each file scan. Start with two file workers
+controls mnemonic processing inside each file scan. Files no larger than one
+chunk use local mnemonic decoding to avoid per-file process startup; larger
+files retain the requested mnemonic worker count. Detector indexes are reused
+within each file worker and per-file reports are passed in memory. Every file
+is still read in full with the same detection and validation rules.
+Start with two file workers
 for rotational media, measure locally, and use four only when the storage and
 CPU benefit from it. Image and single-file scans accept neither parallel folder
 work nor folder batching.
@@ -142,9 +147,22 @@ byte count and ETA is based on newly processed bytes. Format 3 checkpoints did
 not retain complete state for noisy units and are rejected with an explicit
 legacy-replay message instead of being presented as true resume.
 
-**FOLDER resume is not yet supported.** Folder checkpoint/resume is deferred to
-P2.7.1; existing image and individual-file checkpoint validation remains
-unchanged.
+Folder scans support SQLite checkpoints with durable outcomes for each completed
+file. Keep the checkpoint and report outside the source folder. Resume requires
+the same discovered file paths, sizes, modification times, and detection
+settings; completed files are skipped. `--workers` and `--file-workers` may be
+changed when resuming, including checkpoints created by earlier GUI builds.
+Changed detection settings are rejected with the names of the mismatched fields.
+
+```powershell
+bfrs --input D:\RecoveredFiles --source-type folder --targets all `
+  --output D:\bfrs-work\folder-report.json --file-workers 2 --workers 1 `
+  --checkpoint D:\bfrs-work\folder.checkpoint.sqlite
+
+bfrs --input D:\RecoveredFiles --source-type folder --targets all `
+  --output D:\bfrs-work\folder-report.json --file-workers 4 --workers 2 `
+  --resume-checkpoint D:\bfrs-work\folder.checkpoint.sqlite
+```
 
 A mnemonic-only scan is available when wallet/container recovery is not
 required:
