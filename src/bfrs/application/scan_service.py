@@ -151,7 +151,7 @@ class ScanService:
             return ScanRunResult(exit_code, config.output_path, "failed")
 
         status, processed_bytes, total_bytes = _read_completion_metadata(
-            config.output_path
+            config.output_path, folder_source=config.input_path.is_dir()
         )
         self._emit(ScanCompletedEvent(
             report_path=config.output_path,
@@ -296,8 +296,12 @@ def _run_current_cli(
 
 
 def _read_completion_metadata(
-    report_path: Path,
+    report_path: Path, *, folder_source: bool = False,
 ) -> tuple[str, int | None, int | None]:
+    # Folder completion is guaranteed by exit code and atomic report publication.
+    # Its multi-gigabyte per-file payload must not be reparsed for metadata.
+    if folder_source:
+        return "completed", None, None
     try:
         payload = json.loads(report_path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError):

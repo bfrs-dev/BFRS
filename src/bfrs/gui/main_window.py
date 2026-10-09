@@ -567,15 +567,21 @@ class MainWindow(QMainWindow):
             self.status_label.setText(self._t("scanning"))
             return
         if isinstance(event, ScanProgressEvent):
+            self.progress_bar.setRange(0, 0 if event.stage == "folder-discovery" else 1000)
             self.progress_bar.setValue(round(event.percent_complete * 10))
             counts = dict(event.raw_by_target)
             targets = " ".join(
                 f"{name}={count}" for name, count in counts.items()
             ) or self._t("none")
             stage = event.stage or self._t("scan_phase")
+            units = f"{event.scanned_bytes}/{event.total_bytes} B"
+            if stage in ("folder-discovery", "folder-checkpoint-restore", "folder-report"):
+                self.status_label.setText(self._t(stage))
+                stage = self._t(stage)
+                units = self._t("progress_records", done=event.scanned_bytes, total=event.total_bytes)
             self.detail_label.setText(
                 f"{event.percent_complete:.1f}% | "
-                f"{event.scanned_bytes}/{event.total_bytes} B | "
+                f"{units} | "
                 f"raw_hits={event.raw_hits} | {targets} | "
                 f"{self._t('phase')}={stage}"
             )
@@ -611,6 +617,9 @@ class MainWindow(QMainWindow):
                     path=report_path,
                 )
             )
+            if report_path and Path(report_path).stat().st_size > 64 * 1024 * 1024:
+                self.status_label.setText(self._t("large_report_saved", path=report_path))
+                return
             if report_path and self.result_browser.load_report(report_path):
                 self.tabs.setCurrentWidget(self.result_browser)
 
