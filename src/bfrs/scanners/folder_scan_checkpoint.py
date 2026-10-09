@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
 
 _SCHEMA_VERSION = 1
@@ -202,6 +202,8 @@ class FolderScanCheckpoint:
     def _configure(self) -> None:
         self._connection.execute("PRAGMA synchronous=FULL")
         self._connection.execute("PRAGMA foreign_keys=ON")
+        self._connection.execute("PRAGMA cache_size=-2048")
+        self._connection.execute("PRAGMA temp_store=FILE")
 
     def _create_schema(self) -> None:
         with self._connection:
@@ -278,45 +280,51 @@ class FolderScanCheckpoint:
                 f"cannot save folder checkpoint outcome: {error}"
             ) from error
 
-    def records(self) -> tuple[FolderCheckpointRecord, ...]:
+    def record_count(self) -> int:
+        return int(self._connection.execute("SELECT COUNT(*) FROM outcomes").fetchone()[0])
+
+    def records(self) -> Iterator[FolderCheckpointRecord]:
         try:
             rows = self._connection.execute(
                 """
                 SELECT relative_path, size, mtime_ns, report_json, error_reason
                 FROM outcomes
-                ORDER BY relative_path COLLATE NOCASE, relative_path
+                ORDER BY relative_path
                 """
-            ).fetchall()
+            )
         except sqlite3.Error as error:
             raise FolderCheckpointError(
                 f"cannot load folder checkpoint outcomes: {error}"
             ) from error
 
-        records: list[FolderCheckpointRecord] = []
-        for relative_path, size, mtime_ns, report_json, error_reason in rows:
-            report = None
-            if report_json is not None:
-                try:
-                    value = json.loads(report_json)
-                except json.JSONDecodeError as error:
-                    raise FolderCheckpointError(
-                        "folder checkpoint contains invalid report JSON"
-                    ) from error
-                if not isinstance(value, dict):
-                    raise FolderCheckpointError(
-                        "folder checkpoint report payload is not an object"
-                    )
-                report = value
-            records.append(FolderCheckpointRecord(
-                relative_path=str(relative_path),
-                size=int(size),
-                mtime_ns=int(mtime_ns),
-                report=report,
-                error_reason=(
-                    None if error_reason is None else str(error_reason)
-                ),
-            ))
-        return tuple(records)
+        try:
+            for relative_path, size, mtime_ns, report_json, error_reason in rows:
+                report = None
+                if report_json is not None:
+                    try:
+                        value = json.loads(report_json)
+                    except json.JSONDecodeError as error:
+                        raise FolderCheckpointError(
+                            "folder checkpoint contains invalid report JSON"
+                        ) from error
+                    if not isinstance(value, dict):
+                        raise FolderCheckpointError(
+                            "folder checkpoint report payload is not an object"
+                        )
+                    report = value
+                yield FolderCheckpointRecord(
+                    relative_path=str(relative_path),
+                    size=int(size),
+                    mtime_ns=int(mtime_ns),
+                    report=report,
+                    error_reason=(
+                        None if error_reason is None else str(error_reason)
+                    ),
+                )
+        except sqlite3.Error as error:
+            raise FolderCheckpointError(f"cannot load folder checkpoint outcomes: {error}") from error
+        finally:
+            rows.close()
 
     def mark_complete(self) -> None:
         self._write_metadata({"state": "COMPLETE"})
