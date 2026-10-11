@@ -164,6 +164,86 @@ bfrs --input D:\RecoveredFiles --source-type folder --targets all `
   --resume-checkpoint D:\bfrs-work\folder.checkpoint.sqlite
 ```
 
+Analyze an existing large report without loading its file array or duplicate
+finding lists into RAM:
+
+```powershell
+py -m pip install "ijson>=3.3,<4"
+py .\scripts\analyze_large_report.py
+```
+
+The script opens a file picker. Alternatively pass `--input report.json` and
+`--output-dir new-analysis-folder`. It creates `podsumowanie.txt` and
+`podsumowanie.json`, a per-file review list (`najwazniejsze_pliki.jsonl`),
+projected review findings (`wyniki_do_sprawdzenia.jsonl`), and a separate
+mnemonic candidate view (`kandydaci_seedow.jsonl`) and likely-noise list
+(`seedy_prawdopodobnie_przypadkowe.jsonl`). It reads the
+existing JSON report once, displays byte progress, and uses a temporary SQLite
+index for unique secret fingerprints. An existing output folder is rejected;
+truncated or invalid JSON does not publish a partial analysis. The original
+report and scanned source files are not modified or rescanned.
+
+It also exports all canonical private-key findings, including raw and rejected
+anchors, to `sygnatury_kluczy.jsonl`. `diagnostyka_kluczy.jsonl` contains the
+existing DER and inner-fragment recovery counters, read failures, truncations,
+and rejection reasons for files with relevant diagnostics. These details are
+also summarized in `podsumowanie.json` under `key_diagnostics`. Root recovery
+module totals and per-file totals remain separate because they may overlap.
+An `UNCHECKED` DER anchor can coexist with a completed recovery-module check;
+consult these diagnostics before concluding that validation was never attempted.
+Missing diagnostics are not interpreted as either a successful check or rejection.
+
+Once the recovered source folder is available, verify the existing DER anchors
+directly, without another directory scan:
+
+```powershell
+py .\scripts\verify_der_findings.py
+```
+
+Select `sygnatury_kluczy.jsonl` from the report analysis and then select the
+recovered source folder. Alternatively provide `--findings`, `--source-root`,
+and an optional new `--output-dir` outside the source folder. The verifier reads
+at most 1,028 bytes per distinct finding and uses the checked-out BFRS validators
+to test both complete historical DER and surviving inner fragments. It requires
+the expected curve, a valid private scalar and a matching embedded public key.
+The output folder contains `podsumowanie_der.json` and `weryfikacja_der.jsonl`;
+these contain public statuses, locations, rejection counts and window hashes,
+without source bytes or private keys. Missing files, shifted offsets and changed
+anchors remain explicit unresolved states. No balance checks are performed.
+
+To check Core/Electrum anchors independently of seed and DER findings:
+
+```powershell
+py .\scripts\verify_wallet_findings.py
+```
+
+Select the full directory report (`Disk_Drill_Hp.bfrs.json`) and the recovered
+source folder. Alternatively provide `--report`, `--source-root`, and a new
+`--output-dir` outside the source folder. This requires ijson and the checked-out
+repository, and runs independently of the installed GUI. It streams the full
+report once into a temporary disk-backed queue, ignores duplicate per-file
+finding views, and checks only canonical `berkeley_metadata`, `wallet_record`,
+and `electrum_wallet_anchor` locations. Reads are bounded to 64 KiB, 79 bytes,
+and 2 MiB respectively. Byte progress is followed by verification progress.
+The two output files are `podsumowanie_portfeli.json` and
+`weryfikacja_portfeli.jsonl`; neither exports source contents or secrets.
+Invalid JSON never publishes partial output. Berkeley metadata proves a database
+format; a valid record key side proves public-key framing; Electrum candidates
+prove only format-specific structure. None proves a used or funded wallet.
+Multiple anchors may describe one object, and checks in bounded windows do not
+exclude larger or damaged objects. Source files and the original report stay
+read-only; no new directory scan or balance lookup is performed.
+
+Only the canonical top-level `target_findings` list is counted; copies in
+per-file reports are ignored. Full per-file summary counts can include noise
+that was already aggregated out of that list. Mnemonic candidate views and
+wallet/private-key recovery diagnostics overlap the canonical list and are not
+added to it. Review lists are projections of the existing public validation
+results, not fresh cryptographic checks or evidence of funded/used wallets.
+The script runs independently of the installed GUI and can be copied to a
+second Windows machine with Python and ijson; rebuilding the installer is not
+required. Share the small summary for initial triage instead of the full report.
+
 A mnemonic-only scan is available when wallet/container recovery is not
 required:
 
