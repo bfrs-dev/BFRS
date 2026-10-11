@@ -193,6 +193,24 @@ An `UNCHECKED` DER anchor can coexist with a completed recovery-module check;
 consult these diagnostics before concluding that validation was never attempted.
 Missing diagnostics are not interpreted as either a successful check or rejection.
 
+Once the recovered source folder is available, verify the existing DER anchors
+directly, without another directory scan:
+
+```powershell
+py .\scripts\verify_der_findings.py
+```
+
+Select `sygnatury_kluczy.jsonl` from the report analysis and then select the
+recovered source folder. Alternatively provide `--findings`, `--source-root`,
+and an optional new `--output-dir` outside the source folder. The verifier reads
+at most 1,028 bytes per distinct finding and uses the checked-out BFRS validators
+to test both complete historical DER and surviving inner fragments. It requires
+the expected curve, a valid private scalar and a matching embedded public key.
+The output folder contains `podsumowanie_der.json` and `weryfikacja_der.jsonl`;
+these contain public statuses, locations, rejection counts and window hashes,
+without source bytes or private keys. Missing files, shifted offsets and changed
+anchors remain explicit unresolved states. No balance checks are performed.
+
 Only the canonical top-level `target_findings` list is counted; copies in
 per-file reports are ignored. Full per-file summary counts can include noise
 that was already aggregated out of that list. Mnemonic candidate views and
