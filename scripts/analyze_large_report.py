@@ -39,10 +39,55 @@ ROW_FIELDS = {
     "physical_start", "physical_end", "safe_fingerprint", "fingerprint",
     "mnemonic_standard", "word_count", "language", "encoding", "recovery_relevance",
     "candidate_id", "duplicate_count", "completeness",
+    "recommended_recovery_action", "confidence",
 }
 METADATA_FIELDS = {
     "mnemonic_standard", "word_count", "language", "encoding", "recovery_relevance",
 }
+KEY_KINDS = {"ec_private_key_der", "wif_private_key", "private_key"}
+KEY_MODULE_FIELDS = {
+    "orphan_private_key_recovery": {
+        "raw_der_anchor_count", "candidate_der_count", "valid_secp256k1_der_count",
+        "canonical_der_count", "valid_with_embedded_pubkey_count",
+        "valid_without_embedded_pubkey_count",
+    },
+    "orphan_private_key_fragment_recovery": {
+        "raw_inner_anchor_count", "candidate_inner_fragment_count", "valid_inner_fragment_count",
+    },
+}
+KEY_DIAGNOSTIC_FIELDS = {"maximum_read_size", "read_failure_count", "truncated_read_count"}
+
+
+def _key_detail(row: dict, key: str, value) -> None:
+    # Capture only counters and reason codes, never key bytes or arbitrary evidence.
+    if key in KEY_MODULE_FIELDS[row["module"]]:
+        row[key] = value
+    elif key.startswith("diagnostics.") and key[12:] in KEY_DIAGNOSTIC_FIELDS:
+        row.setdefault("diagnostics", {})[key[12:]] = value
+    elif key == "reasons.item" and isinstance(value, str):
+        if len(row.setdefault("reasons", [])) < 100:
+            row["reasons"].append(value)
+    elif key == "diagnostics.rejection_counts.item.item":
+        # BFRS stores rejection_counts as [[reason, count], ...]. Only a
+        # single pair is retained while the module is being streamed.
+        if isinstance(value, str):
+            row["_rejection_reason"] = value
+        elif isinstance(value, int) and not isinstance(value, bool):
+            reason = row.pop("_rejection_reason", None)
+            if reason is not None:
+                row.setdefault("rejection_counts", {})[reason] = value
+    elif key.startswith("diagnostics.rejection_counts."):
+        # Also accept an object-shaped counter from other report versions.
+        reason = key[len("diagnostics.rejection_counts."):]
+        if "." not in reason and isinstance(value, int) and not isinstance(value, bool):
+            row.setdefault("rejection_counts", {})[reason] = value
+
+
+def _interesting_key_detail(row: dict) -> bool:
+    return any(row.get(key, 0) for key in KEY_MODULE_FIELDS[row["module"]]) or any(
+        row.get("diagnostics", {}).get(key, 0)
+        for key in {"read_failure_count", "truncated_read_count"}
+    ) or bool(row.get("rejection_counts"))
 ROOT_FIELDS = {
     "source", "source_root", "source_type", "report_schema_version", "file_count",
     "files_discovered", "files_scanned", "files_failed", "files_skipped",
@@ -88,6 +133,9 @@ def _project(row: dict, key: str, value) -> None:
         row.setdefault("normalized_state", {})[key.split(".", 1)[1]] = value
     elif key.startswith("safe_metadata.") and key.split(".", 1)[1] in METADATA_FIELDS:
         row.setdefault("safe_metadata", {})[key.split(".", 1)[1]] = value
+    elif key == "reason_codes.item" and isinstance(value, str):
+        if len(row.setdefault("reason_codes", [])) < 100:
+            row["reason_codes"].append(value)
 
 
 def _state(row: dict) -> dict:
@@ -168,6 +216,13 @@ def analyze_report(source: Path, output_dir: Path, *, progress=None) -> dict:
     sample_file_buckets = {key: [] for key in ("SECRET_REVIEW", "WALLET_STRUCTURE", "OTHER_REVIEW", "SEED_NOISE")}
     current_file = None
     current_details = {}
+    current_key_details = []
+    current_der_rows = 0
+    key_detail = None
+    key_detail_prefix = None
+    key_counts = Counter()
+    key_rejections = Counter()
+    key_samples = []
     row = None
     row_prefix = None
     seen_views = set()
@@ -185,6 +240,35 @@ def analyze_report(source: Path, output_dir: Path, *, progress=None) -> dict:
             noise_stream = resources.enter_context((staging / "seedy_prawdopodobnie_przypadkowe.jsonl").open("x", encoding="utf-8"))
             candidate_stream = resources.enter_context((staging / "kandydaci_seedow.jsonl").open("x", encoding="utf-8"))
             files_stream = resources.enter_context((staging / "najwazniejsze_pliki.jsonl").open("x", encoding="utf-8"))
+            keys_stream = resources.enter_context((staging / "sygnatury_kluczy.jsonl").open("x", encoding="utf-8"))
+            diagnostics_stream = resources.enter_context((staging / "diagnostyka_kluczy.jsonl").open("x", encoding="utf-8"))
+
+            def finish_key_detail(item, file_metadata=None, der_rows=0):
+                item.pop("_rejection_reason", None)
+                module = item["module"]
+                scope = "files:" if file_metadata is not None else "root:"
+                key_counts[scope + module + ":reports_present"] += 1
+                for key in KEY_MODULE_FIELDS[module]:
+                    value = item.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        key_counts[scope + module + ":" + key] += value
+                for key in {"read_failure_count", "truncated_read_count"}:
+                    value = item.get("diagnostics", {}).get(key)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        key_counts[scope + module + ":" + key] += value
+                for reason, count in item.get("rejection_counts", {}).items():
+                    key_rejections[scope + module + ":" + reason] += count
+                if not _interesting_key_detail(item) and not der_rows:
+                    return
+                if file_metadata is not None:
+                    item.update({key: value for key, value in file_metadata.items() if key in FILE_FIELDS})
+                    item["file_der_finding_rows"] = der_rows
+                else:
+                    item["source_view"] = "root_recovery_module"
+                _write_row(diagnostics_stream, item)
+                key_counts["exported_diagnostic_rows"] += 1
+                if len(key_samples) < 10:
+                    key_samples.append(item)
 
             def finish_row(item, view):
                 state = _state(item)
@@ -194,6 +278,12 @@ def analyze_report(source: Path, output_dir: Path, *, progress=None) -> dict:
                 categories[f"{item.get('target', 'unknown')} / {item.get('artifact_kind', 'unknown')}"] += 1
                 for field, value in state.items():
                     counters[f"{field}:{value}"] += 1
+                if str(item.get("artifact_kind", "")).lower() in KEY_KINDS:
+                    _write_row(keys_stream, item)
+                    key_counts["canonical_key_rows"] += 1
+                    key_counts["kind:" + str(item["artifact_kind"]).lower()] += 1
+                    key_counts["crypto_state:" + state["crypto_state"]] += 1
+                    key_counts["discovery_state:" + state["discovery_state"]] += 1
                 valid_secret = (str(item.get("artifact_kind", "")).lower() in SECRET_KINDS
                                 and state["crypto_state"] == "VALID"
                                 and state["discovery_state"] != "REJECTED")
@@ -231,8 +321,22 @@ def analyze_report(source: Path, output_dir: Path, *, progress=None) -> dict:
                             last_progress = now
                     if prefix == "files.item" and event == "start_map":
                         current_file, current_details = {}, {}
+                        current_key_details = []
+                        current_der_rows = 0
                     elif prefix == "files.item" and event == "end_map":
                         counters["files_processed"] += 1
+                        for item in current_key_details:
+                            finish_key_detail(item, current_file, current_der_rows)
+                        if current_der_rows and not current_key_details:
+                            key_counts["files_with_der_findings_but_no_recovery_modules"] += 1
+                            missing = {
+                                **current_file, "module": "NOT_REPORTED",
+                                "file_der_finding_rows": current_der_rows,
+                            }
+                            _write_row(diagnostics_stream, missing)
+                            key_counts["exported_diagnostic_rows"] += 1
+                            if len(key_samples) < 10:
+                                key_samples.append(missing)
                         for key, count in current_details.get("finding_summary", {}).items():
                             if isinstance(count, int) and not isinstance(count, bool):
                                 reported_counts[key] += count
@@ -245,6 +349,19 @@ def analyze_report(source: Path, output_dir: Path, *, progress=None) -> dict:
                             if len(bucket) < 5:
                                 bucket.append(current_file)
                         current_file = None
+                    elif event == "start_map" and prefix in {
+                        *KEY_MODULE_FIELDS,
+                        *("files.item.report." + module for module in KEY_MODULE_FIELDS),
+                        *("files.item." + module for module in KEY_MODULE_FIELDS),
+                    }:
+                        key_detail = {"module": prefix.rsplit(".", 1)[-1]}
+                        key_detail_prefix = prefix
+                    elif key_detail_prefix is not None and prefix == key_detail_prefix and event == "end_map":
+                        if current_file is not None:
+                            current_key_details.append(key_detail)
+                        else:
+                            finish_key_detail(key_detail)
+                        key_detail, key_detail_prefix = None, None
                     elif prefix in {"target_findings", "mnemonic_recovery.candidates"} and event == "start_array":
                         seen_views.add(prefix)
                     # Only the canonical top-level finding list is counted. The
@@ -279,6 +396,11 @@ def analyze_report(source: Path, output_dir: Path, *, progress=None) -> dict:
                             _write_row(candidate_stream if actionable else noise_stream, row)
                         row, row_prefix = None, None
                     elif event in SCALARS:
+                        if (prefix == "files.item.report.target_findings.item.artifact_kind"
+                                and str(value).lower() == "ec_private_key_der"):
+                            current_der_rows += 1
+                        if key_detail_prefix is not None and prefix.startswith(key_detail_prefix + "."):
+                            _key_detail(key_detail, prefix[len(key_detail_prefix) + 1:], value)
                         if row_prefix is not None and prefix.startswith(row_prefix + "."):
                             _project(row, prefix[len(row_prefix) + 1:], value)
                         elif prefix in ROOT_FIELDS:
@@ -310,12 +432,16 @@ def analyze_report(source: Path, output_dir: Path, *, progress=None) -> dict:
         database.unlink()
         sample_files = [item for bucket in sample_file_buckets.values() for item in bucket]
         summary = {
-            "analysis_schema_version": 1,
+            "analysis_schema_version": 2,
             "input_report": str(source), "input_report_bytes": total_bytes,
             "report_metadata": metadata, "reported_finding_counts": dict(reported_counts),
             "retained_finding_counts": dict(counters), "by_target_and_kind": dict(categories),
             "file_priority_counts": dict(priorities),
             "sample_files": sample_files, "sample_findings": sample_findings,
+            "key_diagnostics": {
+                "counts": dict(key_counts), "rejection_counts": dict(key_rejections),
+                "sample_files": key_samples,
+            },
             "notes": [
                 "Statusy walidacji pochodza z raportu; nie wykonano nowego skanu ani sprawdzania salda.",
                 "Kopie target_findings w raportach poszczegolnych plikow nie sa liczone ponownie.",
@@ -323,6 +449,8 @@ def analyze_report(source: Path, output_dir: Path, *, progress=None) -> dict:
                 "Widoki mnemonic_candidates i diagnostyka kluczy/portfeli nakladaja sie na target_findings; nie nalezy ich sumowac.",
                 "SECRET_REVIEW oznacza plik do analizy; sama walidacja seeda nie dowodzi, ze byl uzywanym portfelem.",
                 "Unikalnosc opiera sie na dostepnych fingerprintach; wspolna tozsamosc roznych formatow nie jest wnioskowana.",
+                "UNCHECKED przy sygnaturze DER nie oznacza, ze modul odzyskiwania nie sprawdzil jej otoczenia; sprawdz diagnostyka_kluczy.jsonl.",
+                "Liczby sygnatur i diagnostyka modulow nakladaja sie; nie nalezy ich dodawac. Brak modulu w raporcie nie oznacza odrzucenia klucza.",
             ],
         }
         (staging / "podsumowanie.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -346,10 +474,16 @@ def analyze_report(source: Path, output_dir: Path, *, progress=None) -> dict:
             f"  Po odlozeniu prawdopodobnego szumu: {candidate_actionable}", "",
             "Pelne liczniki z raportu (moga obejmowac zagregowany szum):",
             *[f"  {key}: {value}" for key, value in sorted(reported_counts.items())], "",
+            "Diagnostyka kluczy (osobne, nakladajace sie widoki):",
+            *[f"  {key}: {value}" for key, value in sorted(key_counts.items())],
+            "Przyczyny odrzucen z modulow odzyskiwania:",
+            *[f"  {key}: {value}" for key, value in sorted(key_rejections.items())], "",
             "Pliki wynikowe:", "  podsumowanie.json - liczniki i niewielka probka lokalizacji",
             "  najwazniejsze_pliki.jsonl - pliki z wynikami do sprawdzenia",
             "  wyniki_do_sprawdzenia.jsonl - wybrane publiczne dane znalezisk",
             "  kandydaci_seedow.jsonl - osobny, nakladajacy sie widok seedow",
+            "  sygnatury_kluczy.jsonl - wszystkie kanoniczne trafienia kluczy, takze RAW i REJECTED",
+            "  diagnostyka_kluczy.jsonl - liczniki DER/fragmentow i przyczyny odrzucen dla plikow",
             "  seedy_prawdopodobnie_przypadkowe.jsonl - prawdopodobny szum", "",
             *summary["notes"],
         ]

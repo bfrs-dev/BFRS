@@ -183,6 +183,16 @@ index for unique secret fingerprints. An existing output folder is rejected;
 truncated or invalid JSON does not publish a partial analysis. The original
 report and scanned source files are not modified or rescanned.
 
+It also exports all canonical private-key findings, including raw and rejected
+anchors, to `sygnatury_kluczy.jsonl`. `diagnostyka_kluczy.jsonl` contains the
+existing DER and inner-fragment recovery counters, read failures, truncations,
+and rejection reasons for files with relevant diagnostics. These details are
+also summarized in `podsumowanie.json` under `key_diagnostics`. Root recovery
+module totals and per-file totals remain separate because they may overlap.
+An `UNCHECKED` DER anchor can coexist with a completed recovery-module check;
+consult these diagnostics before concluding that validation was never attempted.
+Missing diagnostics are not interpreted as either a successful check or rejection.
+
 Only the canonical top-level `target_findings` list is counted; copies in
 per-file reports are ignored. Full per-file summary counts can include noise
 that was already aggregated out of that list. Mnemonic candidate views and

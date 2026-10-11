@@ -39,6 +39,7 @@ def run_report(tmp_path, payload, *, bom=False):
         "podsumowanie.txt", "podsumowanie.json", "najwazniejsze_pliki.jsonl",
         "wyniki_do_sprawdzenia.jsonl", "seedy_prawdopodobnie_przypadkowe.jsonl",
         "kandydaci_seedow.jsonl",
+        "sygnatury_kluczy.jsonl", "diagnostyka_kluczy.jsonl",
     }
     return result, output
 
@@ -197,3 +198,100 @@ def test_against_real_bfrs_folder_report(tmp_path):
     assert summary["retained_finding_counts"]["retained_unique_valid_secret_fingerprints"] == 1
     assert summary["retained_finding_counts"]["files_processed"] == 2
     assert summary["reported_finding_counts"]["crypto_valid_secret_occurrences"] == 2
+
+
+def test_raw_der_is_exported_with_existing_rejection_diagnostics_and_late_file_path(tmp_path):
+    row = finding(kind="ec_private_key_der", crypto="UNCHECKED", discovery="RAW")
+    row["normalized_state"]["structural_state"] = "NONE"
+    row["reason_codes"] = ["DER_ANCHOR_ONLY"]
+    module = {
+        "raw_der_anchor_count": 1, "candidate_der_count": 1,
+        "valid_secp256k1_der_count": 0, "reasons": ["no_valid_historical_secp256k1_der"],
+        "diagnostics": {"read_failure_count": 0, "truncated_read_count": 1,
+                        "rejection_counts": [["embedded_public_key_mismatch", 1]],
+                        "private_key": "SYNTHETIC_SECRET_DO_NOT_EXPORT"},
+        "locations": [{"private_bytes": "SYNTHETIC_SECRET_DO_NOT_EXPORT"}],
+    }
+    result, output = run_report(tmp_path, {
+        "source_type": "FOLDER", "files": [{"report": {
+            "target_findings": [row], "orphan_private_key_recovery": module,
+        }, "file_path": "E:\\HP\\żółty.bin", "relative_path": "żółty.bin"}],
+        "target_findings": [row],
+    })
+    keys = [json.loads(line) for line in (output / "sygnatury_kluczy.jsonl").read_text().splitlines()]
+    assert len(keys) == 1
+    assert keys[0]["reason_codes"] == ["DER_ANCHOR_ONLY"]
+    assert keys[0]["normalized_state"]["crypto_state"] == "UNCHECKED"
+    diagnostics = json.loads((output / "diagnostyka_kluczy.jsonl").read_text())
+    assert diagnostics["file_path"] == "E:\\HP\\żółty.bin"
+    assert diagnostics["rejection_counts"] == {"embedded_public_key_mismatch": 1}
+    assert result["key_diagnostics"]["counts"]["canonical_key_rows"] == 1
+    assert result["retained_finding_counts"]["retained_valid_secret_occurrences"] == 0
+    for path in output.iterdir():
+        assert "SYNTHETIC_SECRET_DO_NOT_EXPORT" not in path.read_text()
+
+
+def test_root_and_file_key_diagnostics_are_separate_non_additive_views(tmp_path):
+    module = {"raw_der_anchor_count": 4, "candidate_der_count": 0,
+              "valid_secp256k1_der_count": 0,
+              "diagnostics": {"rejection_counts": {"der_invalid": 2}}}
+    result, output = run_report(tmp_path, {
+        "source_type": "FOLDER", "orphan_private_key_recovery": module,
+        "files": [{"file_path": "file.bin", "report": {"orphan_private_key_recovery": module}}],
+        "target_findings": [],
+    })
+    counts = result["key_diagnostics"]["counts"]
+    assert counts["root:orphan_private_key_recovery:raw_der_anchor_count"] == 4
+    assert counts["files:orphan_private_key_recovery:raw_der_anchor_count"] == 4
+    assert len((output / "diagnostyka_kluczy.jsonl").read_text().splitlines()) == 2
+
+
+def test_fragment_diagnostics_and_zero_module_presence_are_retained(tmp_path):
+    result, output = run_report(tmp_path, {
+        "source_type": "FOLDER", "files": [
+            {"file_path": "empty", "report": {"orphan_private_key_recovery": {
+                "raw_der_anchor_count": 0, "candidate_der_count": 0, "valid_secp256k1_der_count": 0}}},
+            {"file_path": "fragment.bin", "report": {"orphan_private_key_fragment_recovery": {
+                "raw_inner_anchor_count": 1, "candidate_inner_fragment_count": 0,
+                "valid_inner_fragment_count": 0, "diagnostics": {"read_failure_count": 1}}}},
+        ], "target_findings": [],
+    })
+    counts = result["key_diagnostics"]["counts"]
+    assert counts["files:orphan_private_key_recovery:reports_present"] == 1
+    assert counts["files:orphan_private_key_fragment_recovery:read_failure_count"] == 1
+    rows = (output / "diagnostyka_kluczy.jsonl").read_text().splitlines()
+    assert len(rows) == 1 and json.loads(rows[0])["file_path"] == "fragment.bin"
+
+
+def test_key_diagnostics_from_real_folder_scan(tmp_path):
+    from bfrs.cli import main
+    from tests.test_cli import basic_arguments
+    from tests.test_orphan_private_key_der import private_der
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "valid.bin").write_bytes(private_der(7))
+    (root / "anchor-only.bin").write_bytes(b"noise\x02\x01\x01\x04\x20" + bytes(32))
+    source = tmp_path / "folder.json"
+    assert main(basic_arguments(root, source) + ["--targets", "secrets", "--skip-mnemonic", "--padding-mib", "1"]) == 0
+    summary = analyzer.analyze_report(source, tmp_path / "analysis")
+    counts = summary["key_diagnostics"]["counts"]
+    assert counts["kind:ec_private_key_der"] == 2
+    original = json.loads(source.read_text())
+    modules = [item["report"]["orphan_private_key_recovery"] for item in original["files"]]
+    assert counts["files:orphan_private_key_recovery:raw_der_anchor_count"] == sum(item["raw_der_anchor_count"] for item in modules)
+    assert counts["files:orphan_private_key_recovery:valid_secp256k1_der_count"] == 1
+    diagnostics = [json.loads(line) for line in (tmp_path / "analysis" / "diagnostyka_kluczy.jsonl").read_text().splitlines()]
+    assert any(row["file_path"].endswith("valid.bin") and row.get("valid_secp256k1_der_count") == 1 for row in diagnostics)
+    assert any(row["file_path"].endswith("anchor-only.bin") and row.get("raw_der_anchor_count") == 0 and row["file_der_finding_rows"] == 1 for row in diagnostics)
+
+
+def test_der_file_without_recovery_module_is_explicitly_marked_not_reported(tmp_path):
+    row = finding(kind="ec_private_key_der", discovery="RAW", crypto="UNCHECKED")
+    row["normalized_state"]["structural_state"] = "NONE"
+    result, output = run_report(tmp_path, {
+        "source_type": "FOLDER", "files": [{"file_path": "unknown.bin", "report": {
+            "target_findings": [row]}}], "target_findings": [row],
+    })
+    diagnostic = json.loads((output / "diagnostyka_kluczy.jsonl").read_text())
+    assert diagnostic["module"] == "NOT_REPORTED"
+    assert result["key_diagnostics"]["counts"]["files_with_der_findings_but_no_recovery_modules"] == 1
