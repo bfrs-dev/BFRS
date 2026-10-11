@@ -211,6 +211,29 @@ these contain public statuses, locations, rejection counts and window hashes,
 without source bytes or private keys. Missing files, shifted offsets and changed
 anchors remain explicit unresolved states. No balance checks are performed.
 
+To check Core/Electrum anchors independently of seed and DER findings:
+
+```powershell
+py .\scripts\verify_wallet_findings.py
+```
+
+Select the full directory report (`Disk_Drill_Hp.bfrs.json`) and the recovered
+source folder. Alternatively provide `--report`, `--source-root`, and a new
+`--output-dir` outside the source folder. This requires ijson and the checked-out
+repository, and runs independently of the installed GUI. It streams the full
+report once into a temporary disk-backed queue, ignores duplicate per-file
+finding views, and checks only canonical `berkeley_metadata`, `wallet_record`,
+and `electrum_wallet_anchor` locations. Reads are bounded to 64 KiB, 79 bytes,
+and 2 MiB respectively. Byte progress is followed by verification progress.
+The two output files are `podsumowanie_portfeli.json` and
+`weryfikacja_portfeli.jsonl`; neither exports source contents or secrets.
+Invalid JSON never publishes partial output. Berkeley metadata proves a database
+format; a valid record key side proves public-key framing; Electrum candidates
+prove only format-specific structure. None proves a used or funded wallet.
+Multiple anchors may describe one object, and checks in bounded windows do not
+exclude larger or damaged objects. Source files and the original report stay
+read-only; no new directory scan or balance lookup is performed.
+
 Only the canonical top-level `target_findings` list is counted; copies in
 per-file reports are ignored. Full per-file summary counts can include noise
 that was already aggregated out of that list. Mnemonic candidate views and
