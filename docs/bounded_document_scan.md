@@ -1,8 +1,8 @@
 # Bounded document scanning — first implementation
 
 Ordinary FILE/FOLDER target scans (including the GUI configuration path) now
-perform a supplementary text scan for .docx and .xlsx files. Image scans and
-partial file ranges do not invoke it. The existing seed-only pipeline is unchanged.
+perform a supplementary text scan for .docx, .xlsx and .rtf files. Image scans and
+partial file ranges do not invoke it. The seed-only pipeline also uses the bounded RTF reader for .rtf files.
 
 ## Cost and limits
 
@@ -34,9 +34,32 @@ are rejected with a settings mismatch rather than silently skipping the new
 analysis. Retain old checkpoints for their old scanner; use a new checkpoint
 for this version. New-version partial checkpoints retain document results.
 
+## WordPad / RTF support
+
+RTF is parsed directly as data with no external applications or dependencies.
+The reader preserves text across formatting groups, decodes hex escapes,
+Windows code pages (including 1250 and font charset overrides), Unicode and
+fallback bytes, and retains paragraph/tab boundaries. It skips known metadata,
+unknown starred destinations, pictures and objects; binary payload lengths are
+validated before skipping. Field display text is retained without executing fields.
+
+Limits: 16 MiB source, 4 MiB output, 256 nested groups. Parsing shares the existing
+single document slot. Unbalanced/truncated input, unknown encodings, invalid
+Unicode and unsupported alternate Unicode destinations produce explicit reasons
+rather than a successful empty scan. This is text recovery, not a complete RTF
+layout renderer; it does not OCR images or recover embedded objects. RTF controls
+not affecting supported text are ignored. The implementation follows Microsoft
+RTF text-encoding guidance:
+https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxrtfex/1e44fa4c-3ea3-402c-8b21-fb19a617e43b
+
+RTF hits carry `bounded_rtf_v1` provenance and logical UTF-8 offsets.
+Document scan version is now 2, so version-1 folder checkpoints cannot silently
+reuse an RTF result from before this extension. The existing raw file scan still
+runs independently and may find raw bytes in destinations omitted from text.
+
 ## Remaining work
 
-This is intentionally the first bounded implementation, not complete Office or
+This is intentionally the bounded implementation, not complete Office or
 archive recovery. Renamed files, legacy DOC/XLS, PDF integration, encrypted
 Office classification, embedded files, RAR/ZIP/7z content and image carving
 remain separate work. An OLE header on a .docx/.xlsx reports an unsupported
