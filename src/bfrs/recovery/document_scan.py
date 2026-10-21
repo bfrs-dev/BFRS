@@ -1,4 +1,4 @@
-"""Bounded, read-only OOXML text pass for intact file/folder target scans.
+"""Bounded, read-only document text pass for intact file/folder target scans.
 
 No Office automation, macros, embedded objects, external links or extraction to disk.
 Offsets on returned hits refer ONLY to extracted UTF-8 text.
@@ -10,6 +10,7 @@ import zlib
 import threading
 import xml.etree.ElementTree as ET
 
+from bfrs.recovery.rtf_text import RTFError
 from bfrs.core.chunk_reader import Chunk
 from bfrs.scanners.target_registry import (
     ValidatedSecretChunkDetector, _mnemonic_hits,
@@ -17,8 +18,8 @@ from bfrs.scanners.target_registry import (
 from bfrs.recovery.mnemonic.raw_mnemonic_scanner import RawMnemonicScanner
 
 _DOCUMENT_SLOT = threading.BoundedSemaphore(1)
-DOCUMENT_SCAN_VERSION = 1
-SUFFIXES = frozenset({'.docx', '.xlsx'})
+DOCUMENT_SCAN_VERSION = 2
+SUFFIXES = frozenset({'.docx', '.xlsx', '.rtf'})
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_PART_BYTES = 4 * 1024 * 1024
 MAX_XML_BYTES = 16 * 1024 * 1024
@@ -114,18 +115,30 @@ def _scan_document(path, *, targets, mnemonic_standards):
     path = Path(path)
     if path.suffix.lower() not in SUFFIXES or not (mnemonic_standards or 'secrets' in targets):
         return (), None
+    is_rtf = path.suffix.lower() == '.rtf'
     coverage = {'version': DOCUMENT_SCAN_VERSION, 'status': 'SKIPPED',
-                'findings': 0, 'xml_bytes': 0, 'scope': 'OOXML_TEXT_ONLY'}
+                'findings': 0, 'xml_bytes': 0, 'scope': 'RTF_TEXT_ONLY' if is_rtf else 'OOXML_TEXT_ONLY'}
     try:
-        if path.stat().st_size > MAX_FILE_BYTES:
+        file_size = path.stat().st_size
+        if file_size > MAX_FILE_BYTES:
             raise DocumentLimit('DOCUMENT_FILE_LIMIT')
-        with path.open('rb') as stream:
-            prefix = stream.read(8)
-        if prefix == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
-            raise DocumentLimit('OFFICE_OLE_OR_ENCRYPTED_UNSUPPORTED')
-        if not prefix.startswith(b'PK\x03\x04'):
-            raise DocumentLimit('DOCUMENT_FORMAT_UNCONFIRMED')
-        data, kind, xml_bytes = extract_ooxml(path)
+        if is_rtf:
+            from bfrs.recovery.rtf_text import extract_rtf, MAX_RTF_BYTES
+            if file_size > MAX_RTF_BYTES:
+                raise DocumentLimit('RTF_FILE_LIMIT')
+            with path.open('rb') as stream:
+                source_bytes = stream.read(MAX_RTF_BYTES + 1)
+            data = extract_rtf(source_bytes)
+            kind, xml_bytes = 'RTF', 0
+            coverage['rtf_bytes'] = len(source_bytes)
+        else:
+            with path.open('rb') as stream:
+                prefix = stream.read(8)
+            if prefix == b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1':
+                raise DocumentLimit('OFFICE_OLE_OR_ENCRYPTED_UNSUPPORTED')
+            if not prefix.startswith(b'PK\x03\x04'):
+                raise DocumentLimit('DOCUMENT_FORMAT_UNCONFIRMED')
+            data, kind, xml_bytes = extract_ooxml(path)
         hits = []
         if 'secrets' in targets:
             hits.extend(ValidatedSecretChunkDetector().detect_chunk(
@@ -140,12 +153,13 @@ def _scan_document(path, *, targets, mnemonic_standards):
             allocation_state='ACTIVE_FILE', safe_metadata={**hit.safe_metadata,
                 'offset_space': 'extracted_text_utf8_bytes',
                 'logical_text_start': hit.start_offset, 'logical_text_end': hit.end_offset,
-                'document_format': kind, 'extractor': 'bounded_ooxml_v1'}) for hit in hits)
+                'document_format': kind,
+                'extractor': 'bounded_rtf_v1' if is_rtf else 'bounded_ooxml_v1'}) for hit in hits)
         coverage.update(status='SCANNED', findings=len(enriched), xml_bytes=xml_bytes,
                         text_bytes=len(data), document_format=kind,
                         mnemonic_recovery=FullImageRecoveryCoordinator._mnemonic_summary(enriched))
         return enriched, coverage
-    except DocumentLimit as error:
+    except (DocumentLimit, RTFError) as error:
         coverage['reason'] = str(error)
     except (OSError, ValueError, KeyError, RuntimeError, NotImplementedError,
             zipfile.BadZipFile, zlib.error, ET.ParseError):
