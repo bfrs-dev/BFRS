@@ -8,6 +8,8 @@ import zlib
 from bfrs.recovery.pdf_inventory import PDFMetadataLimit, inspect_pdf
 
 VERSION = 1
+# Bump when unknown-OLE inspection changes, so cached metadata is refreshed.
+OLE_INVENTORY_REVISION = 1
 MAX_READ_BYTES = 2 * 1024 * 1024
 MAX_READ_CALLS = 4096
 MAX_MEMBERS = 4096
@@ -231,6 +233,29 @@ def _rar(reader, result, modern):
     result.update(encryption='NO_ENCRYPTION_INDICATOR', structure='HEADERS_CHECKED', member_count=count)
 
 
+def _ole_directory_metadata(ole, result):
+    """Describe already-loaded, reachable entries without opening any streams."""
+    if len(ole.direntries) > MAX_MEMBERS:
+        raise InventoryLimit('OLE_DIRECTORY_ENTRY_LIMIT')
+    entries = []
+    count = 0
+    for index, entry in enumerate(ole.direntries):
+        if entry is None or index == 0:
+            continue
+        count += 1
+        if len(entries) < MAX_NAMES:
+            entries.append({'id': index, 'name': entry.name[:64],
+                            'type': entry.entry_type, 'size': entry.size,
+                            'clsid': entry.clsid})
+    warnings = bool(ole.parsing_issues)
+    result.update(ole_root_clsid=ole.root.clsid, ole_directory_entries=entries,
+                  ole_directory_entry_count=count,
+                  ole_directory_entries_truncated=count > len(entries),
+                  ole_directory_warnings=warnings,
+                  ole_inventory_revision=OLE_INVENTORY_REVISION,
+                  structure='DIRECTORY_CHECKED_WITH_WARNINGS' if warnings else 'DIRECTORY_CHECKED')
+
+
 def _ole(reader, result):
     try:
         import olefile
@@ -284,6 +309,7 @@ def _ole(reader, result):
                     return
             raise InventoryLimit('XLS_RECORD_LIMIT')
         else:
+            _ole_directory_metadata(ole, result)
             result['reason'] = 'OLE_TYPE_UNDETERMINED'
 
 
