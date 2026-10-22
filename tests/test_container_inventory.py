@@ -224,3 +224,28 @@ def test_unknown_candidates_are_retried_on_resume(tmp_path, monkeypatch):
     runner.inventory(source, output)
     result = runner.inventory(source, output, resume=True)
     assert result['run']['inspected'] == 1 and result['run']['reused'] == 0
+
+
+def test_old_signature_only_pdf_is_reclassified_on_resume(tmp_path, monkeypatch):
+    from pypdf import PdfWriter
+    source, output = tmp_path/'source', tmp_path/'output'
+    source.mkdir()
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    writer.encrypt('test-password')
+    writer.write(source/'old.pdf')
+    (source/'plain.bin').write_bytes(b'ordinary')
+    original = runner.inspect_file
+    def old_inspector(path):
+        if path.suffix == '.pdf':
+            return {'format': 'PDF', 'encryption': 'UNKNOWN', 'structure': 'SIGNATURE_ONLY',
+                    'reason': 'PDF_ENCRYPTION_REQUIRES_DEEPER_PARSER', 'bytes_read': 512}
+        return original(path)
+    monkeypatch.setattr(runner, 'inspect_file', old_inspector)
+    runner.inventory(source, output)
+    monkeypatch.setattr(runner, 'inspect_file', original)
+    second = runner.inventory(source, output, resume=True)
+    assert second['run']['inspected'] == 1 and second['run']['reused'] == 1
+    assert second['encryption_counts'] == {'ENCRYPTED': 1}
+    third = runner.inventory(source, output, resume=True)
+    assert third['run']['inspected'] == 0 and third['run']['reused'] == 2
