@@ -262,3 +262,37 @@ def test_whitespace_after_eof_is_not_reported_as_extra_data(tmp_path):
         stream.write(b'\r\n\t ')
     row = inventory.inspect_file(path)
     assert row['encryption'] == 'NO_ENCRYPTION_INDICATOR' and row['pdf_trailing_bytes'] == 0
+
+
+@pytest.mark.parametrize('extra,expected,reason', [
+    (b'', 'UNKNOWN', 'PDF_ROOT_REFERENCE_MISSING'),
+    (b'/Encrypt 3 0 R', 'ENCRYPTED', 'PDF_ENCRYPT_ENTRY_WITHOUT_ROOT'),
+    (b'/Encrypt 123', 'UNKNOWN', 'PDF_INVALID_ENCRYPT_ENTRY'),
+    (b'/Encrypt 3 0 R /Prev 999999999', 'UNKNOWN', 'PDF_XREF_OFFSET_OUT_OF_RANGE'),
+])
+def test_missing_root_preserves_only_valid_encryption_marker(tmp_path, extra, expected, reason):
+    path = tmp_path/'resource.bin'
+    classic_pdf(path, extra)
+    # Trailer follows the xref table, so removing its Root leaves xref offsets intact.
+    path.write_bytes(path.read_bytes().replace(b' /Root 1 0 R', b''))
+    row = inventory.inspect_file(path)
+    assert row['encryption'] == expected and row['reason'] == reason
+    if expected == 'ENCRYPTED':
+        assert row['structure'] == 'PDF_TRAILERS_CHECKED_ROOT_MISSING'
+        assert row['pdf_root_reference_present'] is False
+        assert row['pdf_password_required'] == 'NOT_CHECKED'
+
+
+def test_real_encrypted_pdf_without_root_reference(tmp_path):
+    path = tmp_path/'resource.res'
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    writer.encrypt('synthetic-test-password')
+    writer.write(path)
+    data, replaced = re.subn(rb'/Root\s+\d+\s+\d+\s+R', b'', path.read_bytes())
+    assert replaced == 1
+    path.write_bytes(data)
+    assert PdfReader(path, strict=True).is_encrypted
+    row = inventory.inspect_file(path)
+    assert row['encryption'] == 'ENCRYPTED'
+    assert row['pdf_root_reference_present'] is False
