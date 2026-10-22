@@ -1,4 +1,5 @@
 """PDF inventory: real encrypted files, xref layouts and bounded failure cases."""
+import re
 import struct
 import zlib
 
@@ -32,10 +33,11 @@ def classic_pdf(path, extra=b'', *, entries=4, payload_size=0):
     return xref
 
 
-def append_table(path, extra):
+def append_table(path, extra, *, empty=False, size=4):
     with path.open('ab') as stream:
         offset = stream.tell()
-        stream.write(b'xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 4 '+extra+b' >>\n')
+        stream.write(b'xref\n0 0\n' if empty else b'xref\n0 1\n0000000000 65535 f \n')
+        stream.write(f'trailer\n<< /Size {size} '.encode()+extra+b' >>\n')
         stream.write(f'startxref\n{offset}\n%%EOF\n'.encode())
     return offset
 
@@ -180,3 +182,43 @@ def test_nonstandard_xref_width_is_unknown(tmp_path):
     classic_pdf(path)
     path.write_bytes(path.read_bytes().replace(b'0000000000 65535 f \n', b'0 65535 f\n'))
     assert inventory.inspect_file(path)['encryption'] == 'UNKNOWN'
+
+
+@pytest.mark.parametrize('encrypted', [False, True])
+def test_empty_xref_subsection_follows_previous_encryption_metadata(tmp_path, encrypted):
+    # Only the marker fixture is synthetic; no user document is stored in tests.
+    path = tmp_path/'empty-update.pdf'
+    previous = classic_pdf(path, b'/Encrypt 3 0 R' if encrypted else b'')
+    append_table(path, f'/Prev {previous}'.encode(), empty=True)
+    row = inventory.inspect_file(path)
+    assert row['encryption'] == ('ENCRYPTED' if encrypted else 'NO_ENCRYPTION_INDICATOR')
+    assert row['pdf_xref_sections'] == 2
+
+
+def test_empty_hybrid_xref_with_shared_previous_section(tmp_path):
+    # Reproduce the reported layout using a generated blank PDF, not private data.
+    original, path = tmp_path/'original.pdf', tmp_path/'hybrid.pdf'
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    writer.write(original)
+    writer = PdfWriter(original, incremental=True)
+    writer.add_metadata({'/Title': 'synthetic hybrid regression'})
+    writer.write(path)
+    xref_stream = int(re.search(rb'startxref\s+(\d+)\s+%%EOF\s*$', path.read_bytes())[1])
+    reference = PdfReader(path, strict=True)
+    root = reference.trailer.raw_get('/Root')
+    previous = int(re.search(rb'startxref\s+(\d+)\s+%%EOF\s*$', original.read_bytes())[1])
+    append_table(path, f'/Root {root.idnum} {root.generation} R /Prev {previous} '
+                 f'/XRefStm {xref_stream}'.encode(), empty=True, size=reference.trailer['/Size'])
+    assert not PdfReader(path, strict=True).is_encrypted
+    row = inventory.inspect_file(path)
+    assert row['encryption'] == 'NO_ENCRYPTION_INDICATOR'
+    assert row['pdf_xref_sections'] == 3 and row['pdf_xref_streams'] == 1
+
+
+def test_empty_subsections_still_obey_section_limit(tmp_path):
+    path = tmp_path/'empty-limit.pdf'
+    data = b'%PDF-1.7\nxref\n'+b'0 0\n'*(pdf.MAX_SUBSECTIONS+1)
+    path.write_bytes(data+b'trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n9\n%%EOF\n')
+    row = inventory.inspect_file(path)
+    assert row['encryption'] == 'UNKNOWN' and row['reason'] == 'PDF_XREF_SUBSECTION_LIMIT'
