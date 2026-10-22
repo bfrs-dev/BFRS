@@ -181,8 +181,13 @@ def _section(reader, offset):
             if sections > MAX_SUBSECTIONS:
                 raise PDFMetadataLimit('PDF_XREF_SUBSECTION_LIMIT')
             _integer(parser.pop())  # first object number
-            count = _integer(parser.pop(), 1)
+            count = _integer(parser.pop())
             parser.end_line()
+            # Hybrid/incremental PDFs can have an empty classic subsection
+            # (e.g. "0 0") followed by a trailer linking XRefStm and/or Prev.
+            # Still parse those links; zero records says nothing about encryption.
+            if count == 0:
+                continue
             start, end = parser.pos, parser.pos + count*20
             if end > reader.size:
                 raise ValueError('PDF_TRUNCATED_XREF_TABLE')
