@@ -67,6 +67,13 @@ in strings, comments or nested unrelated dictionaries are not markers. PDF name
 escapes are decoded. Duplicate dictionary keys, malformed fields, cycles and
 unsupported layouts produce UNKNOWN with an explicit reason.
 
+Short printable ASCII text/HTML appended after the last `%%EOF` is tolerated
+up to 1024 bytes (including surrounding whitespace). Such a suffix is reported
+as `pdf_trailing_bytes`; it is not interpreted or validated as document content.
+Ordinary whitespace alone reports zero. Binary suffixes, longer text, and suffixes
+containing PDF structural keywords remain UNKNOWN. Only the final EOF is used,
+so an invalid later revision is not bypassed by choosing an older trailer.
+
 ENCRYPTED does not imply a password prompt: a PDF can use an empty user password.
 `pdf_password_required` is always `NOT_CHECKED`. The inventory neither attempts
 passwords (including an empty password) nor resolves the encryption dictionary,
