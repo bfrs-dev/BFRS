@@ -11,7 +11,7 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from bfrs.recovery.container_inventory import VERSION, inspect_file
+from bfrs.recovery.container_inventory import VERSION, OLE_INVENTORY_REVISION, inspect_file
 
 EXTENSIONS = {'.zip', '.rar', '.7z', '.doc', '.docx', '.xls', '.xlsx', '.rtf', '.pdf', '.ppt', '.pptx'}
 
@@ -89,6 +89,9 @@ def inventory(source, output, *, resume=False, progress=None, should_stop=None):
         if resume:
             if metadata.get('source') != str(source) or metadata.get('version') != str(VERSION):
                 raise ValueError('Checkpoint dotyczy innego zrodla lub wersji skanera.')
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(files)')}
+        if 'inspection_revision' not in columns:
+            connection.execute('ALTER TABLE files ADD COLUMN inspection_revision INTEGER NOT NULL DEFAULT 0')
         run_id = int(metadata.get('run_id', '0')) + 1
         for key, value in {'source': str(source), 'version': str(VERSION), 'run_id': str(run_id)}.items():
             connection.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', (key, value))
@@ -101,8 +104,9 @@ def inventory(source, output, *, resume=False, progress=None, should_stop=None):
                 relative = str(path.relative_to(source))
                 identity = json.dumps([info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino]) if info else None
                 counters['visited'] += 1
-                previous = connection.execute('SELECT identity FROM files WHERE path=?', (relative,)).fetchone()
-                if not error and previous and previous[0] == identity:
+                previous = connection.execute('SELECT identity,inspection_revision FROM files WHERE path=?', (relative,)).fetchone()
+                if (not error and previous and previous[0] == identity
+                        and previous[1] in (0, OLE_INVENTORY_REVISION)):
                     connection.execute('UPDATE files SET run_id=? WHERE path=?', (run_id, relative))
                     counters['reused'] += 1
                 else:
@@ -122,11 +126,20 @@ def inventory(source, output, *, resume=False, progress=None, should_stop=None):
                         row = {'format': None, 'encryption': 'UNKNOWN', 'structure': 'SKIPPED', 'reason': error}
                     candidate = bool(error or row['format'] or path.suffix.lower() in EXTENSIONS)
                     payload = json.dumps({'path': relative, 'size': info.st_size if info else None, **row}, ensure_ascii=False) if candidate else None
-                    # Failed reads are retried on resume; do not cache them as complete.
+                    # A checked but unidentified OLE directory can be reused without
+                    # implying anything about encryption. Refresh it on parser changes.
+                    stable_ole = (row.get('format') == 'OLE'
+                        and row.get('encryption') == 'UNKNOWN'
+                        and row.get('reason') == 'OLE_TYPE_UNDETERMINED'
+                        and row.get('structure') == 'DIRECTORY_CHECKED'
+                        and row.get('ole_inventory_revision') == OLE_INVENTORY_REVISION)
+                    # Failed/limited reads and other unknown formats are still retried.
                     cache_identity = identity if (not error and row.get('structure') != 'SOURCE_CHANGED'
-                        and not (row.get('format') and row.get('encryption') == 'UNKNOWN')) else None
-                    connection.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?)',
-                                       (relative, cache_identity, payload, run_id))
+                        and (stable_ole or not (row.get('format') and row.get('encryption') == 'UNKNOWN'))) else None
+                    connection.execute('INSERT OR REPLACE INTO files '
+                                       '(path,identity,result,run_id,inspection_revision) VALUES (?,?,?,?,?)',
+                                       (relative, cache_identity, payload, run_id,
+                                        OLE_INVENTORY_REVISION if stable_ole else 0))
                 if counters['visited'] % 100 == 0:
                     connection.commit()
                 if progress:
