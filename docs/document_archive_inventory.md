@@ -59,7 +59,9 @@ payload, document XML or embedded files.
 
 PDF files, including renamed files, are checked from the final `startxref` and
 `%%EOF`. The bounded parser reads classic trailer dictionaries or cross-reference
-stream dictionaries, following `Prev` and hybrid `XRefStm` links. A non-null
+stream dictionaries, following `Prev` and hybrid `XRefStm` links.
+Empty classic subsections (`0 0`) are supported, including hybrid update trailers;
+their metadata links are still followed before classifying encryption. A non-null
 top-level `Encrypt` dictionary/reference is an encryption marker. Matching words
 in strings, comments or nested unrelated dictionaries are not markers. PDF name
 escapes are decoded. Duplicate dictionary keys, malformed fields, cycles and
