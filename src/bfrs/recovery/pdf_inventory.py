@@ -12,6 +12,7 @@ MAX_TOKENS = 8192
 MAX_DEPTH = 32
 MAX_STRING_BYTES = 65536
 TAIL_BYTES = 65536
+MAX_TRAILING_BYTES = 1024
 BLOCK_BYTES = 4096
 SPACE = b'\x00\t\n\x0c\r '
 DELIMITERS = SPACE + b'()<>[]{}/%'
@@ -235,6 +236,25 @@ def inspect_pdf(reader):
     """Return metadata status; never infer a password requirement or integrity."""
     length = min(reader.size, TAIL_BYTES)
     tail = reader.at(reader.size-length, length)
+    eof = tail.rfind(b'%%EOF')
+    if eof < 0:
+        raise ValueError('PDF_FINAL_STARTXREF_MISSING')
+    suffix = tail[eof+5:]
+    trailing_bytes = 0
+    if suffix.strip(SPACE):
+        # Some producers append diagnostic text/HTML. Accept only a short ASCII
+        # suffix and disclose it; never fall back past a possible PDF update.
+        if len(suffix) > MAX_TRAILING_BYTES:
+            raise PDFMetadataLimit('PDF_TRAILING_DATA_LIMIT')
+        if any(byte not in SPACE and not 32 <= byte <= 126 for byte in suffix):
+            raise PDFMetadataLimit('PDF_TRAILING_DATA_UNSUPPORTED')
+        if re.search(rb'(?<![A-Za-z0-9_])(?:startxref|xref|trailer|obj|endobj|stream|endstream)'
+                     rb'(?![A-Za-z0-9_])|%PDF-|/Encrypt', suffix):
+            raise PDFMetadataLimit('PDF_TRAILING_UPDATE_UNSUPPORTED')
+        trailing_bytes = len(suffix)
+    # Use the last EOF only. A malformed later revision must not be hidden by
+    # selecting an earlier, apparently valid startxref/EOF pair.
+    tail = tail[:eof+5]
     ending = re.search(rb'(?:^|[\r\n])startxref[\x00\t\n\x0c\r ]+(\d{1,20})'
                        rb'[\x00\t\n\x0c\r ]+%%EOF[\x00\t\n\x0c\r ]*\Z', tail)
     if not ending:
@@ -274,4 +294,5 @@ def inspect_pdf(reader):
             'reason': 'PDF_ENCRYPT_ENTRY' if encrypted else None,
             'pdf_xref_sections': len(checked),
             'pdf_xref_streams': sum(row[1] for row in checked.values()),
+            'pdf_trailing_bytes': trailing_bytes,
             'pdf_password_required': 'NOT_CHECKED'}
