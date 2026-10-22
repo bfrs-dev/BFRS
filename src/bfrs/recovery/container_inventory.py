@@ -14,6 +14,7 @@ MAX_READ_BYTES = 2 * 1024 * 1024
 MAX_READ_CALLS = 4096
 MAX_MEMBERS = 4096
 MAX_NAMES = 50
+MAX_OLE_METADATA_BYTES = 1024 * 1024
 OLE_MAGIC = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'
 
 
@@ -256,6 +257,58 @@ def _ole_directory_metadata(ole, result):
                   structure='DIRECTORY_CHECKED_WITH_WARNINGS' if warnings else 'DIRECTORY_CHECKED')
 
 
+class _OleMetadataStream:
+    """Sequential prefix reader for regular FAT streams, not a chain validator.
+
+    olefile has already loaded the directory and FAT. Its openstream() eagerly
+    copies the entire stream; here only sectors needed for metadata are read.
+    """
+    def __init__(self, reader, ole, entry):
+        self.reader, self.ole, self.entry = reader, ole, entry
+        self.position = 0
+        self.sector = entry.isectStart
+        self.seen = set()
+        self.buffer = b''
+        self.cursor = 0
+
+    def read(self, count):
+        if count < 0:
+            raise ValueError('OLE_UNBOUNDED_READ')
+        count = min(count, self.entry.size - self.position)
+        if self.position + count > MAX_OLE_METADATA_BYTES:
+            raise InventoryLimit('OLE_METADATA_PREFIX_LIMIT')
+        parts = []
+        while count:
+            if self.cursor == len(self.buffer):
+                if self.buffer:
+                    self.sector = int(self.ole.fat[self.sector])
+                if self.sector in self.seen:
+                    raise ValueError('OLE_METADATA_CHAIN_CYCLE')
+                if not 0 <= self.sector < len(self.ole.fat):
+                    raise ValueError('OLE_METADATA_CHAIN_OUT_OF_RANGE')
+                self.seen.add(self.sector)
+                length = min(self.ole.sectorsize, self.entry.size - self.position)
+                self.buffer = self.reader.at((self.sector+1)*self.ole.sectorsize, length)
+                self.cursor = 0
+            take = min(count, len(self.buffer)-self.cursor)
+            parts.append(self.buffer[self.cursor:self.cursor+take])
+            self.cursor += take
+            self.position += take
+            count -= take
+        return b''.join(parts)
+
+
+def _ole_metadata_stream(reader, ole, name):
+    entry = ole.direntries[ole._find(name)]
+    if entry.entry_type != 2:
+        raise ValueError('OLE_EXPECTED_STREAM')
+    if entry.size < ole.minisectorcutoff:
+        # Keep olefile's MiniFAT handling; its backing reads still use the
+        # shared byte/call budget, including loading the root mini stream.
+        return ole.openstream(name)
+    return _OleMetadataStream(reader, ole, entry)
+
+
 def _ole(reader, result):
     try:
         import olefile
@@ -264,48 +317,57 @@ def _ole(reader, result):
     reader.seek(0)
     with olefile.OleFileIO(reader, raise_defects=olefile.DEFECT_INCORRECT) as ole:
         if ole.exists('EncryptionInfo') and ole.exists('EncryptedPackage'):
-            if ole.get_size('EncryptionInfo') > 1024 * 1024:
-                raise InventoryLimit('OLE_STREAM_LIMIT')
-            version = ole.openstream('EncryptionInfo').read(8)
+            version = _ole_metadata_stream(reader, ole, 'EncryptionInfo').read(8)
             if len(version) < 8 or ole.get_size('EncryptedPackage') < 8:
                 raise ValueError('OFFICE_TRUNCATED_ENCRYPTION_METADATA')
             if struct.unpack_from('<HH', version) not in {(2, 2), (3, 2), (4, 2), (4, 4)}:
                 raise InventoryLimit('OFFICE_ENCRYPTION_VERSION_UNSUPPORTED')
             result.update(format='OFFICE_ENCRYPTED', encryption='ENCRYPTED',
-                          structure='DIRECTORY_CHECKED', reason='OFFICE_ENCRYPTION_STREAMS')
+                          structure='DIRECTORY_CHECKED', reason='OFFICE_ENCRYPTION_STREAMS',
+                          ole_stream_scope='METADATA_PREFIX_ONLY')
         elif ole.exists('WordDocument'):
             result['format'] = 'DOC'
-            if ole.get_size('WordDocument') > 1024 * 1024:
-                raise InventoryLimit('OLE_STREAM_LIMIT')
-            fib = ole.openstream('WordDocument').read(32)
-            if len(fib) < 32 or fib[:2] != b'\xec\xa5':
+            fib = _ole_metadata_stream(reader, ole, 'WordDocument').read(32)
+            if len(fib) < 32:
+                raise ValueError('DOC_INVALID_FIB')
+            ident, version = struct.unpack_from('<HH', fib)
+            if ident == 0xa5dc:
+                if version != 0x65:
+                    raise InventoryLimit('DOC_LEGACY_FIB_VERSION_UNSUPPORTED')
+            elif ident != 0xa5ec:
                 raise ValueError('DOC_INVALID_FIB')
             flags = struct.unpack_from('<H', fib, 10)[0]
             result.update(encryption='ENCRYPTED' if flags & 0x100 else 'NO_ENCRYPTION_INDICATOR',
-                          structure='FIB_CHECKED')
+                          structure='FIB_CHECKED', doc_fib_ident=ident,
+                          doc_fib_version=version, ole_stream_scope='METADATA_PREFIX_ONLY')
         elif ole.exists('Workbook') or ole.exists('Book'):
             result['format'] = 'XLS'
             name = 'Workbook' if ole.exists('Workbook') else 'Book'
-            if ole.get_size(name) > 1024 * 1024:
-                raise InventoryLimit('OLE_STREAM_LIMIT')
-            stream = ole.openstream(name)
-            if stream.read(2) != b'\x09\x08':
-                raise InventoryLimit('XLS_BIFF_VERSION_UNSUPPORTED')
-            stream.seek(0)
-            for _ in range(MAX_MEMBERS):
+            stream = _ole_metadata_stream(reader, ole, name)
+            for index in range(MAX_MEMBERS):
                 header = stream.read(4)
                 if len(header) != 4:
                     raise ValueError('XLS_TRUNCATED_GLOBALS')
                 record, length = struct.unpack('<HH', header)
-                if len(stream.read(length)) != length:
+                data = stream.read(length)
+                if len(data) != length:
                     raise ValueError('XLS_TRUNCATED_RECORD')
+                if index == 0:
+                    if record != 0x0809 or length < 4 or data[:4] != b'\x00\x06\x05\x00':
+                        raise InventoryLimit('XLS_BIFF_VERSION_UNSUPPORTED')
+                elif record == 0x0809:
+                    raise ValueError('XLS_UNEXPECTED_BOF')
                 if record == 0x2f:
                     if length < 6:
                         raise ValueError('XLS_TRUNCATED_FILEPASS')
-                    result.update(encryption='ENCRYPTED', structure='GLOBALS_CHECKED', reason='XLS_FILEPASS')
+                    result.update(encryption='ENCRYPTED', structure='GLOBALS_CHECKED', reason='XLS_FILEPASS',
+                                  ole_stream_scope='METADATA_PREFIX_ONLY')
                     return
                 if record == 0x0a:
-                    result.update(encryption='NO_ENCRYPTION_INDICATOR', structure='GLOBALS_CHECKED')
+                    if length:
+                        raise ValueError('XLS_INVALID_EOF')
+                    result.update(encryption='NO_ENCRYPTION_INDICATOR', structure='GLOBALS_CHECKED',
+                                  ole_stream_scope='METADATA_PREFIX_ONLY')
                     return
             raise InventoryLimit('XLS_RECORD_LIMIT')
         else:
