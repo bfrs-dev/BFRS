@@ -37,7 +37,8 @@ It does not use or modify the GUI/folder-scan checkpoint.
 
 ## Meaning of results
 
-* ENCRYPTED: a supported encryption flag, record or Office stream pair was found.
+* ENCRYPTED: a supported encryption flag, record, Office stream pair or PDF
+  trailer encryption entry was found.
 * NO_ENCRYPTION_INDICATOR: no encryption marker was found in the checked headers.
   This does NOT prove the payload is intact, fully readable or wallet-related.
 * UNKNOWN: unsupported metadata, a limit, an error, or an undecided format.
@@ -50,10 +51,43 @@ Encrypted Office containers are identified by EncryptionInfo+EncryptedPackage;
 legacy DOC uses FibBase.fEncrypted and BIFF8 XLS uses FILEPASS in globals.
 
 7z start/next-header CRCs are checked when within budget, but encryption remains
-UNKNOWN pending a deeper coder/header parser. PDF is identified by signature;
-its encryption also remains UNKNOWN in this first quick pass. RTF is recognized
-by its start signature, without parsing its full body. No integrity guarantee
-is made for a payload, document XML or embedded files.
+UNKNOWN pending a deeper coder/header parser. RTF is recognized by its start
+signature, without parsing its full body. No integrity guarantee is made for a
+payload, document XML or embedded files.
+
+### PDF encryption metadata
+
+PDF files, including renamed files, are checked from the final `startxref` and
+`%%EOF`. The bounded parser reads classic trailer dictionaries or cross-reference
+stream dictionaries, following `Prev` and hybrid `XRefStm` links. A non-null
+top-level `Encrypt` dictionary/reference is an encryption marker. Matching words
+in strings, comments or nested unrelated dictionaries are not markers. PDF name
+escapes are decoded. Duplicate dictionary keys, malformed fields, cycles and
+unsupported layouts produce UNKNOWN with an explicit reason.
+
+ENCRYPTED does not imply a password prompt: a PDF can use an empty user password.
+`pdf_password_required` is always `NOT_CHECKED`. The inventory neither attempts
+passwords (including an empty password) nor resolves the encryption dictionary,
+loads pages, decodes streams, validates every xref record or checks the payload.
+An indirect encryption reference is a marker, not proof that its target exists
+or that the document can be recovered. NO_ENCRYPTION_INDICATOR means no marker
+in the supported metadata reached by this pass, not a PDF integrity guarantee.
+
+PDF-specific limits: 64 KiB final-tail search, 4 KiB read buffers, 32 linked xref
+sections, 256 classic subsections per section, 8192 tokens per section, nesting
+depth 32, string length 64 KiB, name/word length 256 bytes and integer length 20
+characters. All reads also share the existing 2 MiB / 4096-call per-file budget.
+Classic 20-byte xref records are skipped by offset, checking the first and last
+record in each subsection, so large tables are not loaded into memory. Xref
+stream payloads are not decompressed. Small buffers/tail probes may include
+adjacent content bytes without interpreting them.
+
+This implementation uses the Python standard library only. No additional PDF
+dependency is needed for the separate inventory script. Checkpoint version 1
+is retained: old signature-only UNKNOWN PDF results are already retried by
+`--resume`; unchanged successful results for other files are reused. Other
+recognized UNKNOWN formats are also retried, as before. After classification,
+unchanged successful PDF results are reused on subsequent resumes.
 
 ## Performance and safety
 
@@ -83,4 +117,6 @@ remains a candidate for a later focused pass.
 
 Format references: https://www.rarlab.com/technote.htm ;
 https://github.com/ip7z/7zip/blob/main/DOC/7zFormat.txt ;
-https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-doc/26fb6c06-4e5c-4778-ab4e-edbf26a545bb
+https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-doc/26fb6c06-4e5c-4778-ab4e-edbf26a545bb ;
+https://pdf-issues.pdfa.org/32000-2-2020/clause07.html ;
+https://pdfa.org/glossary-of-pdf-terms/
