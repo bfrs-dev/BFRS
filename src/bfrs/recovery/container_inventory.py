@@ -5,6 +5,8 @@ import struct
 import stat
 import zlib
 
+from bfrs.recovery.pdf_inventory import PDFMetadataLimit, inspect_pdf
+
 VERSION = 1
 MAX_READ_BYTES = 2 * 1024 * 1024
 MAX_READ_CALLS = 4096
@@ -320,10 +322,11 @@ def inspect_file(path):
             elif re.match(rb'^\{\\rtf1(?:[^0-9]|$)', prefix):
                 result.update(format='RTF', encryption='NO_ENCRYPTION_INDICATOR', structure='SIGNATURE_ONLY')
             elif prefix.startswith(b'%PDF-'):
-                result.update(format='PDF', structure='SIGNATURE_ONLY', reason='PDF_ENCRYPTION_REQUIRES_DEEPER_PARSER')
+                result['format'] = 'PDF'
+                result.update(inspect_pdf(reader))
             else:
                 result.update(structure='NOT_RECOGNIZED', reason='NO_SUPPORTED_START_SIGNATURE')
-        except InventoryLimit as error:
+        except (InventoryLimit, PDFMetadataLimit) as error:
             result.update(encryption='UNKNOWN', reason=str(error), structure='LIMIT_OR_UNSUPPORTED')
         except (ValueError, OSError, struct.error, IndexError, RecursionError) as error:
             result.update(encryption='UNKNOWN', structure='INVALID_OR_UNSUPPORTED_METADATA',
