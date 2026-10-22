@@ -35,6 +35,47 @@ Outputs:
 The ordinary GUI scan is unchanged; this script is a separate inventory mode.
 It does not use or modify the GUI/folder-scan checkpoint.
 
+### Browse found files without rescanning
+
+The separate viewer opens an existing `inventory.sqlite` in read-only mode:
+
+```powershell
+py -3.13 -m pip install "PySide6>=6.11,<7"
+py -3.13 .\scripts\view_inventory.py --report "D:\BFRS-inventory-01\inventory.sqlite"
+```
+
+The default filter shows encryption markers. Other filters show UNKNOWN,
+NO_ENCRYPTION_INDICATOR or all candidates. Search matches the filename/path,
+including case-insensitive Polish characters; results are ordered by path and
+paged in groups of 200. The table shows name, format, size, status, reason and
+relative folder, with readable details below. Counts cover all candidates in
+the last recorded run, independently of the current search/filter. An interrupted
+run may contain only part of the source; the viewer does not imply completeness.
+
+Select a row and choose **Pokaż w Eksploratorze**, or double-click the row, to
+show and select the original file in Windows Explorer. No document is launched
+by the viewer. **Kopiuj ścieżkę** copies its full path, also while the source is
+offline. **Wskaż folder źródłowy** remaps the scan root for this viewing session
+when a drive letter or folder location changes; choose the equivalent root,
+not the selected file's immediate parent. Relative subfolders are preserved.
+The original root can be restored with a button. No report or source file is
+rewritten; remapping does not verify content identity at the new location.
+
+Browsing reads only SQLite, not source content or source file attributes. Each
+page uses a short read-only transaction, and query work runs outside the UI
+thread with a 15-second SQLite execution budget. No database connection is held
+between operations. Missing or moved files produce an explanatory message when
+revealed; no automatic scan is started. The selected path is checked for regular
+file status and link/reparse components before revealing. Windows paths are
+passed directly to Shell APIs without shell command interpolation. Explorer
+itself controls its preview and thumbnail behavior.
+
+The viewer uses the existing optional PySide6 GUI dependency and does not change
+scanner performance or require that dependency for CLI scans. It is currently
+a separate window, not a new tab in the main BFRS GUI. On other platforms the
+reveal action opens the containing folder without selecting the file. Existing
+version-1 inventory checkpoints are supported; JSONL alone is not a viewer input.
+
 ## Meaning of results
 
 * ENCRYPTED: a supported encryption flag, record, Office stream pair or PDF
