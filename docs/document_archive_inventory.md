@@ -50,6 +50,26 @@ are checked and encryption records/flags inspected without reading payloads.
 Encrypted Office containers are identified by EncryptionInfo+EncryptedPackage;
 legacy DOC uses FibBase.fEncrypted and BIFF8 XLS uses FILEPASS in globals.
 
+Office metadata reads follow regular FAT sectors only as far as the required
+prefix: 8 bytes of EncryptionInfo, 32 bytes of WordDocument, or XLS globals up to
+FILEPASS/EOF. A stream larger than 1 MiB is no longer rejected solely by size.
+The inspected logical prefix is capped at 1 MiB and all physical reads retain
+the shared 2 MiB / 4096-call budget. A single sector is buffered at a time;
+cycles, invalid links and truncated sectors encountered in that prefix remain
+UNKNOWN. MiniFAT streams retain olefile's reader under the shared budget.
+`ole_stream_scope=METADATA_PREFIX_ONLY` explicitly excludes validation of the
+remaining stream chain or payload. Later damage can therefore coexist with a
+classified encryption marker (or its absence in the inspected metadata).
+
+DOC additionally accepts the Word 6.0 FIB pair `wIdent=0xA5DC, nFib=0x0065`, using
+the encryption flag at the same header offset. Other versions with that legacy
+identifier remain UNKNOWN; arbitrary identifiers are not accepted. Reports
+include `doc_fib_ident` and `doc_fib_version`. XLS requires a BIFF8 workbook-globals
+BOF, rejects an unexpected nested BOF and requires a zero-length EOF record.
+These are metadata checks, not full document validation or text extraction.
+Existing failed DOC/XLS results retry on resume; already cached unknown OLE
+directories are unaffected because their inspection logic has not changed.
+
 Other OLE containers remain UNKNOWN with `OLE_TYPE_UNDETERMINED`. Their report
 now includes `ole_root_clsid` and up to 50 `ole_directory_entries` (directory ID,
 name, numeric entry type, declared size and CLSID). These are flat, reachable
@@ -130,7 +150,7 @@ unchanged successful PDF results are reused on subsequent resumes.
 ## Performance and safety
 
 Read budget: 2 MiB and 4096 read calls per file; 4096 ZIP entries/RAR blocks;
-64 KiB RAR header limit; 1 MiB Office stream limit. Non-candidates use only the
+64 KiB RAR header limit; 1 MiB Office metadata prefix limit. Non-candidates use only the
 512-byte probe. Large recognized containers may require seeks to their metadata.
 No whole-file hashing, decompression, secondary worker pool, or in-memory file
 list is used. Directory traversal is streamed; SQLite persists batches of 100.
@@ -159,3 +179,6 @@ https://github.com/ip7z/7zip/blob/main/DOC/7zFormat.txt ;
 https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-doc/26fb6c06-4e5c-4778-ab4e-edbf26a545bb ;
 https://pdf-issues.pdfa.org/32000-2-2020/clause07.html ;
 https://pdfa.org/glossary-of-pdf-terms/
+
+Legacy Word header cross-check (LibreOffice WW8Fib reader/writer):
+https://dev-builds.libreoffice.org/lcov_reports/master-2015-06-10_23.49.39/sw/source/filter/ww8/ww8scan.cxx.gcov.html
