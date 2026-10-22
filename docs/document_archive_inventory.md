@@ -82,6 +82,14 @@ An indirect encryption reference is a marker, not proof that its target exists
 or that the document can be recovered. NO_ENCRYPTION_INDICATOR means no marker
 in the supported metadata reached by this pass, not a PDF integrity guarantee.
 
+A PDF-based resource container or incomplete document may have a valid encryption
+marker but no `Root` reference. This is reported as ENCRYPTED with structure
+`PDF_TRAILERS_CHECKED_ROOT_MISSING`, reason `PDF_ENCRYPT_ENTRY_WITHOUT_ROOT`, and
+`pdf_root_reference_present=false`. This does not assert a valid document catalog
+or recoverable pages. A missing Root without an encryption marker remains UNKNOWN;
+invalid metadata or unresolved metadata links also remain UNKNOWN. Detection is
+based on structure, not a filename or producer allowlist.
+
 PDF-specific limits: 64 KiB final-tail search, 4 KiB read buffers, 32 linked xref
 sections, 256 classic subsections per section, 8192 tokens per section, nesting
 depth 32, string length 64 KiB, name/word length 256 bytes and integer length 20
