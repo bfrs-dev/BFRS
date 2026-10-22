@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sqlite3
 from pathlib import Path
 import struct
 import zipfile
@@ -249,3 +250,92 @@ def test_old_signature_only_pdf_is_reclassified_on_resume(tmp_path, monkeypatch)
     assert second['encryption_counts'] == {'ENCRYPTED': 1}
     third = runner.inventory(source, output, resume=True)
     assert third['run']['inspected'] == 0 and third['run']['reused'] == 2
+
+
+def test_unknown_ole_directory_metadata_adds_no_reads(tmp_path, monkeypatch):
+    pytest.importorskip('olefile')
+    path = ole_fixture(tmp_path/'design.art', {'Design': b'not a known format', 'Preview': b'example'})
+    original = module._ole_directory_metadata
+    monkeypatch.setattr(module, '_ole_directory_metadata', lambda ole, row: None)
+    before = module.inspect_file(path)
+    monkeypatch.setattr(module, '_ole_directory_metadata', original)
+    after = module.inspect_file(path)
+    assert after['bytes_read'] == before['bytes_read']
+    assert after['format'] == 'OLE' and after['encryption'] == 'UNKNOWN'
+    assert after['reason'] == 'OLE_TYPE_UNDETERMINED'
+    assert after['structure'] == 'DIRECTORY_CHECKED'
+    assert after['ole_directory_entry_count'] == 2
+    assert [e['name'] for e in after['ole_directory_entries']] == ['Design', 'Preview']
+    assert all(e['type'] == 2 and e['size'] == 4096 for e in after['ole_directory_entries'])
+    assert not after['ole_directory_entries_truncated']
+    monkeypatch.setattr(module, 'MAX_NAMES', 1)
+    truncated = module.inspect_file(path)
+    assert len(truncated['ole_directory_entries']) == 1
+    assert truncated['ole_directory_entries_truncated']
+    assert truncated['ole_directory_entry_count'] == 2
+    monkeypatch.setattr(module, 'MAX_MEMBERS', 1)
+    limited = module.inspect_file(path)
+    assert limited['reason'] == 'OLE_DIRECTORY_ENTRY_LIMIT'
+    assert limited['encryption'] == 'UNKNOWN'
+
+
+def test_unknown_ole_resume_migrates_old_checkpoint_and_reuses_metadata(tmp_path, monkeypatch):
+    pytest.importorskip('olefile')
+    source, output = tmp_path/'source', tmp_path/'output'
+    source.mkdir()
+    output.mkdir()
+    path = ole_fixture(source/'design.art', {'Design': b'example'})
+    (source/'plain.bin').write_bytes(b'ordinary')
+    # Exact pre-change schema: old unknown OLE had a NULL cache identity.
+    info = (source/'plain.bin').stat()
+    identity = json.dumps([info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino])
+    with sqlite3.connect(output/'inventory.sqlite') as db:
+        db.execute('CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)')
+        db.executemany('INSERT INTO metadata VALUES (?,?)',
+                       [('source', str(source.resolve())), ('version', str(module.VERSION)), ('run_id', '1')])
+        db.execute('CREATE TABLE files (path TEXT PRIMARY KEY, identity TEXT, result TEXT, run_id INTEGER)')
+        db.execute('INSERT INTO files VALUES (?,NULL,?,1)', ('design.art', '{}'))
+        db.execute('INSERT INTO files VALUES (?,?,NULL,1)', ('plain.bin', identity))
+    first = runner.inventory(source, output, resume=True)
+    assert first['run']['inspected'] == 1 and first['run']['reused'] == 1
+    original = runner.inspect_file
+    def forbidden(path):
+        raise AssertionError('stable OLE directory should be reused')
+    monkeypatch.setattr(runner, 'inspect_file', forbidden)
+    second = runner.inventory(source, output, resume=True)
+    assert second['run']['inspected'] == 0 and second['run']['reused'] == 2
+    assert second['run']['bytes_read'] == 0
+    assert second['encryption_counts'] == {'UNKNOWN': 1}
+    monkeypatch.setattr(runner, 'inspect_file', original)
+    # A future OLE parser revision invalidates only its own cached directories.
+    monkeypatch.setattr(module, 'OLE_INVENTORY_REVISION', module.OLE_INVENTORY_REVISION+1)
+    monkeypatch.setattr(runner, 'OLE_INVENTORY_REVISION', module.OLE_INVENTORY_REVISION)
+    third = runner.inventory(source, output, resume=True)
+    assert third['run']['inspected'] == 1 and third['run']['reused'] == 1
+    assert runner.inventory(source, output, resume=True)['run']['bytes_read'] == 0
+    # A changed source is inspected and may now have a positive encryption marker.
+    ole_fixture(path, {'EncryptionInfo': struct.pack('<HHI', 4, 4, 64),
+                       'EncryptedPackage': struct.pack('<Q', 100)+b'example'})
+    fourth = runner.inventory(source, output, resume=True)
+    assert fourth['run']['inspected'] == 1
+    assert fourth['encryption_counts'] == {'ENCRYPTED': 1}
+
+
+@pytest.mark.parametrize('case', ['warnings', 'limit', 'invalid', 'dependency', 'changed'])
+def test_unreliable_ole_is_still_retried(tmp_path, monkeypatch, case):
+    source, output = tmp_path/'source', tmp_path/'output'
+    source.mkdir()
+    (source/'sample.art').write_bytes(module.OLE_MAGIC)
+    structures = {'warnings': 'DIRECTORY_CHECKED_WITH_WARNINGS', 'limit': 'LIMIT_OR_UNSUPPORTED',
+                  'invalid': 'INVALID_OR_UNSUPPORTED_METADATA', 'dependency': 'LIMIT_OR_UNSUPPORTED',
+                  'changed': 'SOURCE_CHANGED'}
+    reasons = {'warnings': 'OLE_TYPE_UNDETERMINED', 'limit': 'OLE_DIRECTORY_ENTRY_LIMIT',
+               'invalid': 'TRUNCATED_METADATA', 'dependency': 'INSTALL_INVENTORY_EXTRA_FOR_OLE',
+               'changed': 'SOURCE_CHANGED_DURING_READ'}
+    monkeypatch.setattr(runner, 'inspect_file', lambda path: {
+        'format': 'OLE', 'encryption': 'UNKNOWN', 'structure': structures[case],
+        'reason': reasons[case], 'bytes_read': 8, 'ole_inventory_revision': module.OLE_INVENTORY_REVISION})
+    runner.inventory(source, output)
+    second = runner.inventory(source, output, resume=True)
+    assert second['run']['inspected'] == 1 and second['run']['reused'] == 0
+    assert second['encryption_counts'] == {'UNKNOWN': 1}
