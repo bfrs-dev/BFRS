@@ -50,6 +50,26 @@ are checked and encryption records/flags inspected without reading payloads.
 Encrypted Office containers are identified by EncryptionInfo+EncryptedPackage;
 legacy DOC uses FibBase.fEncrypted and BIFF8 XLS uses FILEPASS in globals.
 
+Other OLE containers remain UNKNOWN with `OLE_TYPE_UNDETERMINED`. Their report
+now includes `ole_root_clsid` and up to 50 `ole_directory_entries` (directory ID,
+name, numeric entry type, declared size and CLSID). These are flat, reachable
+entries already loaded by olefile, not full hierarchical paths. The report also
+includes the reachable non-root entry count, truncation flag and parsing-warning
+flag. Directory slots are capped at 4096. No additional streams are opened and
+no extra file reads are needed to collect these fields. Names, extensions and
+CLSID values alone do not prove a format, absence of encryption or valid payload.
+
+An unknown OLE container with a checked directory and no parser warnings can
+now be cached on resume, while retaining its UNKNOWN encryption result. This
+avoids repeatedly reading the same unsupported structure. An OLE-specific
+inspection revision invalidates these cached entries when that analysis changes.
+Errors, parser warnings, limits, changed sources and missing dependencies are
+still retried. The version-1 SQLite schema gains an `inspection_revision` column
+automatically; existing reports and successful-file checkpoints are preserved.
+The first resume of an older checkpoint reads these unknown OLE files once to
+collect the directory metadata; subsequent unchanged resumes reuse it. Actual
+format recognition for proprietary OLE payloads remains follow-up work.
+
 7z start/next-header CRCs are checked when within budget, but encryption remains
 UNKNOWN pending a deeper coder/header parser. RTF is recognized by its start
 signature, without parsing its full body. No integrity guarantee is made for a
@@ -103,7 +123,8 @@ This implementation uses the Python standard library only. No additional PDF
 dependency is needed for the separate inventory script. Checkpoint version 1
 is retained: old signature-only UNKNOWN PDF results are already retried by
 `--resume`; unchanged successful results for other files are reused. Other
-recognized UNKNOWN formats are also retried, as before. After classification,
+recognized UNKNOWN formats are retried, except checked OLE directories described
+above. After classification,
 unchanged successful PDF results are reused on subsequent resumes.
 
 ## Performance and safety
@@ -117,8 +138,9 @@ On interruption the current batch is committed and reports exported. Abrupt
 termination can require redoing the last uncommitted batch.
 
 Resume enumerates paths and stats again but reuses unchanged successfully
-classified files using size, mtime and filesystem identity. Undetermined
-recognized containers are retried (e.g. after installing olefile). It does not
+classified files using size, mtime and filesystem identity. Checked unknown OLE
+directories are also reused until their inspection revision changes. Other
+undetermined recognized containers are retried (e.g. after installing olefile). It does not
 prove content identity if metadata has been deliberately preserved. Reports
 include only paths visited in the current run; on a complete run deleted paths
 are absent. Incomplete exports have complete=false.
