@@ -52,15 +52,22 @@ def rar5_header(body):
 
 
 def ole_fixture(path, streams):
-    # Minimal valid CFB v3 with normal FAT streams (4096 bytes each), no mini FAT.
+    # CFB v3 with normal FAT streams; supports multi-MiB synthetic payloads.
     free, end, fat_sector = 0xffffffff, 0xfffffffe, 0xfffffffd
+    sizes = [max(4096, len(content)) for content in streams.values()]
+    sectors = [(size+511)//512 for size in sizes]
+    fat_count = 1
+    while fat_count*128 < fat_count+1+sum(sectors):
+        fat_count += 1
+    assert fat_count <= 109 and len(streams) <= 3
     header = bytearray(512)
     header[:8] = module.OLE_MAGIC
     struct.pack_into('<HHHHH', header, 24, 0x3e, 3, 0xfffe, 9, 6)
-    struct.pack_into('<LLLLLLLLL', header, 40, 0, 1, 1, 0, 4096, end, 0, end, 0)
-    struct.pack_into('<109L', header, 76, 0, *([free]*108))
-    fat = [free]*128
-    fat[0], fat[1] = fat_sector, end
+    struct.pack_into('<LLLLLLLLL', header, 40, 0, fat_count, fat_count, 0, 4096, end, 0, end, 0)
+    struct.pack_into('<109L', header, 76, *range(fat_count), *([free]*(109-fat_count)))
+    fat = [free]*(128*fat_count)
+    fat[:fat_count] = [fat_sector]*fat_count
+    fat[fat_count] = end
     directory = bytearray(512)
     def entry(index, name, kind, child, sibling, sector, size):
         offset = index*128
@@ -70,13 +77,15 @@ def ole_fixture(path, streams):
         struct.pack_into('<LQ', directory, offset+116, sector, size)
     entry(0, 'Root Entry', 5, 1, free, end, 0)
     payload = []
+    sector = fat_count+1
     for index, (name, content) in enumerate(streams.items(), 1):
-        sector = 2+(index-1)*8
-        entry(index, name, 2, free, index+1 if index<len(streams) else free, sector, 4096)
-        for current in range(sector, sector+8):
-            fat[current] = current+1 if current < sector+7 else end
-        payload.append(content.ljust(4096, b'\0'))
-    path.write_bytes(header + struct.pack('<128L', *fat) + directory + b''.join(payload))
+        count = sectors[index-1]
+        entry(index, name, 2, free, index+1 if index<len(streams) else free, sector, sizes[index-1])
+        for current in range(sector, sector+count):
+            fat[current] = current+1 if current < sector+count-1 else end
+        payload.append(content.ljust(count*512, b'\0'))
+        sector += count
+    path.write_bytes(header + struct.pack(f'<{len(fat)}L', *fat) + directory + b''.join(payload))
     return path
 
 
@@ -339,3 +348,130 @@ def test_unreliable_ole_is_still_retried(tmp_path, monkeypatch, case):
     second = runner.inventory(source, output, resume=True)
     assert second['run']['inspected'] == 1 and second['run']['reused'] == 0
     assert second['encryption_counts'] == {'UNKNOWN': 1}
+
+
+@pytest.mark.parametrize('flags,expected', [(0, 'NO_ENCRYPTION_INDICATOR'), (0x100, 'ENCRYPTED')])
+def test_word6_prefix_and_mini_stream(tmp_path, flags, expected):
+    pytest.importorskip('olefile')
+    fib = bytearray(32)
+    struct.pack_into('<HH', fib, 0, 0xa5dc, 0x65)
+    struct.pack_into('<H', fib, 10, flags)
+    path = ole_fixture(tmp_path/'legacy.bin', {'WordDocument': fib})
+    row = module.inspect_file(path)
+    assert row['encryption'] == expected and row['doc_fib_version'] == 0x65
+    assert row['bytes_read'] < 4096
+    # Convert the synthetic directory to a MiniFAT-backed 32-byte FIB.
+    data = bytearray(path.read_bytes())
+    struct.pack_into('<LL', data, 60, 2, 1)
+    struct.pack_into('<LL', data, 512+2*4, 0xfffffffe, 0xfffffffe)
+    struct.pack_into('<LQ', data, 1024+116, 3, 64)
+    struct.pack_into('<LQ', data, 1024+128+116, 0, 32)
+    data[1536:2048] = struct.pack('<128L', 0xfffffffe, *([0xffffffff]*127))
+    data[2048:2080] = fib
+    path.write_bytes(data)
+    assert module.inspect_file(path)['encryption'] == expected
+    struct.pack_into('<H', data, 2050, 0x99)
+    path.write_bytes(data)
+    assert module.inspect_file(path)['reason'] == 'DOC_LEGACY_FIB_VERSION_UNSUPPORTED'
+
+
+@pytest.mark.parametrize('kind', ['DOC', 'XLS', 'OFFICE_ENCRYPTED'])
+@pytest.mark.parametrize('encrypted', [False, True])
+def test_large_office_streams_use_bounded_prefix(tmp_path, kind, encrypted):
+    pytest.importorskip('olefile')
+    tail = b'\0'*(3*1024*1024)
+    if kind == 'DOC':
+        fib = bytearray(32)
+        struct.pack_into('<HH', fib, 0, 0xa5ec, 0xc1)
+        struct.pack_into('<H', fib, 10, 0x100 if encrypted else 0)
+        streams = {'WordDocument': fib+tail}
+    elif kind == 'XLS':
+        bof = struct.pack('<HHHH', 0x809, 4, 0x600, 5)
+        # A record/header crossing sectors plus a FILEPASS in a later sector.
+        extra = struct.pack('<HH', 0x42, 499)+b'\0'*499
+        if encrypted:
+            extra += struct.pack('<HH', 0x2f, 6)+b'\0'*6
+        streams = {'Workbook': bof+extra+struct.pack('<HH', 10, 0)+tail}
+    else:
+        streams = {'EncryptionInfo': struct.pack('<HHI', 4, 4, 64)+tail,
+                   'EncryptedPackage': struct.pack('<Q', 100)}
+    row = module.inspect_file(ole_fixture(tmp_path/'large.bin', streams))
+    assert row['format'] == kind
+    assert row['encryption'] == ('ENCRYPTED' if encrypted or kind == 'OFFICE_ENCRYPTED'
+                                 else 'NO_ENCRYPTION_INDICATOR')
+    assert row['bytes_read'] < 40*1024
+    assert row['ole_stream_scope'] == 'METADATA_PREFIX_ONLY'
+
+
+@pytest.mark.parametrize('link', [2, 0xfffffffe, 0xffffffff, 0xfffffffd, 120])
+def test_ole_prefix_rejects_broken_chain(tmp_path, link):
+    pytest.importorskip('olefile')
+    content = struct.pack('<HHHHHH', 0x809, 4, 0x600, 5, 0x42, 600)+b'\0'*600
+    content += struct.pack('<HH', 10, 0)
+    path = ole_fixture(tmp_path/'broken.xls', {'Workbook': content})
+    data = bytearray(path.read_bytes())
+    struct.pack_into('<L', data, 512+2*4, link)
+    path.write_bytes(data)
+    row = module.inspect_file(path)
+    assert row['encryption'] == 'UNKNOWN'
+    assert row['structure'] == 'INVALID_OR_UNSUPPORTED_METADATA'
+
+
+def test_fragmented_ole_prefix_and_shared_budgets(tmp_path, monkeypatch):
+    pytest.importorskip('olefile')
+    content = struct.pack('<HHHHHH', 0x809, 4, 0x600, 5, 0x42, 600)+b'\0'*600
+    content += struct.pack('<HH', 10, 0)
+    path = ole_fixture(tmp_path/'fragmented.xls', {'Workbook': content})
+    data = bytearray(path.read_bytes())
+    # Move logical sector two to a non-adjacent sector and link it back.
+    data[512+7*512:512+8*512] = data[512+3*512:512+4*512]
+    struct.pack_into('<L', data, 512+2*4, 7)
+    struct.pack_into('<L', data, 512+7*4, 4)
+    path.write_bytes(data)
+    assert module.inspect_file(path)['encryption'] == 'NO_ENCRYPTION_INDICATOR'
+    with monkeypatch.context() as m:
+        m.setattr(module, 'MAX_OLE_METADATA_BYTES', 512)
+        assert module.inspect_file(path)['reason'] == 'OLE_METADATA_PREFIX_LIMIT'
+    with monkeypatch.context() as m:
+        m.setattr(module, 'MAX_READ_BYTES', 2048)
+        assert module.inspect_file(path)['encryption'] == 'UNKNOWN'
+    with monkeypatch.context() as m:
+        m.setattr(module, 'MAX_READ_CALLS', 2)
+        assert module.inspect_file(path)['encryption'] == 'UNKNOWN'
+
+
+@pytest.mark.parametrize('content', [
+    struct.pack('<HHHHHH', 0x809, 4, 0x500, 5, 10, 0),
+    struct.pack('<HHHHHH', 0x809, 4, 0x600, 0x10, 10, 0),
+    struct.pack('<HHHHHH', 0x809, 4, 0x600, 5, 0x809, 0),
+    struct.pack('<HHHHHH', 0x809, 4, 0x600, 5, 10, 1)+b'x',
+    struct.pack('<HHHHHH', 0x809, 4, 0x600, 5, 0x2f, 2)+b'xx',
+    struct.pack('<HHHHHH', 0x809, 4, 0x600, 5, 0x42, 65535),
+])
+def test_invalid_xls_globals_stay_unknown(tmp_path, content):
+    pytest.importorskip('olefile')
+    row = module.inspect_file(ole_fixture(tmp_path/'invalid.xls', {'Workbook': content}))
+    assert row['encryption'] == 'UNKNOWN'
+
+
+def test_old_office_limit_checkpoint_refreshes_only_failed_files(tmp_path, monkeypatch):
+    pytest.importorskip('olefile')
+    source, output = tmp_path/'source', tmp_path/'output'
+    source.mkdir()
+    content = struct.pack('<HHHHHH', 0x809, 4, 0x600, 5, 10, 0)+b'\0'*(2*1024*1024)
+    ole_fixture(source/'large.xls', {'Workbook': content})
+    ole_fixture(source/'unsupported.bin', {'Design': b'example'})
+    (source/'ordinary.bin').write_bytes(b'ordinary')
+    original = runner.inspect_file
+    def old(path):
+        if path.suffix == '.xls':
+            return dict(format='XLS', encryption='UNKNOWN', structure='LIMIT_OR_UNSUPPORTED',
+                        reason='OLE_STREAM_LIMIT', bytes_read=512)
+        return original(path)
+    monkeypatch.setattr(runner, 'inspect_file', old)
+    runner.inventory(source, output)
+    monkeypatch.setattr(runner, 'inspect_file', original)
+    second = runner.inventory(source, output, resume=True)
+    assert second['run']['inspected'] == 1 and second['run']['reused'] == 2
+    third = runner.inventory(source, output, resume=True)
+    assert third['run']['inspected'] == 0 and third['run']['bytes_read'] == 0
