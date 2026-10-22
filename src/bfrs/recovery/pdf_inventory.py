@@ -286,12 +286,17 @@ def inspect_pdf(reader):
         checked[offset] = (encrypt[0] != 'null', is_stream, b'Root' in fields)
 
     visit(int(ending[1]))
-    if not any(row[2] for row in checked.values()):
-        raise ValueError('PDF_ROOT_REFERENCE_MISSING')
+    has_root = any(row[2] for row in checked.values())
     encrypted = any(row[0] for row in checked.values())
+    # PDF-based resource containers can carry encryption metadata without a
+    # document catalog. Preserve that positive marker while disclosing the
+    # missing Root; its absence must still prevent an unencrypted verdict.
+    if not has_root and not encrypted:
+        raise ValueError('PDF_ROOT_REFERENCE_MISSING')
     return {'encryption': 'ENCRYPTED' if encrypted else 'NO_ENCRYPTION_INDICATOR',
-            'structure': 'PDF_TRAILERS_CHECKED',
-            'reason': 'PDF_ENCRYPT_ENTRY' if encrypted else None,
+            'structure': 'PDF_TRAILERS_CHECKED' if has_root else 'PDF_TRAILERS_CHECKED_ROOT_MISSING',
+            'reason': ('PDF_ENCRYPT_ENTRY' if has_root else 'PDF_ENCRYPT_ENTRY_WITHOUT_ROOT') if encrypted else None,
+            'pdf_root_reference_present': has_root,
             'pdf_xref_sections': len(checked),
             'pdf_xref_streams': sum(row[1] for row in checked.values()),
             'pdf_trailing_bytes': trailing_bytes,
