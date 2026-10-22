@@ -58,7 +58,9 @@ def export_reports(connection, output, run_id, complete, counters):
     summary = {'version': VERSION, 'complete': complete, 'encryption_counts': dict(counts),
                'run': counters, 'scope': 'FILE_START_SIGNATURES_AND_BOUNDED_METADATA',
                'limitations': ['NO_EXTRACTION_OR_PASSWORD_ATTEMPTS', 'NO_PAYLOAD_INTEGRITY_TEST',
-                              'PDF_AND_7Z_ENCRYPTION_MAY_REMAIN_UNKNOWN', 'NO_SFX_OR_EMBEDDED_SIGNATURE_SEARCH',
+                              '7Z_ENCRYPTION_MAY_REMAIN_UNKNOWN',
+                              'PDF_METADATA_ONLY_NO_PASSWORD_OR_PAYLOAD_CHECK',
+                              'NO_SFX_OR_EMBEDDED_SIGNATURE_SEARCH',
                               'RESUME_USES_SIZE_MTIME_AND_FILE_ID_NOT_CONTENT_HASH']}
     temporary = output / 'summary.json.tmp'
     temporary.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8')
