@@ -135,7 +135,7 @@ def test_bad_tail_offset_cycle_and_header_only(tmp_path):
     path = tmp_path/'broken.pdf'
     previous = classic_pdf(path)
     original = path.read_bytes()
-    for data in [b'%PDF-1.7\n', original[:-10], original+b'not whitespace',
+    for data in [b'%PDF-1.7\n', original[:-10], original+b'\xffbinary suffix',
                  original.replace(str(previous).encode()+b'\n%%EOF', b'1\n%%EOF')]:
         path.write_bytes(data)
         assert inventory.inspect_file(path)['encryption'] == 'UNKNOWN'
@@ -222,3 +222,43 @@ def test_empty_subsections_still_obey_section_limit(tmp_path):
     path.write_bytes(data+b'trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n9\n%%EOF\n')
     row = inventory.inspect_file(path)
     assert row['encryption'] == 'UNKNOWN' and row['reason'] == 'PDF_XREF_SUBSECTION_LIMIT'
+
+
+@pytest.mark.parametrize('encrypted', [False, True])
+@pytest.mark.parametrize('suffix', [b'<font color=#CCCCCC>Diagnostic time = 1.25\n<br></font>',
+                                  b'Producer diagnostic message\n'])
+def test_short_text_after_eof_is_disclosed_without_losing_encryption(tmp_path, encrypted, suffix):
+    path = tmp_path/'diagnostic-footer.pdf'
+    classic_pdf(path, b'/Encrypt 3 0 R' if encrypted else b'')
+    with path.open('ab') as stream:
+        stream.write(suffix)
+    row = inventory.inspect_file(path)
+    assert row['encryption'] == ('ENCRYPTED' if encrypted else 'NO_ENCRYPTION_INDICATOR')
+    assert row['pdf_trailing_bytes'] == len(suffix)+1  # newline after %%EOF
+
+
+@pytest.mark.parametrize('suffix,reason', [
+    (b'x'*1025, 'PDF_TRAILING_DATA_LIMIT'),
+    (b'\xff\x80', 'PDF_TRAILING_DATA_UNSUPPORTED'),
+    (b'9 0 obj\n<< /Encrypt 3 0 R >>\nendobj', 'PDF_TRAILING_UPDATE_UNSUPPORTED'),
+    (b'startxref\n0', 'PDF_TRAILING_UPDATE_UNSUPPORTED'),
+    (b'%PDF-1.7\n', 'PDF_TRAILING_UPDATE_UNSUPPORTED'),
+    (b'trailer\n<< /Size 4 >>', 'PDF_TRAILING_UPDATE_UNSUPPORTED'),
+    (b'junk\n%%EOF\n', 'PDF_FINAL_STARTXREF_MISSING'),
+])
+def test_trailing_binary_updates_and_invalid_last_eof_remain_unknown(tmp_path, suffix, reason):
+    path = tmp_path/'trailing.pdf'
+    classic_pdf(path)
+    with path.open('ab') as stream:
+        stream.write(suffix)
+    row = inventory.inspect_file(path)
+    assert row['encryption'] == 'UNKNOWN' and row['reason'] == reason
+
+
+def test_whitespace_after_eof_is_not_reported_as_extra_data(tmp_path):
+    path = tmp_path/'whitespace.pdf'
+    classic_pdf(path)
+    with path.open('ab') as stream:
+        stream.write(b'\r\n\t ')
+    row = inventory.inspect_file(path)
+    assert row['encryption'] == 'NO_ENCRYPTION_INDICATOR' and row['pdf_trailing_bytes'] == 0
