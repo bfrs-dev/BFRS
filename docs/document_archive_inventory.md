@@ -91,6 +91,39 @@ are checked and encryption records/flags inspected without reading payloads.
 Encrypted Office containers are identified by EncryptionInfo+EncryptedPackage;
 legacy DOC uses FibBase.fEncrypted and BIFF8 XLS uses FILEPASS in globals.
 
+### Large classic ZIP directories
+
+Classic single-volume ZIP directories are no longer rejected at 4096 entries.
+They are traversed with a 64 KiB input window, retaining at most 50 names of
+512 characters each and the fixed OOXML marker set. Each entry's header and
+filename are checked, including entries after the name-report limit. Extra
+fields and comments are skipped by their bounded lengths, reusing prefetched
+bytes where available. No archive members are extracted or decompressed.
+
+The existing 2 MiB / 4096-read per-file budgets still apply, including the initial
+signature probe and final EOCD search. A declared central-directory size larger
+than the remaining byte budget is rejected before reading the directory, even
+if skipping extra fields might have made a partial scan cheaper. This keeps
+over-budget retries inexpensive and never turns a partial check into a negative
+encryption finding. The classic count field bounds the parser to at most 65534
+entries; 65535 remains a ZIP64 sentinel, not a supported count.
+
+Reports include `zip_declared_members`, `zip_directory_size` (bytes) and
+`zip_members_checked` when a supported EOCD has been found. These are diagnostic
+fields: encryption classification and `member_count`/`encrypted_members` are
+published only after all declared entries and the directory boundary pass the
+existing checks. Malformed entries, truncation, unsupported layouts and limits
+remain UNKNOWN, even if an earlier entry carried a marker. This does not check
+local headers, payload integrity or password requirements. ZIP64, multivolume,
+directory trailers and encrypted central-directory layouts remain unsupported.
+
+Checkpoint version 1 is retained. Old `ZIP_MEMBER_LIMIT` results already retry
+on `--resume`; unchanged successful ZIP and other cached file results are reused.
+Newly classified ZIPs are reusable on the next resume. Other unresolved formats
+also retain their existing retry behavior; resume is not a ZIP-only pass.
+
+Format reference: https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
+
 ### Windows EFS attributes
 
 The inventory checks `st_file_attributes & FILE_ATTRIBUTE_ENCRYPTED` (`0x4000`)
@@ -238,7 +271,8 @@ unchanged successful PDF results are reused on subsequent resumes.
 
 ## Performance and safety
 
-Read budget: 2 MiB and 4096 read calls per file; 4096 ZIP entries/RAR blocks;
+Read budget: 2 MiB and 4096 read calls per file; 4096 RAR blocks;
+classic ZIP counts up to 65534 with a 64 KiB directory window and the shared byte budget;
 64 KiB RAR header limit; 1 MiB Office metadata prefix limit. Non-candidates use only the
 512-byte probe. Large recognized containers may require seeks to their metadata.
 No whole-file hashing, decompression, secondary worker pool, or in-memory file
