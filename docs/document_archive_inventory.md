@@ -212,10 +212,37 @@ The first resume of an older checkpoint reads these unknown OLE files once to
 collect the directory metadata; subsequent unchanged resumes reuse it. Actual
 format recognition for proprietary OLE payloads remains follow-up work.
 
-7z start/next-header CRCs are checked when within budget, but encryption remains
-UNKNOWN pending a deeper coder/header parser. RTF is recognized by its start
-signature, without parsing its full body. No integrity guarantee is made for a
-payload, document XML or embedded files.
+RTF is recognized by its start signature, without parsing its full body. No
+integrity guarantee is made for a payload, document XML or embedded files.
+
+### 7z encryption metadata
+
+The inventory validates start/next-header CRCs and parses supported coder chains,
+stream ranges and inline file metadata. A structured 7z AES coder produces
+ENCRYPTED, distinguishing encrypted member data (`7Z_AES_DATA`) from an encrypted
+header (`7Z_AES_HEADER`). An encrypted header is not decrypted; its member count
+and data-encryption status remain undetermined. Byte matches in filenames,
+unrelated properties or payloads do not count as encryption markers.
+
+Unencrypted headers can be plain or encoded with a single Copy, LZMA or LZMA2
+coder. Only this metadata stream is decoded, using Python's standard library;
+archive members are never extracted and passwords are never attempted. Header
+streams are capped at 1 MiB each for packed and decoded sizes, with an LZMA
+dictionary cap of 16 MiB. All physical reads still share the 2 MiB / 4096-call
+file budget. Additional structural limits are 256 folders/packed streams,
+8 coders per folder, 65536 files/substreams and 32 metadata properties.
+
+Only single-input/output coder chains are supported. Additional metadata streams,
+external properties, unsupported header encodings, invalid CRCs, malformed data
+and exceeded limits remain UNKNOWN. Unknown member compression methods also
+prevent a negative encryption classification. Known non-encrypting coders produce
+NO_ENCRYPTION_INDICATOR after the supported metadata has been checked; this does
+not validate member payloads or prove that the archive can be recovered.
+
+Reports expose `seven_zip_header_encoding`, separate header/data encryption
+indicators and coder method identifiers. Old signature-only UNKNOWN 7z results
+are retried automatically with `--resume`; unchanged successful results are then
+reused. No checkpoint reset or additional runtime package is required.
 
 ### PDF encryption metadata
 
@@ -275,8 +302,9 @@ Read budget: 2 MiB and 4096 read calls per file; 4096 RAR blocks;
 classic ZIP counts up to 65534 with a 64 KiB directory window and the shared byte budget;
 64 KiB RAR header limit; 1 MiB Office metadata prefix limit. Non-candidates use only the
 512-byte probe. Large recognized containers may require seeks to their metadata.
-No whole-file hashing, decompression, secondary worker pool, or in-memory file
-list is used. Directory traversal is streamed; SQLite persists batches of 100.
+No whole-file hashing, member-payload decompression, secondary worker pool, or
+in-memory file list is used. Only supported 7z metadata headers may be decoded
+within the limits above. Directory traversal is streamed; SQLite persists batches of 100.
 On interruption the current batch is committed and reports exported. Abrupt
 termination can require redoing the last uncommitted batch.
 
@@ -299,6 +327,7 @@ remains a candidate for a later focused pass.
 
 Format references: https://www.rarlab.com/technote.htm ;
 https://github.com/ip7z/7zip/blob/main/DOC/7zFormat.txt ;
+https://github.com/ip7z/7zip/blob/main/DOC/Methods.txt ;
 https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-doc/26fb6c06-4e5c-4778-ab4e-edbf26a545bb ;
 https://pdf-issues.pdfa.org/32000-2-2020/clause07.html ;
 https://pdfa.org/glossary-of-pdf-terms/
