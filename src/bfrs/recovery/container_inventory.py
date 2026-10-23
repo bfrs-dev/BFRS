@@ -6,6 +6,7 @@ import stat
 import zlib
 
 from bfrs.recovery.pdf_inventory import PDFMetadataLimit, inspect_pdf
+from bfrs.recovery.seven_zip_inventory import SevenZipLimit, inspect_7z
 
 VERSION = 1
 # Bump when unknown-OLE inspection changes, so cached metadata is refreshed.
@@ -444,13 +445,7 @@ def inspect_file(path):
                 _rar(reader, result, False)
             elif prefix.startswith(b'7z\xbc\xaf\x27\x1c'):
                 result['format'] = '7Z'
-                if len(prefix) < 32 or zlib.crc32(prefix[12:32]) & 0xffffffff != struct.unpack_from('<L', prefix, 8)[0]:
-                    raise ValueError('7Z_START_CRC_MISMATCH')
-                offset, size, crc = struct.unpack_from('<QQL', prefix, 12)
-                header = reader.at(32+offset, size)
-                if zlib.crc32(header) & 0xffffffff != crc:
-                    raise ValueError('7Z_NEXT_HEADER_CRC_MISMATCH')
-                result.update(structure='HEADER_CRC_CHECKED', reason='7Z_ENCRYPTION_REQUIRES_DEEPER_PARSER')
+                result.update(inspect_7z(reader, prefix))
             elif prefix.startswith(OLE_MAGIC):
                 result['format'] = 'OLE'
                 _ole(reader, result)
@@ -461,7 +456,7 @@ def inspect_file(path):
                 result.update(inspect_pdf(reader))
             else:
                 result.update(structure='NOT_RECOGNIZED', reason='NO_SUPPORTED_START_SIGNATURE')
-        except (InventoryLimit, PDFMetadataLimit) as error:
+        except (InventoryLimit, PDFMetadataLimit, SevenZipLimit) as error:
             result.update(encryption='UNKNOWN', reason=str(error), structure='LIMIT_OR_UNSUPPORTED')
         except (ValueError, OSError, struct.error, IndexError, RecursionError) as error:
             result.update(encryption='UNKNOWN', structure='INVALID_OR_UNSUPPORTED_METADATA',
