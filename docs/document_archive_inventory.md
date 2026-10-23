@@ -10,9 +10,9 @@ extracts archive payloads, launches Office, evaluates macros or tries passwords.
 From the checkout containing this change:
 
 ```powershell
-cd C:\Projects\BFRS-2.0
+cd C:\Example\BFRS
 py -m pip install -e ".[inventory]"
-py .\scripts\inventory_documents.py --source "E:\Disk_Drill_Hp" --output "D:\BFRS-inventory-01"
+py .\scripts\inventory_documents.py --source "E:\ExampleSource" --output "D:\ExampleReports\inventory-01"
 ```
 
 The output directory must be new and outside the source tree. `olefile` is an
@@ -22,12 +22,12 @@ remain UNKNOWN with a dependency reason; other formats still work.
 Stop with Ctrl+C; restart using the same paths plus `--resume`:
 
 ```powershell
-py .\scripts\inventory_documents.py --source "E:\Disk_Drill_Hp" --output "D:\BFRS-inventory-01" --resume
+py .\scripts\inventory_documents.py --source "E:\ExampleSource" --output "D:\ExampleReports\inventory-01" --resume
 ```
 
 Outputs:
 
-* `inventory.jsonl`: recognized candidates, suspicious extensions, read errors
+* `inventory.jsonl`: recognized candidates, EFS-marked files/folders, suspicious extensions, read errors
   and skipped links, one JSON record per file/path.
 * `summary.json`: counts and explicit completeness/scope/limitations.
 * `inventory.sqlite`: durable per-file checkpoint; do not delete while resuming.
@@ -41,7 +41,7 @@ The separate viewer opens an existing `inventory.sqlite` in read-only mode:
 
 ```powershell
 py -3.13 -m pip install "PySide6>=6.11,<7"
-py -3.13 .\scripts\view_inventory.py --report "D:\BFRS-inventory-01\inventory.sqlite"
+py -3.13 .\scripts\view_inventory.py --report "D:\ExampleReports\inventory-01\inventory.sqlite"
 ```
 
 The default filter shows encryption markers. Other filters show UNKNOWN,
@@ -66,7 +66,7 @@ page uses a short read-only transaction, and query work runs outside the UI
 thread with a 15-second SQLite execution budget. No database connection is held
 between operations. Missing or moved files produce an explanatory message when
 revealed; no automatic scan is started. The selected path is checked for regular
-file status and link/reparse components before revealing. Windows paths are
+file or directory status (as recorded in the report) and link/reparse components before revealing. Windows paths are
 passed directly to Shell APIs without shell command interpolation. Explorer
 itself controls its preview and thumbnail behavior.
 
@@ -79,7 +79,7 @@ version-1 inventory checkpoints are supported; JSONL alone is not a viewer input
 ## Meaning of results
 
 * ENCRYPTED: a supported encryption flag, record, Office stream pair or PDF
-  trailer encryption entry was found.
+  trailer encryption entry was found, or Windows reports an EFS attribute.
 * NO_ENCRYPTION_INDICATOR: no encryption marker was found in the checked headers.
   This does NOT prove the payload is intact, fully readable or wallet-related.
 * UNKNOWN: unsupported metadata, a limit, an error, or an undecided format.
@@ -90,6 +90,54 @@ OOXML marker paths distinguish DOCX/XLSX/PPTX inside ZIP. RAR3/RAR5 header CRCs
 are checked and encryption records/flags inspected without reading payloads.
 Encrypted Office containers are identified by EncryptionInfo+EncryptedPackage;
 legacy DOC uses FibBase.fEncrypted and BIFF8 XLS uses FILEPASS in globals.
+
+### Windows EFS attributes
+
+The inventory checks `st_file_attributes & FILE_ATTRIBUTE_ENCRYPTED` (`0x4000`)
+from the stat metadata already collected during traversal. It identifies regular
+files regardless of extension, empty directories, nested directories and the
+scan root itself. Links/reparse points remain skipped, including ones that also
+carry the encrypted bit. Ordinary directories do not create extra SQLite rows.
+
+EFS results use `format=WINDOWS_EFS`, `filesystem_encryption=EFS`,
+`entry_kind=file|directory`, `structure=FILESYSTEM_ATTRIBUTE_ONLY` and
+`content_inspection=NOT_PERFORMED`. EFS file content is not opened, decrypted or
+checked for container encryption, even when the current account could read it.
+No certificates, keys, password prompts or additional dependencies are needed
+for this attribute check. Inaccessible attributes cannot be classified; access
+denial alone is never evidence of encryption.
+
+An EFS directory marker means encryption is the default for newly created files;
+it does not prove every existing child is encrypted. Children are still visited
+and assessed individually. The viewer distinguishes **Plik EFS** and **Folder EFS**,
+explains this distinction and can copy/reveal either. The scan root is recorded
+as `path="."` and shown as **(folder źródłowy)**. Directories have no reported file
+size. A folder whose attributes are available but whose enumeration fails retains
+the EFS marker plus `scan_error`; the error counter increases and the folder is
+retried on resume. EFS folders are emitted after their children (or enumeration
+failure), so an interrupted run can omit a parent marker until resumed.
+
+`summary.json` includes separate `efs_counts.files` and `efs_counts.directories`
+within the overall encryption counts. `filesystem_encryption_check` reports
+`WINDOWS_FILE_ATTRIBUTES` or `UNAVAILABLE_ON_THIS_PLATFORM`; absence of Windows
+attributes is not a negative EFS finding. `run.visited` counts emitted paths
+(files, marked folders and errors); `reported_directories` is its directory
+subset and `metadata_only` counts freshly classified EFS paths without payload
+reads. Reused EFS rows are counted in `reused`, not `metadata_only`.
+
+On resume, the currently observed EFS flag participates in cache identity.
+Adding/removing it invalidates only affected file rows even if size/mtime/file ID
+are unchanged. Old non-EFS version-1 identities remain reusable, including rows
+with no candidate result. Previously cached ordinary files that now have EFS are
+therefore detected without a mass content rescan. Removed folder markers and
+deleted paths disappear from a completed current-run export.
+
+This checks current filesystem attributes, not historical encryption. Recovered
+or copied files may have lost their original EFS metadata. It does not detect
+BitLocker volumes, TrueCrypt/VeraCrypt containers or EFS metadata inside raw disk
+images. No Windows encryption settings are changed.
+
+Reference: https://learn.microsoft.com/en-us/windows/win32/fileio/handling-encrypted-files-and-directories
 
 Office metadata reads follow regular FAT sectors only as far as the required
 prefix: 8 bytes of EncryptionInfo, 32 bytes of WordDocument, or XLS globals up to
