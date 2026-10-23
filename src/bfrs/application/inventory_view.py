@@ -68,11 +68,13 @@ def read_inventory_page(database, state='ENCRYPTED', search='', offset=0):
                              offset, len(payloads) > PAGE_SIZE)
 
 
-def source_path(source, relative):
+def source_path(source, relative, *, directory=False):
     """Resolve relative report names lexically, without accessing the source."""
     source = Path(source)
     if not source.is_absolute():
         raise ValueError('Wskaż folder źródłowy na tym komputerze.')
+    if directory and relative == '.':
+        return source
     name = PureWindowsPath(relative)
     parts = re.split(r'[\\/]', relative)
     if (not relative or name.drive or name.root or any(
@@ -82,9 +84,9 @@ def source_path(source, relative):
     return source.joinpath(*parts)
 
 
-def checked_source_path(source, relative):
-    """Before revealing, reject missing files and links/reparse points."""
-    target = source_path(source, relative)
+def checked_source_path(source, relative, *, directory=False):
+    """Before revealing, check the expected type and reject links/reparse points."""
+    target = source_path(source, relative, directory=directory)
     source = Path(source)
     # Inspect every ancestor too: a remapped root may itself sit below a link.
     components = list(reversed(source.parents)) + [source]
@@ -98,6 +100,6 @@ def checked_source_path(source, relative):
             raise ValueError('Ta lokalizacja zawiera dowiązanie lub punkt ponownej analizy.')
         if path != target and not stat.S_ISDIR(info.st_mode):
             raise ValueError('Folder źródłowy jest niedostępny.')
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError('Wybrana pozycja nie jest zwykłym plikiem.')
+    if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
+        raise ValueError('Typ wybranej pozycji nie zgadza się z raportem (plik/folder).')
     return target
