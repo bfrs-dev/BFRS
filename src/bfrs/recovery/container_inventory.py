@@ -13,6 +13,7 @@ OLE_INVENTORY_REVISION = 1
 MAX_READ_BYTES = 2 * 1024 * 1024
 MAX_READ_CALLS = 4096
 MAX_MEMBERS = 4096
+ZIP_DIRECTORY_BLOCK_BYTES = 64 * 1024
 MAX_NAMES = 50
 MAX_OLE_METADATA_BYTES = 1024 * 1024
 OLE_MAGIC = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'
@@ -60,6 +61,44 @@ class BoundedReader:
         return data
 
 
+class _ZipDirectoryReader:
+    """Forward-only central-directory window; never buffer the whole directory."""
+
+    def __init__(self, reader, offset, size):
+        self.reader, self.offset, self.size = reader, offset, size
+        self.position = self.buffer_start = 0
+        self.buffer = b''
+
+    def read(self, count):
+        if count < 0 or self.position + count > self.size:
+            raise ValueError('ZIP_TRUNCATED_DIRECTORY_ENTRY')
+        index = self.position - self.buffer_start
+        if 0 <= index and index + count <= len(self.buffer):
+            self.position += count
+            return self.buffer[index:index + count]
+        chunks = []
+        remaining = count
+        while remaining:
+            index = self.position - self.buffer_start
+            if not 0 <= index < len(self.buffer):
+                self.buffer_start = self.position
+                self.buffer = self.reader.at(self.offset + self.position,
+                    min(ZIP_DIRECTORY_BLOCK_BYTES, self.size - self.position))
+                index = 0
+            take = min(remaining, len(self.buffer) - index)
+            chunks.append(self.buffer[index:index + take])
+            self.position += take
+            remaining -= take
+        return b''.join(chunks)
+
+    def skip(self, count):
+        if count < 0 or self.position + count > self.size:
+            raise ValueError('ZIP_TRUNCATED_DIRECTORY_ENTRY')
+        # Extra fields/comments are not interpreted. Reuse prefetched bytes if
+        # the next record is still in the current block; otherwise seek ahead.
+        self.position += count
+
+
 def _zip(reader, result):
     length = min(reader.size, 65557)
     tail = reader.at(reader.size - length, length)
@@ -75,33 +114,41 @@ def _zip(reader, result):
         raise InventoryLimit('ZIP_MULTIVOLUME_UNSUPPORTED')
     if count == 65535 or size == 0xffffffff or offset == 0xffffffff:
         raise InventoryLimit('ZIP64_UNSUPPORTED')
-    if count > MAX_MEMBERS:
-        raise InventoryLimit('ZIP_MEMBER_LIMIT')
+    result.update(zip_declared_members=count, zip_directory_size=size, zip_members_checked=0)
     if offset + size != reader.size - length + pos:
         raise InventoryLimit('ZIP_DIRECTORY_LAYOUT_UNSUPPORTED')
-    central = reader.at(offset, size)
-    cursor = encrypted = 0
+    if count * 46 > size:
+        raise ValueError('ZIP_BAD_DIRECTORY_ENTRY')
+    # Reject known over-budget directories before reading them. Classic ZIP's
+    # 16-bit count bounds work to 65534 entries (65535 is the ZIP64 sentinel).
+    if size > MAX_READ_BYTES - reader.bytes_read:
+        raise InventoryLimit('METADATA_READ_LIMIT')
+    central = _ZipDirectoryReader(reader, offset, size)
+    encrypted = 0
     names = []
     markers = set()
-    for _ in range(count):
-        if central[cursor:cursor+4] != b'PK\x01\x02' or cursor+46 > len(central):
+    for index in range(count):
+        if central.position + 46 > size:
             raise ValueError('ZIP_BAD_DIRECTORY_ENTRY')
-        flags, method = struct.unpack_from('<HH', central, cursor+8)
-        name_size, extra_size, comment_size = struct.unpack_from('<HHH', central, cursor+28)
-        disk_start = struct.unpack_from('<H', central, cursor+34)[0]
+        header = central.read(46)
+        if header[:4] != b'PK\x01\x02':
+            raise ValueError('ZIP_BAD_DIRECTORY_ENTRY')
+        flags, method = struct.unpack_from('<HH', header, 8)
+        name_size, extra_size, comment_size = struct.unpack_from('<HHH', header, 28)
+        disk_start = struct.unpack_from('<H', header, 34)[0]
         if disk_start:
             raise InventoryLimit('ZIP_MULTIVOLUME_UNSUPPORTED')
-        end = cursor+46+name_size+extra_size+comment_size
-        if end > len(central):
+        if central.position + name_size + extra_size + comment_size > size:
             raise ValueError('ZIP_TRUNCATED_DIRECTORY_ENTRY')
         encrypted += bool(flags & 0x2041 or method == 99)
-        name = central[cursor+46:cursor+46+name_size].decode('utf-8' if flags & 2048 else 'cp437', 'replace')
+        name = central.read(name_size).decode('utf-8' if flags & 2048 else 'cp437', 'replace')
         if len(names) < MAX_NAMES:
             names.append(name[:512])
         if name in {'[Content_Types].xml', 'word/document.xml', 'xl/workbook.xml', 'ppt/presentation.xml'}:
             markers.add(name)
-        cursor = end
-    if cursor != len(central):
+        central.skip(extra_size + comment_size)
+        result['zip_members_checked'] = index + 1
+    if central.position != size:
         raise InventoryLimit('ZIP_DIRECTORY_TRAILER_UNSUPPORTED')
     if '[Content_Types].xml' in markers:
         for name, kind in [('word/document.xml', 'DOCX'), ('xl/workbook.xml', 'XLSX'), ('ppt/presentation.xml', 'PPTX')]:
