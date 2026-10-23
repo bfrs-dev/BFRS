@@ -108,6 +108,7 @@ def export_reports(connection, output, run_id, complete, counters, filesystem_ch
                               'EFS_DIRECTORY_FLAG_DOES_NOT_PROVE_ALL_CHILDREN_ENCRYPTED',
                               'EFS_CONTENT_NOT_READ_OR_DECRYPTED',
                               '7Z_ENCRYPTION_MAY_REMAIN_UNKNOWN',
+                              '7Z_BOUNDED_HEADER_DECODING_NO_MEMBER_EXTRACTION',
                               'PDF_METADATA_ONLY_NO_PASSWORD_OR_PAYLOAD_CHECK',
                               'NO_SFX_OR_EMBEDDED_SIGNATURE_SEARCH',
                               'RESUME_USES_SIZE_MTIME_AND_FILE_ID_NOT_CONTENT_HASH']}
