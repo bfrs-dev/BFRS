@@ -24,6 +24,9 @@ LABELS = {'ENCRYPTED': 'Znacznik szyfrowania', 'UNKNOWN': 'Nieustalone',
           'NO_ENCRYPTION_INDICATOR': 'Bez znacznika szyfrowania'}
 
 REASONS = {
+    '7Z_AES_HEADER': 'Znacznik AES w metadanych szyfrowanego nagłówka 7z',
+    '7Z_AES_DATA': 'Znacznik AES w metadanych zawartości 7z',
+    '7Z_NO_ENCRYPTION_CODER': 'Brak szyfrowania w sprawdzonych opisach metod 7z',
     'WINDOWS_EFS_FILE_ATTRIBUTE': 'Plik z atrybutem szyfrowania Windows EFS',
     'WINDOWS_EFS_DIRECTORY_DEFAULT': 'Folder z domyślnym szyfrowaniem EFS nowych plików',
     'PDF_ENCRYPT_ENTRY': 'Wpis szyfrowania w metadanych PDF',
