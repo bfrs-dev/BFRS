@@ -403,15 +403,17 @@ def _finding_sort_key(root: Path, finding: dict) -> tuple:
         relative = str(source)
     return (
         relative.casefold(),
-        int(finding.get("file_offset_start", finding.get("start_offset", -1))),
-        int(finding.get("file_offset_end", finding.get("end_offset", -1))),
+        int(finding.get("file_offset_start", finding.get("start_offset", -1)) or 0),
+        int(finding.get("file_offset_end", finding.get("end_offset", -1)) or 0),
         str(finding.get("target", "")),
         str(finding.get("hit_type", finding.get("type", ""))),
     )
 
 
 def _folder_checkpoint_semantics(arguments) -> dict:
+    from bfrs.recovery.document_scan import DOCUMENT_SCAN_VERSION
     return {
+        "document_scan_version": DOCUMENT_SCAN_VERSION,
         "chunk_mib": arguments.chunk_mib,
         "overlap_kib": arguments.overlap_kib,
         "cluster_mib": arguments.cluster_mib,
