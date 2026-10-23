@@ -95,6 +95,34 @@ def test_remap_missing_paths_and_links(tmp_path):
         checked_source_path(directory_link, file.name)
 
 
+def test_folder_and_scan_root_reveal_require_explicit_directory_kind(tmp_path):
+    folder = tmp_path/'folder'
+    folder.mkdir()
+    file = tmp_path/'file'
+    file.write_bytes(b'example')
+    assert checked_source_path(tmp_path, 'folder', directory=True) == folder
+    assert checked_source_path(tmp_path, '.', directory=True) == tmp_path
+    with pytest.raises(ValueError):
+        checked_source_path(tmp_path, 'folder')
+    with pytest.raises(ValueError):
+        checked_source_path(tmp_path, 'file', directory=True)
+    for name in ('..', '../outside', 'folder/../file', '/absolute'):
+        with pytest.raises(ValueError):
+            source_path(tmp_path, name, directory=True)
+
+
+def test_directory_reveal_rejects_reparse_points(tmp_path, monkeypatch):
+    real_lstat = Path.lstat
+    folder = tmp_path/'folder'
+    folder.mkdir()
+    def fake_lstat(path):
+        info = real_lstat(path)
+        return SimpleNamespace(st_mode=info.st_mode, st_file_attributes=0x4400 if path == folder else 0)
+    monkeypatch.setattr(Path, 'lstat', fake_lstat)
+    with pytest.raises(ValueError, match='ponownej analizy'):
+        checked_source_path(tmp_path, 'folder', directory=True)
+
+
 class FakeCall:
     def __init__(self, implementation):
         self.implementation = implementation
