@@ -24,6 +24,8 @@ LABELS = {'ENCRYPTED': 'Znacznik szyfrowania', 'UNKNOWN': 'Nieustalone',
           'NO_ENCRYPTION_INDICATOR': 'Bez znacznika szyfrowania'}
 
 REASONS = {
+    'WINDOWS_EFS_FILE_ATTRIBUTE': 'Plik z atrybutem szyfrowania Windows EFS',
+    'WINDOWS_EFS_DIRECTORY_DEFAULT': 'Folder z domyślnym szyfrowaniem EFS nowych plików',
     'PDF_ENCRYPT_ENTRY': 'Wpis szyfrowania w metadanych PDF',
     'PDF_ENCRYPT_ENTRY_WITHOUT_ROOT': 'Wpis szyfrowania PDF; brak odwołania do katalogu dokumentu',
     'OFFICE_ENCRYPTION_STREAMS': 'Metadane szyfrowania dokumentu Office',
@@ -121,7 +123,7 @@ class InventoryBrowser(QWidget):
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(['Nazwa', 'Format', 'Rozmiar', 'Wynik', 'Powód', 'Folder'])
+        self.table.setHorizontalHeaderLabels(['Nazwa', 'Format / typ', 'Rozmiar', 'Wynik', 'Powód', 'Folder'])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -132,7 +134,7 @@ class InventoryBrowser(QWidget):
         splitter.addWidget(self.table)
         self.details = QPlainTextEdit()
         self.details.setReadOnly(True)
-        self.details.setPlaceholderText('Wybierz plik, aby zobaczyć szczegóły raportu.')
+        self.details.setPlaceholderText('Wybierz plik lub folder, aby zobaczyć szczegóły raportu.')
         splitter.addWidget(self.details)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
@@ -226,7 +228,8 @@ class InventoryBrowser(QWidget):
         for index, row in enumerate(page.rows):
             path = PureWindowsPath(row['path'])
             size = row.get('size')
-            values = (path.name, row.get('format') or 'Nieznany',
+            kind = ('Folder EFS' if row.get('entry_kind') == 'directory' else 'Plik EFS') if row.get('format') == 'WINDOWS_EFS' else row.get('format') or 'Nieznany'
+            values = (path.name or '(folder źródłowy)', kind,
                       f'{size:,} B'.replace(',', ' ') if isinstance(size, int) else '—',
                       LABELS[row['encryption']], describe_reason(row), str(path.parent))
             for column, value in enumerate(values):
@@ -234,7 +237,7 @@ class InventoryBrowser(QWidget):
                 item.setToolTip(str(value))
                 self.table.setItem(index, column, item)
         self.page_label.setText(f'Strona {page.offset//PAGE_SIZE+1} · {len(page.rows)} pozycji')
-        self.message.setText('Wybierz plik i użyj przycisku pokazania lokalizacji.' if page.rows
+        self.message.setText('Wybierz pozycję i użyj przycisku pokazania lokalizacji.' if page.rows
                              else 'Brak wyników dla wybranego filtra.')
         self._enable_controls()
 
@@ -251,6 +254,15 @@ class InventoryBrowser(QWidget):
             f"Kod analizy: {row.get('reason') or row.get('structure') or '—'}\n\n"
             'To zapis oceny metadanych. Nie potwierdza poprawności całego pliku '
             'ani konieczności podania hasła przy otwieraniu.' if row else '')
+        if row and row.get('filesystem_encryption') == 'EFS':
+            self.details.appendPlainText('\nWykryto bieżący atrybut Windows EFS. '
+                'Zawartość nie była odczytywana ani odszyfrowywana.')
+            if row.get('entry_kind') == 'directory':
+                self.details.appendPlainText('Znacznik folderu dotyczy domyślnego szyfrowania '
+                    'nowych plików. Nie potwierdza szyfrowania wszystkich istniejących plików; '
+                    'każdy plik jest sprawdzany osobno.')
+            if row.get('scan_error'):
+                self.details.appendPlainText('Niepełne przeglądanie folderu: ' + row['scan_error'])
         self._enable_controls()
 
     def _enable_controls(self):
@@ -286,7 +298,7 @@ class InventoryBrowser(QWidget):
         row = self._selected()
         if row:
             try:
-                path = source_path(self._source(), row['path'])
+                path = source_path(self._source(), row['path'], directory=row.get('entry_kind') == 'directory')
                 QGuiApplication.clipboard().setText(str(path))
                 self.message.setText('Skopiowano ścieżkę. Zawartość pliku nie była odczytywana.')
             except (ValueError, OSError) as error:
@@ -297,13 +309,14 @@ class InventoryBrowser(QWidget):
         if row is None or self.worker:
             return
         source, relative = self._source(), row['path']
+        directory = row.get('entry_kind') == 'directory'
         def reveal():
-            path = checked_source_path(source, relative)
+            path = checked_source_path(source, relative, directory=directory)
             if os.name == 'nt':
                 reveal_in_explorer(path)
                 return None
-            return path.parent
-        self._start(reveal, self._revealed, 'Sprawdzanie lokalizacji pliku…')
+            return path if directory else path.parent
+        self._start(reveal, self._revealed, 'Sprawdzanie lokalizacji…')
 
     def _revealed(self, folder):
         if folder is not None and not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
