@@ -135,7 +135,8 @@ def test_7z_and_pdf_are_not_misreported_as_unencrypted(tmp_path):
     path.write_bytes(b'7z\xbc\xaf\x27\x1c\x00\x04'+struct.pack('<L', zlib.crc32(start))+start+next_header)
     row = module.inspect_file(path)
     assert row['format'] == '7Z'
-    assert row['structure'] == 'HEADER_CRC_CHECKED'
+    assert row['structure'] == 'INVALID_OR_UNSUPPORTED_METADATA'
+    assert row['reason'] == '7Z_TRUNCATED_HEADER'
     assert row['encryption'] == 'UNKNOWN'
     path.write_bytes(b'%PDF-1.7\n')
     row = module.inspect_file(path)
