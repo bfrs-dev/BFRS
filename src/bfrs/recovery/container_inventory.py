@@ -177,6 +177,7 @@ def _vint(data, pos):
 def _rar(reader, result, modern):
     offset = 8 if modern else 7
     count = 0
+    service_count = 0
     main_seen = split = False
     for _ in range(MAX_MEMBERS):
         if offset == reader.size and main_seen and not modern:
@@ -255,13 +256,27 @@ def _rar(reader, result, modern):
                 if flags & 0x80:
                     result.update(encryption='ENCRYPTED', reason='RAR_ENCRYPTED_HEADERS', structure='HEADER_CHECKED')
                     return
-            elif kind == 0x74:
+            elif kind in (0x74, 0x7a):
                 if not main_seen or size < 32:
                     raise ValueError('RAR_INVALID_FILE_HEADER')
-                count += 1
+                # RAR3 service blocks share the file-header layout. Their
+                # payload (comments, recovery data, alternate streams, etc.)
+                # is skipped by size, but its password flag must be checked.
+                if kind == 0x7a:
+                    fixed_size = 40 if flags & 0x100 else 32
+                    name_size = struct.unpack_from('<H', block, 26)[0]
+                    salt_size = 8 if flags & 0x400 else 0
+                    if (not flags & 0x8000 or not name_size
+                            or fixed_size + name_size + salt_size > size):
+                        raise ValueError('RAR_INVALID_SERVICE_HEADER')
+                    service_count += 1
+                    result['rar_service_headers_checked'] = service_count
+                else:
+                    count += 1
                 split |= bool(flags & 3)
                 if flags & 4:
-                    result.update(encryption='ENCRYPTED', reason='RAR_FILE_PASSWORD_FLAG', structure='HEADER_CHECKED')
+                    reason = 'RAR_SERVICE_PASSWORD_FLAG' if kind == 0x7a else 'RAR_FILE_PASSWORD_FLAG'
+                    result.update(encryption='ENCRYPTED', reason=reason, structure='HEADER_CHECKED')
                     return
                 data_size = struct.unpack_from('<L', block, 7)[0]
                 if flags & 0x100:
