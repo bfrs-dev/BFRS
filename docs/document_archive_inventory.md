@@ -88,6 +88,14 @@ version-1 inventory checkpoints are supported; JSONL alone is not a viewer input
 ZIP central directory entries provide encryption flags and up to 50 filenames.
 OOXML marker paths distinguish DOCX/XLSX/PPTX inside ZIP. RAR3/RAR5 header CRCs
 are checked and encryption records/flags inspected without reading payloads.
+RAR3 service headers (`0x7a`, including archive comments) use the file-header
+layout. The inventory checks their CRC, fixed/name/salt bounds and password flag,
+then seeks past the declared packed data without decompressing it. Split service
+blocks retain the multivolume limitation. An encrypted service block reports
+`RAR_SERVICE_PASSWORD_FLAG`; checked service blocks are counted separately in
+`rar_service_headers_checked`, not as archive members. Other unsupported legacy
+block types still remain UNKNOWN. Existing UNKNOWN results retry on resume;
+the shared byte/read/block limits are unchanged.
 Encrypted Office containers are identified by EncryptionInfo+EncryptedPackage;
 legacy DOC uses FibBase.fEncrypted and BIFF8 XLS uses FILEPASS in globals.
 
