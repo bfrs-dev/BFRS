@@ -220,6 +220,52 @@ The first resume of an older checkpoint reads these unknown OLE files once to
 collect the directory metadata; subsequent unchanged resumes reuse it. Actual
 format recognition for proprietary OLE payloads remains follow-up work.
 
+### Probable OLE types without payload reads
+
+`ole_type_hint` is separate from `format` and `encryption`. Root CLSIDs and the
+already-reported directory entries can suggest Windows Installer databases,
+transforms or patches, PowerPoint, embroidery designs, thumbnail caches, browser
+state or graphics documents. An empty directory is described without assuming
+an empty or intact file. Unknown combinations retain UNDETERMINED; parser
+warnings prevent a specific hint. Filenames and extensions are not evidence.
+Reports include bounded evidence, a hint revision and a partial-list indicator.
+Hints never change encryption status or assert that a file is recoverable.
+
+On the first resume after this update, stable cached OLE rows gain hints from
+their saved metadata with no source-content reads. Only cached PowerPoint
+candidates have their identities invalidated to run the new PPT inspection.
+Other valid checkpoints remain reusable. The browser also derives hints for
+old reports in memory and displays them in details without editing the report.
+
+### Binary PowerPoint encryption metadata
+
+For root `Current User` / `PowerPoint Document` streams, the bounded parser
+validates CurrentUserAtom fields and checks its encryption token. An explicit
+encrypted token yields ENCRYPTED as a metadata marker. The ordinary token alone
+is insufficient: PowerPoint 2002 also uses it for encrypted documents. For this
+token, the parser reads the referenced latest UserEditAtom and checks its optional
+encryption-session persist ID. A valid nonzero ID is an encryption marker; absent
+markers in the supported metadata yield NO_ENCRYPTION_INDICATOR. Unsupported
+versions/tokens, malformed records/references and exceeded limits remain UNKNOWN.
+
+The parser does not resolve encryption references, traverse earlier edits,
+validate the persist directory or inspect slides, embedded objects, passwords or
+payload integrity. PowerPoint 4/PP40 remains a hint, not a supported encryption
+parser. `ppt_password_required` stays NOT_CHECKED. This is not an assessment of
+IRM rights or editing restrictions.
+
+Regular FAT streams use targeted reads at metadata offsets rather than loading
+the stream prefix or full content. Chain traversal checks encountered cycles,
+invalid sectors and physical bounds, with a cap of 65536 sectors per stream.
+MiniFAT uses bounded olefile handling. Existing 2 MiB / 4096-read per-file limits
+still apply; no extra runtime dependency is required.
+
+References: MS-PPT CurrentUserAtom, UserEditAtom and Appendix A:
+https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-ppt/940d5700-e4d7-4fc0-ab48-fed5dbc48bc1 ;
+https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-ppt/3ffb3fab-95de-4873-98aa-d508fbbac981 ;
+https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-ppt/de2e8a1c-53a6-4aaf-983d-2f5c6a531b4f ;
+https://devblogs.microsoft.com/setup/identifying-windows-installer-file-types/
+
 RTF is recognized by its start signature, without parsing its full body. No
 integrity guarantee is made for a payload, document XML or embedded files.
 
