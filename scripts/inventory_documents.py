@@ -12,9 +12,33 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from bfrs.recovery.container_inventory import VERSION, OLE_INVENTORY_REVISION, inspect_file
+from bfrs.recovery.ole_type_hints import OLE_HINT_REVISION, ole_type_hint, ppt_candidate
+from bfrs.recovery.ppt_inventory import PPT_INVENTORY_REVISION
 
 EXTENSIONS = {'.zip', '.rar', '.7z', '.doc', '.docx', '.xls', '.xlsx', '.rtf', '.pdf', '.ppt', '.pptx'}
 FILE_ATTRIBUTE_ENCRYPTED = 0x4000
+
+
+def _upgrade_ole_cache(connection, metadata):
+    """Enrich stable cached directories without source I/O; refresh only PPT candidates."""
+    revision = f'{OLE_HINT_REVISION}:{PPT_INVENTORY_REVISION}'
+    if metadata.get('ole_hint_ppt_revision') == revision:
+        return
+    cursor = connection.execute('SELECT path,result FROM files WHERE inspection_revision=?',
+                                (OLE_INVENTORY_REVISION,))
+    for path, payload in cursor:
+        if not payload:
+            continue
+        row = json.loads(payload)
+        if row.get('format') != 'OLE':
+            continue
+        row.update(ole_type_hint(row))
+        connection.execute('UPDATE files SET result=? WHERE path=?',
+                           (json.dumps(row, ensure_ascii=False), path))
+        if ppt_candidate(row):
+            connection.execute('UPDATE files SET identity=NULL WHERE path=?', (path,))
+    connection.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)',
+                       ('ole_hint_ppt_revision', revision))
 
 
 def _link(info):
@@ -110,6 +134,7 @@ def export_reports(connection, output, run_id, complete, counters, filesystem_ch
                               '7Z_ENCRYPTION_MAY_REMAIN_UNKNOWN',
                               '7Z_BOUNDED_HEADER_DECODING_NO_MEMBER_EXTRACTION',
                               'PDF_METADATA_ONLY_NO_PASSWORD_OR_PAYLOAD_CHECK',
+                              'PPT_METADATA_ONLY_NO_PASSWORD_OR_PAYLOAD_CHECK',
                               'NO_SFX_OR_EMBEDDED_SIGNATURE_SEARCH',
                               'RESUME_USES_SIZE_MTIME_AND_FILE_ID_NOT_CONTENT_HASH']}
     temporary = output / 'summary.json.tmp'
@@ -146,6 +171,7 @@ def inventory(source, output, *, resume=False, progress=None, should_stop=None):
         columns = {row[1] for row in connection.execute('PRAGMA table_info(files)')}
         if 'inspection_revision' not in columns:
             connection.execute('ALTER TABLE files ADD COLUMN inspection_revision INTEGER NOT NULL DEFAULT 0')
+        _upgrade_ole_cache(connection, metadata)
         run_id = int(metadata.get('run_id', '0')) + 1
         for key, value in {'source': str(source), 'version': str(VERSION), 'run_id': str(run_id)}.items():
             connection.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', (key, value))
