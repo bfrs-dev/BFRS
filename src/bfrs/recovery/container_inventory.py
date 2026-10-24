@@ -7,6 +7,8 @@ import zlib
 
 from bfrs.recovery.pdf_inventory import PDFMetadataLimit, inspect_pdf
 from bfrs.recovery.seven_zip_inventory import SevenZipLimit, inspect_7z
+from bfrs.recovery.ole_type_hints import ole_type_hint
+from bfrs.recovery.ppt_inventory import PPTMetadataLimit, inspect_ppt
 
 VERSION = 1
 # Bump when unknown-OLE inspection changes, so cached metadata is refreshed.
@@ -318,6 +320,7 @@ def _ole_directory_metadata(ole, result):
                   ole_directory_warnings=warnings,
                   ole_inventory_revision=OLE_INVENTORY_REVISION,
                   structure='DIRECTORY_CHECKED_WITH_WARNINGS' if warnings else 'DIRECTORY_CHECKED')
+    result.update(ole_type_hint(result))
 
 
 class _OleMetadataStream:
@@ -433,6 +436,12 @@ def _ole(reader, result):
                                   ole_stream_scope='METADATA_PREFIX_ONLY')
                     return
             raise InventoryLimit('XLS_RECORD_LIMIT')
+        elif ole.exists('PowerPoint Document') or ole.exists('Current User'):
+            _ole_directory_metadata(ole, result)
+            result['format'] = 'PPT'
+            if ole.parsing_issues:
+                raise ValueError('PPT_OLE_DIRECTORY_WARNINGS')
+            result.update(inspect_ppt(reader, ole))
         else:
             _ole_directory_metadata(ole, result)
             result['reason'] = 'OLE_TYPE_UNDETERMINED'
@@ -471,7 +480,7 @@ def inspect_file(path):
                 result.update(inspect_pdf(reader))
             else:
                 result.update(structure='NOT_RECOGNIZED', reason='NO_SUPPORTED_START_SIGNATURE')
-        except (InventoryLimit, PDFMetadataLimit, SevenZipLimit) as error:
+        except (InventoryLimit, PDFMetadataLimit, SevenZipLimit, PPTMetadataLimit) as error:
             result.update(encryption='UNKNOWN', reason=str(error), structure='LIMIT_OR_UNSUPPORTED')
         except (ValueError, OSError, struct.error, IndexError, RecursionError) as error:
             result.update(encryption='UNKNOWN', structure='INVALID_OR_UNSUPPORTED_METADATA',
