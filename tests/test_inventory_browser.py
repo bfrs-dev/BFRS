@@ -21,6 +21,28 @@ def finish(app, window):
     assert window.worker is None
 
 
+def test_browser_ole_hint_from_old_report_preserves_unknown(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    database = tmp_path/'inventory.sqlite'
+    make_report(database, tmp_path/'source', [('example.bin', 'UNKNOWN', 2)])
+    row = dict(path='example.bin', format='OLE', encryption='UNKNOWN', size=100,
+               reason='OLE_TYPE_UNDETERMINED', ole_directory_entries=[dict(name='SStitches', type=2)],
+               ole_directory_entry_count=100, ole_directory_entries_truncated=True)
+    with sqlite3.connect(database) as db:
+        db.execute('UPDATE files SET result=?', (json.dumps(row),))
+    window = module.InventoryBrowser(database)
+    finish(app, window)
+    window.state_combo.setCurrentIndex(1)
+    finish(app, window)
+    window.table.selectRow(0)
+    details = window.details.toPlainText()
+    assert 'projekt hafciarski' in details and 'Nieustalone' in details
+    assert 'nie ocena szyfrowania' in details and 'skrócona' in details
+    with sqlite3.connect(database) as db:
+        assert json.loads(db.execute('SELECT result FROM files').fetchone()[0]) == row
+    window.close()
+
+
 def test_browser_default_filter_copy_remap_and_reveal(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     source = tmp_path/'source'
