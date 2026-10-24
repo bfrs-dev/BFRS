@@ -228,6 +228,126 @@ def test_rar_file_encryption_without_hidden_names(tmp_path):
     assert row['encryption'] == 'ENCRYPTED' and row['reason'] == 'RAR_FILE_ENCRYPTION_RECORD'
 
 
+def rar3_service(*, name=b'CMT', flags=0x8000, packed_size=0, extra=b'',
+                 name_size=None, high_size=0):
+    body = struct.pack('<LLBLLBBHL', packed_size, 0, 2, 0, 0, 29, 48,
+                       len(name) if name_size is None else name_size, 0)
+    if flags & 0x100:
+        body += struct.pack('<LL', high_size, 0)
+    return rar3_header(0x7a, flags, body + name + extra)
+
+
+def rar3_archive(*blocks):
+    return (b'Rar!\x1a\x07\x00' + rar3_header(0x73, 0, b'\0' * 6)
+            + b''.join(blocks) + rar3_header(0x7b, 0, b''))
+
+
+@pytest.mark.parametrize('name', [b'CMT', b'RR', b'STM', b'custom'])
+def test_rar3_service_payload_is_skipped_and_members_follow(tmp_path, name):
+    # An apparent encrypted header in service data is not a header marker.
+    payload = rar3_header(0x73, 0x80, b'\0' * 6)
+    plain = struct.pack('<LLBLLBBHL', 0, 0, 2, 0, 0, 29, 48, 1, 0) + b'a'
+    path = tmp_path/'service.rar'
+    path.write_bytes(rar3_archive(rar3_service(name=name, packed_size=len(payload)), payload,
+                                 rar3_header(0x74, 0x8000, plain)))
+    row = module.inspect_file(path)
+    assert row['encryption'] == 'NO_ENCRYPTION_INDICATOR'
+    assert row['member_count'] == 1 and row['rar_service_headers_checked'] == 1
+    path.write_bytes(rar3_archive(rar3_service(name=name, packed_size=len(payload)), payload,
+                                 rar3_header(0x74, 0x8004, plain)))
+    assert module.inspect_file(path)['reason'] == 'RAR_FILE_PASSWORD_FLAG'
+
+
+@pytest.mark.parametrize('flags,extra', [(0x8004, b''), (0x8404, b'x' * 8),
+                                       (0x8504, b'private metadata' + b'x' * 8)])
+def test_rar3_encrypted_service_is_a_marker(tmp_path, flags, extra):
+    path = tmp_path/'service.rar'
+    path.write_bytes(rar3_archive(rar3_service(flags=flags, extra=extra)))
+    row = module.inspect_file(path)
+    assert row['encryption'] == 'ENCRYPTED' and row['reason'] == 'RAR_SERVICE_PASSWORD_FLAG'
+
+
+@pytest.mark.parametrize('block,reason', [
+    (rar3_service(name=b''), 'RAR_INVALID_SERVICE_HEADER'),
+    (rar3_service(name_size=100), 'RAR_INVALID_SERVICE_HEADER'),
+    (rar3_service(flags=0), 'RAR_INVALID_SERVICE_HEADER'),
+    (rar3_service(flags=0x8404, extra=b'x' * 7), 'RAR_INVALID_SERVICE_HEADER'),
+    (rar3_header(0x7a, 0x8000, b'x' * 4), 'RAR_INVALID_FILE_HEADER'),
+    (rar3_service(packed_size=9999), 'RAR_TRUNCATED_PAYLOAD'),
+    (rar3_service(flags=0x8100, high_size=1), 'RAR_TRUNCATED_PAYLOAD'),
+    (rar3_service(flags=0x8001), 'RAR_MULTIVOLUME_INCOMPLETE_SCOPE'),
+    (rar3_service(flags=0x8002), 'RAR_MULTIVOLUME_INCOMPLETE_SCOPE'),
+    (rar3_header(0x77, 0, b''), 'RAR_BLOCK_UNSUPPORTED'),
+])
+def test_rar3_invalid_or_incomplete_service_stays_unknown(tmp_path, block, reason):
+    path = tmp_path/'service.rar'
+    path.write_bytes(rar3_archive(block))
+    row = module.inspect_file(path)
+    assert row['encryption'] == 'UNKNOWN' and row['reason'] == reason
+
+
+def test_rar3_service_crc_and_main_header_required(tmp_path):
+    path = tmp_path/'service.rar'
+    damaged = bytearray(rar3_service())
+    damaged[-1] ^= 1
+    path.write_bytes(rar3_archive(damaged))
+    assert module.inspect_file(path)['reason'] == 'RAR_HEADER_CRC_MISMATCH'
+    path.write_bytes(b'Rar!\x1a\x07\x00' + rar3_service())
+    assert module.inspect_file(path)['encryption'] == 'UNKNOWN'
+
+
+def test_rar3_service_large_data_not_read(tmp_path, monkeypatch):
+    path = tmp_path/'large.rar'
+    packed_size = 100 * 1024 * 1024
+    main = b'Rar!\x1a\x07\x00' + rar3_header(0x73, 0, b'\0' * 6)
+    service = rar3_service(packed_size=packed_size)
+    end = rar3_header(0x7b, 0, b'')
+    with path.open('wb') as stream:
+        stream.write(main + service)
+        stream.seek(packed_size, 1)
+        stream.write(end)
+    calls, original = [], module.BoundedReader.at
+    def record(reader, offset, size):
+        calls.append((offset, size))
+        return original(reader, offset, size)
+    monkeypatch.setattr(module.BoundedReader, 'at', record)
+    row = module.inspect_file(path)
+    assert row['encryption'] == 'NO_ENCRYPTION_INDICATOR' and row['member_count'] == 0
+    end_offset = len(main) + len(service) + packed_size
+    assert calls == [(0, 512), (7, 7), (7, 13), (20, 7), (20, len(service)),
+                     (end_offset, 7), (end_offset, 7)]
+    assert row['bytes_read'] < 1024
+
+
+def test_rar3_service_block_limit(tmp_path, monkeypatch):
+    path = tmp_path/'service.rar'
+    path.write_bytes(rar3_archive(rar3_service(), rar3_service()))
+    monkeypatch.setattr(module, 'MAX_MEMBERS', 2)
+    assert module.inspect_file(path)['reason'] == 'RAR_BLOCK_LIMIT'
+
+
+def test_rar3_service_resume_retries_old_unknown(tmp_path, monkeypatch):
+    source, output = tmp_path/'source', tmp_path/'output'
+    source.mkdir()
+    path = source/'sample.rar'
+    path.write_bytes(rar3_archive(rar3_service()))
+    (source/'ordinary.bin').write_bytes(b'ordinary')
+    original = runner.inspect_file
+    def old(target):
+        if target == path:
+            return dict(format='RAR', encryption='UNKNOWN', structure='LIMIT_OR_UNSUPPORTED',
+                        reason='RAR_BLOCK_UNSUPPORTED', bytes_read=32)
+        return original(target)
+    monkeypatch.setattr(runner, 'inspect_file', old)
+    runner.inventory(source, output)
+    monkeypatch.setattr(runner, 'inspect_file', original)
+    second = runner.inventory(source, output, resume=True)
+    assert second['run']['inspected'] == 1 and second['run']['reused'] == 1
+    assert second['encryption_counts'] == {'NO_ENCRYPTION_INDICATOR': 1}
+    third = runner.inventory(source, output, resume=True)
+    assert third['run']['reused'] == 2 and third['run']['bytes_read'] == 0
+
+
 def test_unknown_candidates_are_retried_on_resume(tmp_path, monkeypatch):
     source, output = tmp_path/'source', tmp_path/'output'
     source.mkdir()
