@@ -18,12 +18,16 @@ from bfrs.application.inventory_view import (
     PAGE_SIZE, checked_source_path, read_inventory_page, source_path,
 )
 from bfrs.gui.windows_reveal import reveal_in_explorer
+from bfrs.recovery.ole_type_hints import ole_type_hint
 
 
 LABELS = {'ENCRYPTED': 'Znacznik szyfrowania', 'UNKNOWN': 'Nieustalone',
           'NO_ENCRYPTION_INDICATOR': 'Bez znacznika szyfrowania'}
 
 REASONS = {
+    'PPT_ENCRYPTED_HEADER_TOKEN': 'Znacznik szyfrowania w nagłówku PowerPoint',
+    'PPT_ENCRYPTION_REFERENCE': 'Odwołanie do szyfrowania w ostatnim zapisie PowerPoint',
+    'PPT_NO_ENCRYPTION_MARKER': 'Brak znacznika szyfrowania w sprawdzonych metadanych PowerPoint',
     '7Z_AES_HEADER': 'Znacznik AES w metadanych szyfrowanego nagłówka 7z',
     '7Z_AES_DATA': 'Znacznik AES w metadanych zawartości 7z',
     '7Z_NO_ENCRYPTION_CODER': 'Brak szyfrowania w sprawdzonych opisach metod 7z',
@@ -39,6 +43,20 @@ REASONS = {
     'RAR_FILE_ENCRYPTION_RECORD': 'Rekord szyfrowania pliku w archiwum RAR',
     'OLE_TYPE_UNDETERMINED': 'Nierozpoznany typ kontenera OLE',
     'NO_SUPPORTED_START_SIGNATURE': 'Brak obsługiwanej sygnatury pliku',
+}
+
+OLE_HINT_LABELS = {
+    'WINDOWS_INSTALLER_DATABASE': 'Baza Windows Installer (np. MSI)',
+    'WINDOWS_INSTALLER_TRANSFORM': 'Transformacja Windows Installer (MST)',
+    'WINDOWS_INSTALLER_PATCH': 'Poprawka Windows Installer (MSP)',
+    'POWERPOINT_BINARY': 'Starsza prezentacja PowerPoint',
+    'POWERPOINT_LEGACY_POSSIBLE': 'Możliwa prezentacja PowerPoint 4',
+    'EMBROIDERY_DESIGN_POSSIBLE': 'Możliwy projekt hafciarski',
+    'THUMBNAIL_CACHE_POSSIBLE': 'Możliwa pamięć podręczna miniatur',
+    'BROWSER_STATE_POSSIBLE': 'Możliwy zapis stanu przeglądarki',
+    'GRAPHICS_DOCUMENT_POSSIBLE': 'Możliwy dokument graficzny',
+    'EMPTY_DIRECTORY': 'Brak wpisów w odczytanym katalogu OLE',
+    'UNDETERMINED': 'Nieustalony',
 }
 
 
@@ -258,6 +276,16 @@ class InventoryBrowser(QWidget):
             f"Kod analizy: {row.get('reason') or row.get('structure') or '—'}\n\n"
             'To zapis oceny metadanych. Nie potwierdza poprawności całego pliku '
             'ani konieczności podania hasła przy otwieraniu.' if row else '')
+        if row and 'ole_directory_entries' in row:
+            hint = ole_type_hint(row)
+            self.details.appendPlainText('\nPrawdopodobny typ OLE: '
+                + OLE_HINT_LABELS[hint['ole_type_hint']]
+                + '\nTo wskazówka z metadanych, nie ocena szyfrowania ani zawartości.')
+            if hint['ole_type_hint_partial']:
+                self.details.appendPlainText('Lista wpisów OLE w raporcie jest skrócona.')
+        if row and row.get('format') == 'PPT':
+            self.details.appendPlainText('\nSprawdzono wybrane metadane PowerPoint. '
+                'Slajdy, historia zmian i cele odwołań do szyfrowania nie były weryfikowane.')
         if row and row.get('filesystem_encryption') == 'EFS':
             self.details.appendPlainText('\nWykryto bieżący atrybut Windows EFS. '
                 'Zawartość nie była odczytywana ani odszyfrowywana.')
