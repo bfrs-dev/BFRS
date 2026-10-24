@@ -836,6 +836,13 @@ def main(
         unified_checkpoint.mark_complete()
 
     configuration = _configuration(arguments, selection)
+    if (source_type is SourceType.FILE and arguments.start == 0
+            and (arguments.end is None or arguments.end == file_size)):
+        from bfrs.recovery.document_scan import enrich_document_result
+        result = enrich_document_result(
+            result, arguments.input, targets=selection.targets,
+            mnemonic_standards=configuration["mnemonic_standards_requested"],
+        )
     if _report_sink is not None:
         _report_sink(serialize_full_image_result(result, configuration))
         return 0

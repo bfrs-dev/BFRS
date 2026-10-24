@@ -38,8 +38,10 @@ class RawHit:
             "target": self.target,
             "wallet_family": self.target,
             "artifact_kind": self.artifact_kind,
-            "physical_start": self.start_offset,
-            "physical_end": self.end_offset,
+            "physical_start": (None if self.source_kind == "DOCUMENT_EXTRACTED_TEXT"
+                               else self.start_offset),
+            "physical_end": (None if self.source_kind == "DOCUMENT_EXTRACTED_TEXT"
+                             else self.end_offset),
             "source_kind": self.source_kind,
             "allocation_state": self.allocation_state,
             "structural_status": self.structural_status,

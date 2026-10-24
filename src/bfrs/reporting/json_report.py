@@ -1399,6 +1399,7 @@ def serialize_full_image_result(
             result.electrum_raw_recovery
         ),
         "target_findings": target_findings,
+        "document_scan": result.evidence.get("document_scan"),
         "rejected_statistics": rejected_statistics,
         "bitcoin_context_evidence": _bitcoin_context_evidence(result),
         "mnemonic_scan_requested": safe_configuration["mnemonic_scan_requested"],

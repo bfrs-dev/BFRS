@@ -15,6 +15,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+inventory = [
+    "olefile>=0.47,<1",
+]
 dev = [
     "pytest>=8,<10",
     "ijson>=3.3,<4",

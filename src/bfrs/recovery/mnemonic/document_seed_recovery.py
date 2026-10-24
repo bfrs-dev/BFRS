@@ -12,10 +12,11 @@ import zipfile
 from bfrs.recovery.ntfs_bitcoin_artifacts import NTFSBitcoinArtifactLocator
 
 from .raw_mnemonic_scanner import MnemonicOccurrence, RawMnemonicScanner
+from bfrs.recovery.rtf_text import MAX_RTF_BYTES
 
 
-PLAIN_EXTENSIONS = frozenset({".txt", ".log", ".csv", ".json", ".xml", ".html", ".htm", ".rtf"})
-DOCUMENT_EXTENSIONS = PLAIN_EXTENSIONS | {".docx", ".pdf"}
+PLAIN_EXTENSIONS = frozenset({".txt", ".log", ".csv", ".json", ".xml", ".html", ".htm"})
+DOCUMENT_EXTENSIONS = PLAIN_EXTENSIONS | {".docx", ".pdf", ".rtf"}
 MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_EXTRACTED_TEXT_BYTES = 64 * 1024 * 1024
 MAX_PDF_PAGES = 10_000
@@ -57,6 +58,12 @@ def _docx_text(data: bytes) -> str:
 
 def extract_document_text(data: bytes, suffix: str) -> tuple[str | None, str | None]:
     suffix = suffix.lower()
+    if suffix == ".rtf":
+        from bfrs.recovery.rtf_text import extract_rtf, RTFError
+        try:
+            return extract_rtf(data).decode("utf-8"), None
+        except RTFError as error:
+            return None, str(error)
     if suffix == ".docx":
         try:
             return _docx_text(data), None
@@ -146,7 +153,8 @@ class DocumentSeedRecovery:
                                                "offset_space": "extracted_text_utf8_bytes",
                                                "logical_text_start": item.candidate.physical_start,
                                                "logical_text_end": item.candidate.physical_end,
-                                               "extractor": "stdlib_docx_wordprocessingml",
+                                               "extractor": ("bounded_rtf_v1" if normalized_suffix == ".rtf"
+                                                             else "stdlib_docx_wordprocessingml"),
                                            }),
                                    item.secret)
                 for item in raw.occurrences)
@@ -162,6 +170,8 @@ class DocumentSeedRecovery:
         if suffix not in DOCUMENT_EXTENSIONS:
             return DocumentScanResult((), ("DOCUMENT_TYPE_UNSUPPORTED",))
         try:
+            if suffix == ".rtf" and source.stat().st_size > MAX_RTF_BYTES:
+                return DocumentScanResult((), ("RTF_FILE_LIMIT",))
             if source.stat().st_size > MAX_DOCUMENT_BYTES:
                 return DocumentScanResult((), ("DOCUMENT_SIZE_LIMIT",))
             data = source.read_bytes()
@@ -191,6 +201,9 @@ class DocumentSeedRecovery:
             if alias is None:
                 continue
             size = record.data.logical_size
+            if Path(alias.filename).suffix.lower() == ".rtf" and size > MAX_RTF_BYTES:
+                failures.append("RTF_FILE_LIMIT")
+                continue
             if size < 0 or size > maximum_file_size:
                 failures.append("DOCUMENT_SIZE_LIMIT")
                 continue
