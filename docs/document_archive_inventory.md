@@ -232,7 +232,12 @@ dictionary cap of 16 MiB. All physical reads still share the 2 MiB / 4096-call
 file budget. Additional structural limits are 256 folders/packed streams,
 8 coders per folder, 65536 files/substreams and 32 metadata properties.
 
-Only single-input/output coder chains are supported. Additional metadata streams,
+Single-input/output coders and BCJ2 (four inputs, one output) are supported in
+member metadata. The parser validates binding indices, unique packed inputs,
+packed-stream counts and that every coder reaches the sole final output without
+cycles. It checks AES markers on every branch. BCJ2 member data is not decoded;
+encoded metadata headers still require the single-coder methods listed above.
+Other complex coders remain UNKNOWN. Additional metadata streams,
 external properties, unsupported header encodings, invalid CRCs, malformed data
 and exceeded limits remain UNKNOWN. Unknown member compression methods also
 prevent a negative encryption classification. Known non-encrypting coders produce
@@ -240,7 +245,7 @@ NO_ENCRYPTION_INDICATOR after the supported metadata has been checked; this does
 not validate member payloads or prove that the archive can be recovered.
 
 Reports expose `seven_zip_header_encoding`, separate header/data encryption
-indicators and coder method identifiers. Old signature-only UNKNOWN 7z results
+indicators and coder method identifiers. Old signature-only and unsupported-BCJ2 UNKNOWN 7z results
 are retried automatically with `--resume`; unchanged successful results are then
 reused. No checkpoint reset or additional runtime package is required.
 
