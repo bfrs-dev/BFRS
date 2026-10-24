@@ -35,6 +35,7 @@ REASONS = {
     'XLS_FILEPASS': 'Rekord szyfrowania skoroszytu XLS',
     'RAR_ENCRYPTED_HEADERS': 'Zaszyfrowane nagłówki archiwum RAR',
     'RAR_FILE_PASSWORD_FLAG': 'Flaga hasła pliku w archiwum RAR',
+    'RAR_SERVICE_PASSWORD_FLAG': 'Flaga hasła bloku pomocniczego w archiwum RAR',
     'RAR_FILE_ENCRYPTION_RECORD': 'Rekord szyfrowania pliku w archiwum RAR',
     'OLE_TYPE_UNDETERMINED': 'Nierozpoznany typ kontenera OLE',
     'NO_SUPPORTED_START_SIGNATURE': 'Brak obsługiwanej sygnatury pliku',
