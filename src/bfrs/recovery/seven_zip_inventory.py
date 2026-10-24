@@ -1,7 +1,8 @@
 """Bounded 7z coder metadata inspection; no member extraction or password work.
 
 Reference: ip7z/7zip DOC/7zFormat.txt and DOC/Methods.txt.
-Only single-input/output coder chains and inline file metadata are supported.
+Supports single-input/output coders and BCJ2 graphs with inline file metadata.
+BCJ2 member streams are inspected structurally, never decoded.
 """
 from dataclasses import dataclass
 import struct
@@ -18,8 +19,9 @@ AES = bytes.fromhex('06f10701')
 COPY = b'\x00'
 LZMA = bytes.fromhex('030101')
 LZMA2 = b'\x21'
+BCJ2 = bytes.fromhex('0303011b')
 # Unknown methods must not produce a negative encryption classification.
-PLAIN_METHODS = {COPY, LZMA, LZMA2, b'\x03', *(bytes([value]) for value in range(4, 12)), bytes.fromhex('040108'),
+PLAIN_METHODS = {COPY, LZMA, LZMA2, BCJ2, b'\x03', *(bytes([value]) for value in range(4, 12)), bytes.fromhex('040108'),
                  bytes.fromhex('040202'), bytes.fromhex('030401'),
                  *(bytes.fromhex(value) for value in
                    ('03030103', '03030205', '03030401', '03030501', '03030701', '03030805'))}
@@ -89,6 +91,7 @@ def _digests(cursor, count):
 class _Folder:
     coders: list
     final_output: int
+    packed_count: int = 1
     unpack_size: int = 0
     crc: int | None = None
     substreams: int = 1
@@ -105,20 +108,24 @@ class _Streams:
 def _folder(cursor):
     count = cursor.bounded(MAX_CODERS, '7Z_CODER_LIMIT')
     _require(count > 0)
-    coders = []
-    for _ in range(count):
+    coders, input_owners = [], []
+    for coder_index in range(count):
         flags = cursor.byte()
         if flags & 0xc0:
             raise SevenZipLimit('7Z_CODER_FLAGS_UNSUPPORTED')
         length = flags & 15
         _require(1 <= length <= 8)
         method = cursor.take(length)
+        inputs, outputs = 1, 1
         if flags & 0x10:
             inputs, outputs = cursor.number(), cursor.number()
-            if (inputs, outputs) != (1, 1):
-                raise SevenZipLimit('7Z_COMPLEX_CODER_UNSUPPORTED')
+        if method == BCJ2:
+            _require((inputs, outputs) == (4, 1), '7Z_INVALID_BCJ2_STREAM_COUNTS')
+        elif (inputs, outputs) != (1, 1):
+            raise SevenZipLimit('7Z_COMPLEX_CODER_UNSUPPORTED')
+        input_owners.extend([coder_index] * inputs)
         props = cursor.take(cursor.bounded(64, '7Z_CODER_PROPERTIES_LIMIT')) if flags & 0x20 else b''
-        if method in (COPY, bytes.fromhex('040108'), bytes.fromhex('040202')):
+        if method in (COPY, BCJ2, bytes.fromhex('040108'), bytes.fromhex('040202')):
             _require(not props, '7Z_INVALID_CODER_PROPERTIES')
         elif method == LZMA:
             _require(len(props) == 5 and props[0] < 225, '7Z_INVALID_LZMA_PROPERTIES')
@@ -142,23 +149,29 @@ def _folder(cursor):
     bound_inputs, bound_outputs, links = set(), set(), {}
     for _ in range(count - 1):
         incoming, outgoing = cursor.number(), cursor.number()
-        _require(incoming < count and outgoing < count
+        _require(incoming < len(input_owners) and outgoing < count
                  and incoming not in bound_inputs and outgoing not in bound_outputs,
                  '7Z_INVALID_CODER_BINDINGS')
         bound_inputs.add(incoming)
         bound_outputs.add(outgoing)
-        links[outgoing] = incoming
-    # For supported 1-in/1-out coders there is exactly one implicit packed input.
-    current = next(iter(set(range(count)) - bound_inputs))
+        links[outgoing] = input_owners[incoming]
+    # Every supported coder has one output. Unbound inputs are packed streams;
+    # multiple streams have explicit indices, each appearing exactly once.
+    packed_inputs = set(range(len(input_owners))) - bound_inputs
+    if len(packed_inputs) > 1:
+        indices = [cursor.number() for _ in packed_inputs]
+        _require(set(indices) == packed_inputs, '7Z_INVALID_PACKED_INDICES')
     final = next(iter(set(range(count)) - bound_outputs))
-    visited = set()
-    while current not in visited:
-        visited.add(current)
-        if current not in links:
-            break
-        current = links[current]
-    _require(len(visited) == count and current == final, '7Z_INVALID_CODER_BINDINGS')
-    return _Folder(coders, final)
+    # All branches must reach the sole final output; reject self-links, cycles
+    # and disconnected coder components. At most MAX_CODERS**2 steps.
+    for current in range(count):
+        visited = set()
+        while current in links:
+            _require(current not in visited, '7Z_INVALID_CODER_BINDINGS')
+            visited.add(current)
+            current = links[current]
+        _require(current == final, '7Z_INVALID_CODER_BINDINGS')
+    return _Folder(coders, final, packed_count=len(packed_inputs))
 
 
 def _substreams(cursor, folders):
@@ -224,7 +237,8 @@ def _streams(cursor, packed_limit):
             token = cursor.byte()
         _require(token == 0)
         token = cursor.byte()
-    _require(len(sizes) == len(folders), '7Z_PACK_STREAM_COUNT_MISMATCH')
+    _require(len(sizes) == sum(folder.packed_count for folder in folders),
+             '7Z_PACK_STREAM_COUNT_MISMATCH')
     if token == 0x08:
         _substreams(cursor, folders)
         token = cursor.byte()
