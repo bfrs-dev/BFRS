@@ -129,6 +129,141 @@ def test_linear_aes_chain_and_unknown_coder_policy(tmp_path):
     assert inspect_bytes(tmp_path, archive(plain_header(chain=chain)))['encryption'] == 'ENCRYPTED'
 
 
+def bcj2_coder(inputs=4, outputs=1, props=b'', method=module.BCJ2):
+    return (bytes([len(method) | 0x10 | (0x20 if props else 0)]) + method
+            + number(inputs) + number(outputs)
+            + (number(len(props)) + props if props else b''))
+
+
+def bcj2_folder(*, branch=None, binds=None, indices=(0, 1, 2, 6), final=None):
+    # Synthetic metadata only: three independent streams feed BCJ2, with a
+    # fourth packed input consumed directly. No user archive data is embedded.
+    branches = branch if branch is not None else [coder()] * 3
+    pairs = binds if binds is not None else [(3, 0), (4, 1), (5, 2)]
+    return (b'\x04' + b''.join(branches) + (final if final is not None else bcj2_coder())
+            + b''.join(number(i) + number(o) for i, o in pairs)
+            + b''.join(number(i) for i in indices))
+
+
+def bcj2_streams(folder=None, *, sizes=(2, 2, 2, 2), outputs=4, repeats=1):
+    folder = bcj2_folder() if folder is None else folder
+    return (b'\x06\x00' + number(len(sizes)) + b'\x09'
+            + b''.join(number(size) for size in sizes) + b'\x00\x07\x0b'
+            + number(repeats) + b'\x00' + folder * repeats + b'\x0c'
+            + number(8) * outputs * repeats + b'\x00\x00')
+
+
+def bcj2_header(stream_info=None, members=1):
+    return (b'\x01\x04' + (bcj2_streams() if stream_info is None else stream_info)
+            + b'\x05' + number(members) + b'\x00\x00')
+
+
+@pytest.mark.parametrize('encoded', [False, True])
+@pytest.mark.parametrize('encrypted_branch', [None, 0, 1, 2])
+def test_bcj2_branches_and_aes_markers(tmp_path, encoded, encrypted_branch):
+    branches = [coder(module.LZMA, b'\x5d\x00\x10\x00\x00')] * 3
+    if encrypted_branch is not None:
+        branches[encrypted_branch] = coder(module.AES, b'\x13')
+    header = bcj2_header(bcj2_streams(bcj2_folder(branch=branches, indices=(6, 2, 0, 1))))
+    row = inspect_bytes(tmp_path, encoded_archive(header) if encoded else archive(header))
+    assert row['encryption'] == ('ENCRYPTED' if encrypted_branch is not None else 'NO_ENCRYPTION_INDICATOR')
+    assert module.BCJ2.hex() in row['seven_zip_methods']
+    assert row['member_count'] == 1
+
+
+def test_bcj2_single_coder_and_multiple_folders(tmp_path):
+    folder = b'\x01' + bcj2_coder() + bytes(range(4))
+    info = bcj2_streams(folder, outputs=1)
+    assert inspect_bytes(tmp_path, archive(bcj2_header(info)))['encryption'] == 'NO_ENCRYPTION_INDICATOR'
+    info = bcj2_streams(sizes=(1,) * 8, repeats=2)
+    row = inspect_bytes(tmp_path, archive(bcj2_header(info, members=2)))
+    assert row['encryption'] == 'NO_ENCRYPTION_INDICATOR' and row['member_count'] == 2
+
+
+def test_bcj2_reordered_coders_and_aes_after_merge(tmp_path):
+    # BCJ2 is coder 0, but AES (coder 1) owns the final output.
+    folder = (b'\x04' + bcj2_coder() + coder(module.AES) + coder() * 2
+              + bytes([4, 0, 1, 2, 2, 3]) + bytes([0, 3, 5, 6]))
+    parsed = module._folder(module._Cursor(folder))
+    assert parsed.final_output == 1 and parsed.packed_count == 4
+    row = inspect_bytes(tmp_path, archive(bcj2_header(bcj2_streams(folder))))
+    assert row['reason'] == '7Z_AES_DATA'
+
+
+def test_bcj2_encoded_header_aes_marker_is_not_decoded(tmp_path, monkeypatch):
+    folder = bcj2_folder(branch=[coder(module.AES), coder(), coder()])
+    description = b'\x17' + bcj2_streams(folder, sizes=(1024,) * 4)
+    def forbidden(*args):
+        pytest.fail('encrypted metadata must not be decoded')
+    monkeypatch.setattr(module, '_decode_header', forbidden)
+    row = inspect_bytes(tmp_path, archive(description, b'x' * 4096))
+    assert row['reason'] == '7Z_AES_HEADER'
+    assert row['bytes_read'] == 512 + len(description)
+
+
+@pytest.mark.parametrize('folder,reason', [
+    (bcj2_folder(indices=(0, 1, 2, 2)), '7Z_INVALID_PACKED_INDICES'),
+    (bcj2_folder(indices=(0, 1, 2, 7)), '7Z_INVALID_PACKED_INDICES'),
+    (bcj2_folder(indices=(0, 1, 2, 3)), '7Z_INVALID_PACKED_INDICES'),
+    (bcj2_folder(binds=[(3, 0), (3, 1), (5, 2)]), '7Z_INVALID_CODER_BINDINGS'),
+    (bcj2_folder(binds=[(3, 0), (4, 0), (5, 2)]), '7Z_INVALID_CODER_BINDINGS'),
+    (bcj2_folder(binds=[(7, 0), (4, 1), (5, 2)]), '7Z_INVALID_CODER_BINDINGS'),
+    (bcj2_folder(binds=[(3, 4), (4, 1), (5, 2)]), '7Z_INVALID_CODER_BINDINGS'),
+    # Self-cycle and a disconnected two-coder cycle, with valid packed indices.
+    (bcj2_folder(binds=[(0, 0), (4, 1), (5, 2)], indices=(1, 2, 3, 6)), '7Z_INVALID_CODER_BINDINGS'),
+    (bcj2_folder(binds=[(1, 0), (0, 1), (5, 2)], indices=(2, 3, 4, 6)), '7Z_INVALID_CODER_BINDINGS'),
+    (bcj2_folder(final=bcj2_coder(inputs=3)), '7Z_INVALID_BCJ2_STREAM_COUNTS'),
+    (bcj2_folder(final=bcj2_coder(outputs=2)), '7Z_INVALID_BCJ2_STREAM_COUNTS'),
+    (bcj2_folder(final=coder(module.BCJ2)), '7Z_INVALID_BCJ2_STREAM_COUNTS'),
+    (bcj2_folder(final=bcj2_coder(props=b'x')), '7Z_INVALID_CODER_PROPERTIES'),
+    (bcj2_folder(final=bcj2_coder(method=b'\x7f')), '7Z_COMPLEX_CODER_UNSUPPORTED'),
+])
+def test_invalid_bcj2_graphs_stay_unknown(tmp_path, folder, reason):
+    row = inspect_bytes(tmp_path, archive(bcj2_header(bcj2_streams(folder))))
+    assert row['encryption'] == 'UNKNOWN' and row['reason'] == reason
+
+
+def test_bcj2_unknown_method_and_invalid_graph_with_aes(tmp_path):
+    folder = bcj2_folder(branch=[coder(b'\x7f'), coder(), coder()])
+    row = inspect_bytes(tmp_path, archive(bcj2_header(bcj2_streams(folder))))
+    assert row['reason'] == '7Z_UNKNOWN_CODER'
+    folder = bcj2_folder(branch=[coder(module.AES), coder(), coder()], indices=(0, 1, 2, 2))
+    row = inspect_bytes(tmp_path, archive(bcj2_header(bcj2_streams(folder))))
+    assert row['encryption'] == 'UNKNOWN' and row['reason'] == '7Z_INVALID_PACKED_INDICES'
+
+
+def test_bcj2_pack_counts_ranges_and_no_header_decoder(tmp_path):
+    for sizes, reason in [((2, 2, 2), '7Z_PACK_STREAM_COUNT_MISMATCH'),
+                          ((2, 2, 2, 3), '7Z_PACK_RANGE_INVALID')]:
+        row = inspect_bytes(tmp_path, archive(bcj2_header(bcj2_streams(sizes=sizes))))
+        assert row['encryption'] == 'UNKNOWN' and row['reason'] == reason
+    row = inspect_bytes(tmp_path, archive(b'\x17' + bcj2_streams()))
+    assert row['reason'] == '7Z_ENCODED_HEADER_CHAIN_UNSUPPORTED'
+    folder = b'\x01' + bcj2_coder() + bytes(range(4))
+    row = inspect_bytes(tmp_path, archive(b'\x17' + bcj2_streams(folder, outputs=1)))
+    assert row['reason'] == '7Z_HEADER_CODEC_UNSUPPORTED'
+
+
+def test_bcj2_large_payload_still_only_reads_metadata(tmp_path, monkeypatch):
+    path = tmp_path/'large.7z'
+    size = 100 * 1024 * 1024
+    header = bcj2_header(bcj2_streams(sizes=(size - 6, 2, 2, 2)))
+    start = struct.pack('<QQ', size, len(header)) + crc(header)
+    with path.open('wb') as stream:
+        stream.write(b'7z\xbc\xaf\x27\x1c\x00\x04' + crc(start) + start)
+        stream.seek(32 + size)
+        stream.write(header)
+    calls, original = [], inventory.BoundedReader.at
+    def record(reader, offset, count):
+        calls.append((offset, count))
+        return original(reader, offset, count)
+    monkeypatch.setattr(inventory.BoundedReader, 'at', record)
+    row = inventory.inspect_file(path)
+    assert row['encryption'] == 'NO_ENCRYPTION_INDICATOR'
+    assert calls == [(0, 512), (32 + size, len(header))]
+    assert row['bytes_read'] == 512 + len(header)
+
+
 def test_aes_bytes_in_filename_properties_or_payload_are_not_markers(tmp_path):
     base = plain_header()
     # AES method bytes in an unrelated archive property and archive member data.
@@ -228,17 +363,20 @@ def test_empty_archive_and_empty_directory(tmp_path):
     assert row['encryption'] == 'NO_ENCRYPTION_INDICATOR' and row['member_count'] == 1
 
 
-def test_resume_reclassifies_only_old_unknown_7z(tmp_path, monkeypatch):
+@pytest.mark.parametrize('bcj2', [False, True])
+def test_resume_reclassifies_only_old_unknown_7z(tmp_path, monkeypatch, bcj2):
     source, output = tmp_path/'source', tmp_path/'output'
     source.mkdir()
     path = source/'example.7z'
-    path.write_bytes(encoded_archive(plain_header(module.AES, b'\x13')))
+    header = bcj2_header() if bcj2 else plain_header(module.AES, b'\x13')
+    path.write_bytes(encoded_archive(header))
     (source/'ordinary.bin').write_bytes(b'ordinary')
     original = runner.inspect_file
     def old(path):
         if path.suffix == '.7z':
             return dict(format='7Z', encryption='UNKNOWN', structure='HEADER_CRC_CHECKED',
-                        reason='7Z_ENCRYPTION_REQUIRES_DEEPER_PARSER', bytes_read=32)
+                        reason='7Z_COMPLEX_CODER_UNSUPPORTED' if bcj2 else
+                               '7Z_ENCRYPTION_REQUIRES_DEEPER_PARSER', bytes_read=32)
         return original(path)
     monkeypatch.setattr(runner, 'inspect_file', old)
     runner.inventory(source, output)
@@ -249,7 +387,7 @@ def test_resume_reclassifies_only_old_unknown_7z(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, 'inspect_file', new)
     second = runner.inventory(source, output, resume=True)
     assert calls == [path] and second['run']['reused'] == 1
-    assert second['encryption_counts'] == {'ENCRYPTED': 1}
+    assert second['encryption_counts'] == {'NO_ENCRYPTION_INDICATOR' if bcj2 else 'ENCRYPTED': 1}
     third = runner.inventory(source, output, resume=True)
     assert third['run']['reused'] == 2 and third['run']['bytes_read'] == 0
 
