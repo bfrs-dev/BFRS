@@ -92,7 +92,10 @@ def walk(root, depth=0, root_info=None):
             for entry in entries:
                 path = Path(entry.path)
                 try:
-                    info = entry.stat(follow_symlinks=False)
+                    # Windows DirEntry.stat() reports zero st_dev/st_ino. Use
+                    # lstat() so resume compares real file IDs, including those
+                    # stored by older checkpoints, without following reparse points.
+                    info = path.lstat() if os.name == 'nt' else entry.stat(follow_symlinks=False)
                     if _link(info):
                         yield path, info, 'LINK_OR_REPARSE_POINT_SKIPPED'
                     elif stat.S_ISDIR(info.st_mode):

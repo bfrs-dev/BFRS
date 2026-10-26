@@ -184,6 +184,38 @@ def test_resume_change_delete_and_no_repeated_content_reads(tmp_path, monkeypatc
     assert third['complete'] and len(rows) == 1 and rows[0]['format'] == 'RTF'
 
 
+
+def test_walk_identity_matches_direct_stat(tmp_path):
+    path = tmp_path / 'plain.bin'
+    path.write_bytes(b'ordinary')
+    [(walked, info, error)] = list(runner.walk(tmp_path))
+    assert walked == path and error is None
+    assert runner._identity(info) == runner._identity(path.stat())
+
+
+def test_resume_refreshes_legacy_zero_file_ids_once(tmp_path, monkeypatch):
+    source, output = tmp_path / 'source', tmp_path / 'output'
+    source.mkdir()
+    path = zip_fixture(source / 'a.bin')
+    runner.inventory(source, output)
+    info = path.stat()
+    # Earlier Windows traversal persisted DirEntry.stat()'s zero file IDs.
+    with sqlite3.connect(output / 'inventory.sqlite') as db:
+        db.execute('UPDATE files SET identity=?',
+                   (json.dumps([info.st_size, info.st_mtime_ns, 0, 0]),))
+    refreshed = runner.inventory(source, output, resume=True)
+    assert refreshed['run']['inspected'] == 1
+    assert refreshed['run']['reused'] == 0
+    with sqlite3.connect(output / 'inventory.sqlite') as db:
+        assert db.execute('SELECT identity FROM files').fetchone()[0] == runner._identity(path.stat())
+    def forbidden(path):
+        raise AssertionError('refreshed file ID should be reused')
+    monkeypatch.setattr(runner, 'inspect_file', forbidden)
+    resumed = runner.inventory(source, output, resume=True)
+    assert resumed['run']['inspected'] == 0
+    assert resumed['run']['reused'] == 1
+    assert resumed['run']['bytes_read'] == 0
+
 def test_interruption_and_links(tmp_path):
     source, output = tmp_path/'source', tmp_path/'output'
     source.mkdir()

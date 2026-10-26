@@ -62,9 +62,9 @@ def test_only_canonical_findings_are_counted_and_keys_deduplicated_on_disk(tmp_p
     assert result["reported_finding_counts"]["crypto_valid_secret_occurrences"] == 2
     assert "crypto_valid_unique_secrets" not in result["reported_finding_counts"]
     assert result["file_priority_counts"]["SECRET_REVIEW"] == 2
-    assert len((output / "wyniki_do_sprawdzenia.jsonl").read_text().splitlines()) == 2
+    assert len((output / "wyniki_do_sprawdzenia.jsonl").read_text(encoding="utf-8").splitlines()) == 2
     for path in output.iterdir():
-        assert "SYNTHETIC_SECRET_DO_NOT_EXPORT" not in path.read_text()
+        assert "SYNTHETIC_SECRET_DO_NOT_EXPORT" not in path.read_text(encoding="utf-8")
 
 
 def test_likely_wordlist_seeds_are_separate_but_not_lost(tmp_path):
@@ -78,7 +78,7 @@ def test_likely_wordlist_seeds_are_separate_but_not_lost(tmp_path):
     assert counts["retained_valid_secret_occurrences"] == 2
     assert counts["likely_false_positive_rows"] == 1
     assert counts["exported_review_rows"] == 1
-    assert len((output / "seedy_prawdopodobnie_przypadkowe.jsonl").read_text().splitlines()) == 1
+    assert len((output / "seedy_prawdopodobnie_przypadkowe.jsonl").read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_file_with_only_aggregated_seed_noise_is_not_prioritized_as_real_secret(tmp_path):
@@ -89,10 +89,11 @@ def test_file_with_only_aggregated_seed_noise_is_not_prioritized_as_real_secret(
         },
     }], "target_findings": []})
     assert result["file_priority_counts"] == {"SEED_NOISE": 1}
-    assert "SEED_NOISE" in (output / "najwazniejsze_pliki.jsonl").read_text()
+    assert "SEED_NOISE" in (output / "najwazniejsze_pliki.jsonl").read_text(encoding="utf-8")
 
 
-def test_file_metadata_after_report_bom_unicode_and_wallet_modules(tmp_path):
+@pytest.mark.parametrize("bom", [False, True])
+def test_file_metadata_after_report_bom_unicode_and_wallet_modules(tmp_path, bom):
     result, output = run_report(tmp_path, {
         "source_type": "FOLDER", "files": [
             {"report": {"intact_wallet": {"detected": True, "wallet_family": "BITCOIN_CORE"}}, "file_path": "E:\\HP\\portfel-żółty.dat"},
@@ -100,13 +101,13 @@ def test_file_metadata_after_report_bom_unicode_and_wallet_modules(tmp_path):
             {"report": {"electrum_raw_recovery": {"fragment_candidates": 1}}, "file_path": "E:\\HP\\fragment"},
             {"report": {"finding_summary": {"accepted_candidates": 0}}, "wallet_detected": True, "file_path": "E:\\HP\\sam-marker"},
         ], "target_findings": [],
-    }, bom=True)
+    }, bom=bom)
     assert result["retained_finding_counts"]["files_processed"] == 4
     assert result["file_priority_counts"] == {
         "WALLET_STRUCTURE": 1, "SECRET_REVIEW": 1, "OTHER_REVIEW": 1,
     }
-    assert "portfel-żółty.dat" in (output / "najwazniejsze_pliki.jsonl").read_text()
-    assert "sam-marker" not in (output / "najwazniejsze_pliki.jsonl").read_text()
+    assert "portfel-żółty.dat" in (output / "najwazniejsze_pliki.jsonl").read_text(encoding="utf-8")
+    assert "sam-marker" not in (output / "najwazniejsze_pliki.jsonl").read_text(encoding="utf-8")
 
 
 def test_unknown_legacy_validation_is_reviewable_not_claimed_valid(tmp_path):
@@ -114,7 +115,7 @@ def test_unknown_legacy_validation_is_reviewable_not_claimed_valid(tmp_path):
     result, output = run_report(tmp_path, {"source_type": "IMAGE", "target_findings": [row]})
     assert result["retained_finding_counts"]["retained_valid_secret_occurrences"] == 0
     assert result["retained_finding_counts"]["exported_review_rows"] == 1
-    projected = json.loads((output / "wyniki_do_sprawdzenia.jsonl").read_text())
+    projected = json.loads((output / "wyniki_do_sprawdzenia.jsonl").read_text(encoding="utf-8"))
     assert projected["normalized_state"]["discovery_state"] == "UNCLASSIFIED"
 
 
@@ -128,7 +129,7 @@ def test_seed_only_candidate_view_remains_non_additive(tmp_path):
     })
     assert result["retained_finding_counts"]["mnemonic_candidate_rows"] == 1
     assert result["retained_finding_counts"]["retained_valid_secret_occurrences"] == 0
-    exported = json.loads((output / "kandydaci_seedow.jsonl").read_text())
+    exported = json.loads((output / "kandydaci_seedow.jsonl").read_text(encoding="utf-8"))
     assert exported["source_view"] == "mnemonic_candidates"
     assert exported["normalized_state"]["crypto_state"] == "VALID"
     assert result["retained_finding_counts"]["mnemonic_candidate_unique_valid_fingerprints"] == 1
@@ -147,18 +148,18 @@ def test_truncated_report_does_not_publish_partial_analysis(tmp_path):
 
 def test_existing_output_is_not_overwritten(tmp_path):
     source = tmp_path / "report.json"
-    source.write_text('{"source_type":"FOLDER","files":[]}')
+    source.write_text('{"source_type":"FOLDER","files":[]}', encoding="utf-8")
     output = tmp_path / "analysis"
     output.mkdir()
-    (output / "existing.txt").write_text("preserve")
+    (output / "existing.txt").write_text("preserve", encoding="utf-8")
     with pytest.raises(analyzer.ReportAnalysisError, match="juz istnieje"):
         analyzer.analyze_report(source, output)
-    assert (output / "existing.txt").read_text() == "preserve"
+    assert (output / "existing.txt").read_text(encoding="utf-8") == "preserve"
 
 
 def test_unrelated_json_is_not_presented_as_zero_findings(tmp_path):
     source = tmp_path / "other.json"
-    source.write_text('{"unrelated": 123}')
+    source.write_text('{"unrelated": 123}', encoding="utf-8")
     with pytest.raises(analyzer.ReportAnalysisError, match="Nie rozpoznano"):
         analyzer.analyze_report(source, tmp_path / "analysis")
 
@@ -200,7 +201,8 @@ def test_against_real_bfrs_folder_report(tmp_path):
     assert summary["reported_finding_counts"]["crypto_valid_secret_occurrences"] == 2
 
 
-def test_raw_der_is_exported_with_existing_rejection_diagnostics_and_late_file_path(tmp_path):
+@pytest.mark.parametrize("bom", [False, True])
+def test_raw_der_is_exported_with_existing_rejection_diagnostics_and_late_file_path(tmp_path, bom):
     row = finding(kind="ec_private_key_der", crypto="UNCHECKED", discovery="RAW")
     row["normalized_state"]["structural_state"] = "NONE"
     row["reason_codes"] = ["DER_ANCHOR_ONLY"]
@@ -217,18 +219,18 @@ def test_raw_der_is_exported_with_existing_rejection_diagnostics_and_late_file_p
             "target_findings": [row], "orphan_private_key_recovery": module,
         }, "file_path": "E:\\HP\\żółty.bin", "relative_path": "żółty.bin"}],
         "target_findings": [row],
-    })
-    keys = [json.loads(line) for line in (output / "sygnatury_kluczy.jsonl").read_text().splitlines()]
+    }, bom=bom)
+    keys = [json.loads(line) for line in (output / "sygnatury_kluczy.jsonl").read_text(encoding="utf-8").splitlines()]
     assert len(keys) == 1
     assert keys[0]["reason_codes"] == ["DER_ANCHOR_ONLY"]
     assert keys[0]["normalized_state"]["crypto_state"] == "UNCHECKED"
-    diagnostics = json.loads((output / "diagnostyka_kluczy.jsonl").read_text())
+    diagnostics = json.loads((output / "diagnostyka_kluczy.jsonl").read_text(encoding="utf-8"))
     assert diagnostics["file_path"] == "E:\\HP\\żółty.bin"
     assert diagnostics["rejection_counts"] == {"embedded_public_key_mismatch": 1}
     assert result["key_diagnostics"]["counts"]["canonical_key_rows"] == 1
     assert result["retained_finding_counts"]["retained_valid_secret_occurrences"] == 0
     for path in output.iterdir():
-        assert "SYNTHETIC_SECRET_DO_NOT_EXPORT" not in path.read_text()
+        assert "SYNTHETIC_SECRET_DO_NOT_EXPORT" not in path.read_text(encoding="utf-8")
 
 
 def test_root_and_file_key_diagnostics_are_separate_non_additive_views(tmp_path):
@@ -243,7 +245,7 @@ def test_root_and_file_key_diagnostics_are_separate_non_additive_views(tmp_path)
     counts = result["key_diagnostics"]["counts"]
     assert counts["root:orphan_private_key_recovery:raw_der_anchor_count"] == 4
     assert counts["files:orphan_private_key_recovery:raw_der_anchor_count"] == 4
-    assert len((output / "diagnostyka_kluczy.jsonl").read_text().splitlines()) == 2
+    assert len((output / "diagnostyka_kluczy.jsonl").read_text(encoding="utf-8").splitlines()) == 2
 
 
 def test_fragment_diagnostics_and_zero_module_presence_are_retained(tmp_path):
@@ -259,7 +261,7 @@ def test_fragment_diagnostics_and_zero_module_presence_are_retained(tmp_path):
     counts = result["key_diagnostics"]["counts"]
     assert counts["files:orphan_private_key_recovery:reports_present"] == 1
     assert counts["files:orphan_private_key_fragment_recovery:read_failure_count"] == 1
-    rows = (output / "diagnostyka_kluczy.jsonl").read_text().splitlines()
+    rows = (output / "diagnostyka_kluczy.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 1 and json.loads(rows[0])["file_path"] == "fragment.bin"
 
 
@@ -276,11 +278,11 @@ def test_key_diagnostics_from_real_folder_scan(tmp_path):
     summary = analyzer.analyze_report(source, tmp_path / "analysis")
     counts = summary["key_diagnostics"]["counts"]
     assert counts["kind:ec_private_key_der"] == 2
-    original = json.loads(source.read_text())
+    original = json.loads(source.read_text(encoding="utf-8"))
     modules = [item["report"]["orphan_private_key_recovery"] for item in original["files"]]
     assert counts["files:orphan_private_key_recovery:raw_der_anchor_count"] == sum(item["raw_der_anchor_count"] for item in modules)
     assert counts["files:orphan_private_key_recovery:valid_secp256k1_der_count"] == 1
-    diagnostics = [json.loads(line) for line in (tmp_path / "analysis" / "diagnostyka_kluczy.jsonl").read_text().splitlines()]
+    diagnostics = [json.loads(line) for line in (tmp_path / "analysis" / "diagnostyka_kluczy.jsonl").read_text(encoding="utf-8").splitlines()]
     assert any(row["file_path"].endswith("valid.bin") and row.get("valid_secp256k1_der_count") == 1 for row in diagnostics)
     assert any(row["file_path"].endswith("anchor-only.bin") and row.get("raw_der_anchor_count") == 0 and row["file_der_finding_rows"] == 1 for row in diagnostics)
 
@@ -292,6 +294,6 @@ def test_der_file_without_recovery_module_is_explicitly_marked_not_reported(tmp_
         "source_type": "FOLDER", "files": [{"file_path": "unknown.bin", "report": {
             "target_findings": [row]}}], "target_findings": [row],
     })
-    diagnostic = json.loads((output / "diagnostyka_kluczy.jsonl").read_text())
+    diagnostic = json.loads((output / "diagnostyka_kluczy.jsonl").read_text(encoding="utf-8"))
     assert diagnostic["module"] == "NOT_REPORTED"
     assert result["key_diagnostics"]["counts"]["files_with_der_findings_but_no_recovery_modules"] == 1
