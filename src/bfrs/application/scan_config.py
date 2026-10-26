@@ -60,6 +60,8 @@ class ScanConfig:
     padding_mib: int = DEFAULT_PADDING_MIB
     minimum_hits: int = DEFAULT_MINIMUM_HITS
     minimum_distinct_types: int = DEFAULT_MINIMUM_DISTINCT_TYPES
+    # GUI publication policy, excluded from scanner/checkpoint semantics.
+    protect_existing_report: bool = False
 
     def __post_init__(self) -> None:
         self._validate_modes()

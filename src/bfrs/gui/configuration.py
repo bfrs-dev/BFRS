@@ -43,6 +43,8 @@ def build_gui_scan_config(
         raise ValueError(translate(language, "validation_report_required"))
     source = Path(input_text)
     output = Path(output_text)
+    if output.exists() or output.is_symlink():
+        raise ValueError(translate(language, "validation_report_exists"))
     if not targets:
         raise ValueError(translate(language, "validation_target_required"))
 
@@ -104,4 +106,5 @@ def build_gui_scan_config(
         file_workers=file_workers,
         checkpoint=(None if resume_checkpoint else checkpoint),
         resume_checkpoint=(checkpoint if resume_checkpoint else None),
+        protect_existing_report=True,
     )

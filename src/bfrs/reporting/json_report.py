@@ -1508,6 +1508,7 @@ def write_json_report(
     result: FullImageRecoveryResult,
     configuration: Mapping[str, Any],
     wallet_recovery: Mapping[str, Any] | None = None,
+    *, overwrite: bool = True,
 ) -> Path:
     report_path = Path(path)
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1520,7 +1521,8 @@ def write_json_report(
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, report_path)
+        from bfrs.reporting.atomic_output import publish
+        publish(temporary, report_path, overwrite=overwrite)
     except BaseException:
         try:
             temporary.unlink(missing_ok=True)

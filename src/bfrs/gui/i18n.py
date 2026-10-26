@@ -292,6 +292,49 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
 }
 
 
+_TRANSLATIONS["pl"].update({
+    "saved_jobs": "Niedokończone zadania",
+    "load_saved_job": "Wczytaj do wznowienia",
+    "job_loaded": "Wczytano zapisany skan. Zgodność checkpointu zostanie sprawdzona przed wznowieniem.",
+    "job_running": "przerwane lub w toku", "job_stopped": "zatrzymane", "job_failed": "błąd",
+    "job_store_error": "Nie udało się trwale zapisać konfiguracji zadania. Skan nie został uruchomiony.\n{message}",
+    "job_update_error": "Nie udało się zaktualizować dziennika zadań: {message}. Checkpoint nie jest usuwany.",
+    "job_load_error": "Nie można wczytać zadania: {message}",
+    "validation_report_exists": "Raport już istnieje. Wybierz nową nazwę; dotychczasowy raport pozostanie bez zmian.",
+    "hint_space": "Zwolnij miejsce lub wybierz raport na nośniku z wolnym miejscem. Zachowaj checkpoint i wznów z tymi samymi ustawieniami.",
+    "hint_permission": "Sprawdź uprawnienia i dostępność nośnika. Wybierz katalog raportu, do którego możesz zapisywać; nie zastępuj istniejącego raportu.",
+    "hint_complete": "Checkpoint oznaczono jako zakończony. Sprawdź zapisany raport. Nie resetuj checkpointu; zakończonych checkpointów folderów nie wznawia się ponownie.",
+    "hint_source_identity": "Przywróć oryginalne źródło i jego lokalizację/nośnik. Nie obchodź kontroli tożsamości. Zmienione źródło wymaga nowego skanu i checkpointu.",
+    "hint_settings": "Wczytaj zapisane zadanie i oryginalne ustawienia. Zmienione detektory, geometria lub zakres mogą wymagać nowego checkpointu; zachowaj dotychczasowy.",
+    "hint_report_exists": "Wybierz nową ścieżkę raportu. Zmiana nazwy raportu nie wymaga zmiany ustawień skanowania ani resetowania checkpointu.",
+    "hint_report": "Sprawdź pełną ścieżkę raportu, dostępność dysku, miejsce i uprawnienia. Wybierz nowy plik, zachowaj checkpoint i spróbuj wznowić.",
+    "hint_checkpoint": "Sprawdź wskazany plik checkpointu i dostępność nośnika. Nie usuwaj go ani nie nadpisuj. Starsza, uszkodzona lub niezgodna wersja może wymagać nowego skanu.",
+    "hint_process": "Proces skanowania zgłosił błąd. Zachowaj checkpoint i opis błędu. Sprawdź dostępność źródła, zasoby i zgodność zapisanych ustawień przed ponowną próbą.",
+    "hint_source": "Sprawdź oryginalną ścieżkę i dostępność nośnika źródłowego. Nie zastępuj źródła innym plikiem o tej samej nazwie.",
+    "hint_unknown": "Zachowaj checkpoint i pełny komunikat. Sam kod zakończenia nie określa przyczyny; sprawdź źródło, checkpoint i zapisane ustawienia.",
+})
+_TRANSLATIONS["en"].update({
+    "saved_jobs": "Unfinished tasks", "load_saved_job": "Load for resume",
+    "job_loaded": "Saved scan loaded. Checkpoint compatibility will be checked before resuming.",
+    "job_running": "interrupted or running", "job_stopped": "stopped", "job_failed": "failed",
+    "job_store_error": "Could not durably save the scan request. The scan was not started.\n{message}",
+    "job_update_error": "Could not update the task journal: {message}. The checkpoint is retained.",
+    "job_load_error": "Cannot load task: {message}",
+    "validation_report_exists": "The report already exists. Choose a new filename; the existing report will be preserved.",
+    "hint_space": "Free disk space or choose a report on another writable drive. Keep the checkpoint and resume with the same settings.",
+    "hint_permission": "Check permissions and drive availability. Choose a writable report directory; do not replace an existing report.",
+    "hint_complete": "The checkpoint is marked complete. Locate the saved report. Do not reset the checkpoint; completed folder checkpoints cannot be resumed again.",
+    "hint_source_identity": "Restore the original source and its location/drive. Do not bypass identity validation. Changed sources need a new scan and checkpoint.",
+    "hint_settings": "Load the saved task and original settings. Changed detectors, geometry or range may need a new checkpoint; keep the existing one.",
+    "hint_report_exists": "Choose a new report path. Changing the report filename does not require changing scanner settings or resetting the checkpoint.",
+    "hint_report": "Check the full report path, drive availability, free space and permissions. Choose a new file, keep the checkpoint and retry resume.",
+    "hint_checkpoint": "Check the checkpoint file and drive availability. Do not delete or overwrite it. A legacy, damaged or incompatible checkpoint may need a new scan.",
+    "hint_process": "The scan process reported a failure. Keep the checkpoint and diagnostic. Check the source, available resources and saved settings before retrying.",
+    "hint_source": "Check the original source path and drive availability. Do not substitute another file with the same name.",
+    "hint_unknown": "Keep the checkpoint and full diagnostic. An exit code alone does not identify the cause; check the source, checkpoint and saved settings.",
+})
+
+
 def normalize_language(language: str | None) -> str:
     """Return a supported language code, falling back to Polish."""
     code = (language or DEFAULT_LANGUAGE).casefold()

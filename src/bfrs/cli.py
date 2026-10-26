@@ -520,6 +520,7 @@ def main(
     _report_sink: Callable[[dict], None] | None = None,
     _seed_pipeline: MnemonicRecoveryPipeline | None = None,
     _seed_workers: int | None = None,
+    _report_overwrite: bool = True,
 ) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
@@ -531,6 +532,7 @@ def main(
         _scan_error=_scan_error, _selection_override=_selection_override,
         _report_sink=_report_sink, _seed_pipeline=_seed_pipeline,
         _seed_workers=_seed_workers,
+        _report_overwrite=_report_overwrite,
     )
 
 
@@ -546,6 +548,7 @@ def _run_scan(
     _report_sink: Callable[[dict], None] | None = None,
     _seed_pipeline: MnemonicRecoveryPipeline | None = None,
     _seed_workers: int | None = None,
+    _report_overwrite: bool = True,
 ) -> int:
     """Shared engine for CLI-validated requests and prepared folder children.
 
@@ -587,6 +590,7 @@ def _run_scan(
                 on_error=_scan_error,
             ),
             progress_callback=_scan_progress,
+            overwrite_report=_report_overwrite,
         )
     if arguments.file_workers != 1:
         parser.error("--file-workers is only supported for FOLDER sources")
@@ -724,9 +728,8 @@ def _run_scan(
             _report_sink(payload)
             return 0
         try:
-            arguments.output.parent.mkdir(parents=True, exist_ok=True)
-            arguments.output.write_text(json.dumps(payload, indent=2, sort_keys=True),
-                                        encoding="utf-8")
+            from bfrs.reporting.atomic_output import write_json
+            write_json(arguments.output, payload, overwrite=_report_overwrite)
         except OSError as error:
             _report_error(f"report error: {error}", _scan_error)
             return 4
@@ -903,6 +906,7 @@ def _run_scan(
             result,
             configuration,
             wallet_recovery,
+            overwrite=_report_overwrite,
         )
     except OSError as error:
         _report_error(f"report error: {error}", _scan_error)

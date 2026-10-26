@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Slot
+from PySide6.QtCore import QThread, Slot, Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -45,6 +45,8 @@ from bfrs.gui.i18n import (
 from bfrs.gui.result_browser import ResultBrowserWidget
 from bfrs.gui.scan_worker import ScanWorker
 from bfrs.gui.settings import GuiPreferences, GuiSettingsStore
+from bfrs.gui.scan_jobs import ScanJobStore
+from bfrs.gui.scan_errors import explain_scan_error
 
 
 _TARGET_KEYS = {
@@ -65,6 +67,11 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self._settings_store = settings_store or GuiSettingsStore()
+        self._job_store = ScanJobStore(self._settings_store.path.parent / "scan-jobs")
+        self._restored_job = None
+        self._active_scan_job = None
+        self._closing_requested = False
+        self._last_failure_message = None
         preferences = self._settings_store.load()
         self._last_result_report = preferences.last_result_report
         self._language = normalize_language(language or preferences.language)
@@ -134,6 +141,17 @@ class MainWindow(QMainWindow):
         source_layout.addWidget(self.output_edit, 2, 1, 1, 2)
         source_layout.addWidget(self.output_button, 2, 3)
         scan_layout.addWidget(self.source_box)
+
+        saved_row = QHBoxLayout()
+        self.saved_jobs_label = QLabel()
+        self.saved_jobs_combo = QComboBox()
+        self.saved_jobs_combo.setMinimumContentsLength(24)
+        self.load_job_button = QPushButton()
+        self.load_job_button.clicked.connect(self._load_saved_job)
+        saved_row.addWidget(self.saved_jobs_label)
+        saved_row.addWidget(self.saved_jobs_combo, 1)
+        saved_row.addWidget(self.load_job_button)
+        scan_layout.addLayout(saved_row)
 
         self.target_box = QGroupBox()
         target_layout = QGridLayout(self.target_box)
@@ -320,11 +338,93 @@ class MainWindow(QMainWindow):
         self.advanced_toggle.toggled.connect(self._save_preferences)
 
         self._retranslate_ui()
+        self.status_label.setWordWrap(True)
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._refresh_saved_jobs()
         if self._last_result_report and Path(self._last_result_report).is_file():
             self.result_browser.load_report(self._last_result_report)
 
     def _t(self, key: str, **values: object) -> str:
         return translate(self._language, key, **values)
+
+    def _refresh_saved_jobs(self):
+        selected = self.saved_jobs_combo.currentData()
+        self.saved_jobs_combo.clear()
+        self.saved_jobs_combo.addItem("—", None)
+        try:
+            jobs = self._job_store.incomplete()
+            for job in jobs:
+                self.saved_jobs_combo.addItem(
+                    f"{job.updated[:19]} | {job.config.input_path.name} → {job.config.output_path.name} "
+                    f"[{self._t('job_' + job.state)}]", job.job_id)
+            if self._job_store.load_errors:
+                self.detail_label.setText(self._t("job_load_error", message="; ".join(self._job_store.load_errors)))
+        except OSError as error:
+            self.detail_label.setText(self._t("job_load_error", message=str(error)))
+        index = self.saved_jobs_combo.findData(selected)
+        self.saved_jobs_combo.setCurrentIndex(max(0, index))
+
+    @Slot()
+    def _load_saved_job(self):
+        if self._thread is not None or not self.saved_jobs_combo.currentData():
+            return
+        try:
+            job = self._job_store.load(self.saved_jobs_combo.currentData())
+            config = job.for_resume()
+            if config.targets is None or config.seed_scan_only or config.electrum_only or config.revalidate_wallet_records:
+                raise ValueError("Saved task uses a CLI-only mode; retain its original CLI settings.")
+            for field, spin in (
+                ("workers", self.workers_spin), ("file_workers", self.file_workers_spin),
+                ("chunk_mib", self.chunk_mib_spin), ("overlap_kib", self.overlap_kib_spin),
+                ("cluster_mib", self.cluster_mib_spin), ("padding_mib", self.padding_mib_spin),
+                ("minimum_hits", self.minimum_hits_spin), ("minimum_distinct_types", self.minimum_distinct_types_spin),
+            ):
+                if not spin.minimum() <= getattr(config, field) <= spin.maximum():
+                    raise ValueError(f"Saved {field} is outside this GUI's supported range")
+            self.source_edit.setText(str(config.input_path))
+            self.output_edit.setText(str(config.output_path))
+            self.checkpoint_edit.setText(str(config.resume_checkpoint))
+            self.resume_check.setChecked(True)
+            self.source_type.setCurrentIndex(max(0, self.source_type.findData(config.source_type.value.lower() if config.source_type else None)))
+            for target, checkbox in self.target_checks.items():
+                checkbox.setChecked(target in config.targets)
+            self.mnemonic_check.setChecked(not config.skip_mnemonic)
+            self.bitcoin_context_check.setChecked(config.include_bitcoin_context)
+            self.workers_spin.setValue(config.workers)
+            self.file_workers_spin.setValue(config.file_workers)
+            self.start_offset_edit.setText(str(config.start))
+            self.end_offset_edit.setText(str(config.end) if config.end is not None else "")
+            for field, spin in (("chunk_mib", self.chunk_mib_spin), ("overlap_kib", self.overlap_kib_spin),
+                    ("cluster_mib", self.cluster_mib_spin), ("padding_mib", self.padding_mib_spin),
+                    ("minimum_hits", self.minimum_hits_spin), ("minimum_distinct_types", self.minimum_distinct_types_spin)):
+                spin.setValue(getattr(config, field))
+            self.recover_wallets_check.setChecked(config.recover_wallets)
+            self.recovery_dir_edit.setText(str(config.recovery_dir) if config.recovery_dir else "")
+            self._restored_job = job
+            self.status_label.setText(self._t("job_loaded"))
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            QMessageBox.warning(self, self._t("invalid_configuration"), self._t("job_load_error", message=str(error)))
+
+    def _restore_missing_report(self):
+        job = self._restored_job
+        if (job is not None and self.resume_check.isChecked() and not self.output_edit.text().strip()
+                and Path(self.source_edit.text()).absolute() == job.config.input_path.absolute()
+                and Path(self.checkpoint_edit.text()).absolute() == job.config.checkpoint_path.absolute()):
+            self.output_edit.setText(str(job.config.output_path))
+
+    def _remember_job_state(self, state):
+        if self._active_scan_job is None:
+            return
+        try:
+            if state == "completed":
+                self._job_store.complete_checkpoint(self._active_scan_job.job_id)
+            else:
+                self._job_store.set_state(self._active_scan_job.job_id, state)
+            self._refresh_saved_jobs()
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            self.detail_label.setText(self._t("job_update_error", message=str(error)))
 
     @Slot()
     def _change_language(self) -> None:
@@ -365,6 +465,8 @@ class MainWindow(QMainWindow):
         self._save_preferences()
 
     def _retranslate_ui(self) -> None:
+        self.saved_jobs_label.setText(self._t("saved_jobs"))
+        self.load_job_button.setText(self._t("load_saved_job"))
         self.language_label.setText(self._t("language"))
         self.tabs.setTabText(0, self._t("tab_scan"))
         self.tabs.setTabText(1, self._t("tab_results"))
@@ -503,6 +605,8 @@ class MainWindow(QMainWindow):
         if self._thread is not None:
             return
 
+        self._restore_missing_report()
+
         try:
             config = build_gui_scan_config(
                 input_path=self.source_edit.text(),
@@ -533,6 +637,13 @@ class MainWindow(QMainWindow):
             )
             return
 
+        try:
+            self._active_scan_job = self._job_store.begin(config)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, self._t("invalid_configuration"), self._t("job_store_error", message=str(error)))
+            return
+        self._last_failure_message = None
+        self._refresh_saved_jobs()
         self._controller = ScanController()
         self._thread = QThread(self)
         self._worker = ScanWorker(config, self._controller)
@@ -596,14 +707,16 @@ class MainWindow(QMainWindow):
             )
             return
         if isinstance(event, ScanStoppedEvent):
+            self._remember_job_state("stopped")
             self.status_label.setText(self._t("scan_stopped"))
             return
         if isinstance(event, ScanFailedEvent):
-            self.status_label.setText(
-                self._t("error_prefix", message=event.message)
-            )
+            self._last_failure_message = explain_scan_error(event.message, self._language)
+            self._remember_job_state("failed")
+            self.status_label.setText(self._last_failure_message)
             return
         if isinstance(event, ScanCompletedEvent):
+            self._remember_job_state("completed")
             self.progress_bar.setValue(1000)
             self.status_label.setText(
                 self._t("scan_completed_status", status=event.status)
@@ -613,6 +726,13 @@ class MainWindow(QMainWindow):
     def _scan_finished(self, result: object) -> None:
         if getattr(result, "status", "") == "stopped":
             self.status_label.setText(self._t("scan_stopped"))
+        elif getattr(result, "status", "") == "failed":
+            self._remember_job_state("failed")
+            if self._last_failure_message is None:
+                self._last_failure_message = explain_scan_error(
+                    f"BFRS scan exited with code {getattr(result, 'exit_code', '?')}; no detailed engine diagnostic received",
+                    self._language)
+            self.status_label.setText(self._last_failure_message)
         elif getattr(result, "completed", False):
             report_path = getattr(result, "report_path", "")
             self.status_label.setText(
@@ -621,7 +741,12 @@ class MainWindow(QMainWindow):
                     path=report_path,
                 )
             )
-            if report_path and Path(report_path).stat().st_size > 64 * 1024 * 1024:
+            try:
+                report_size = Path(report_path).stat().st_size if report_path else 0
+            except OSError as error:
+                self.status_label.setText(explain_scan_error(f"report error: {error}", self._language))
+                return
+            if report_path and report_size > 64 * 1024 * 1024:
                 self.status_label.setText(self._t("large_report_saved", path=report_path))
                 return
             if report_path and self.result_browser.load_report(report_path):
@@ -629,11 +754,19 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _scan_failed(self, message: str) -> None:
-        self.status_label.setText(self._t("scan_failed"))
-        QMessageBox.critical(self, self._t("scan_error_title"), message)
+        self._remember_job_state("failed")
+        self._last_failure_message = explain_scan_error(message, self._language)
+        self.status_label.setText(self._last_failure_message)
+        QMessageBox.critical(self, self._t("scan_error_title"), self._last_failure_message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._thread is not None:
+            self._closing_requested = True
+            self._request_stop()
+            event.ignore()
+            return
         self._save_preferences()
+        self._closing_requested = False
         super().closeEvent(event)
 
     @Slot()
@@ -647,3 +780,5 @@ class MainWindow(QMainWindow):
         self._controller = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        if self._closing_requested:
+            self.close()

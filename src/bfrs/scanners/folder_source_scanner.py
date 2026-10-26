@@ -498,6 +498,7 @@ def _scan_folder_source(
     *,
     progress_callback: Callable[[ScanProgress], None] | None = None,
     resources: ExitStack,
+    overwrite_report: bool = True,
 ) -> int:
     root = arguments.input.resolve()
 
@@ -801,9 +802,13 @@ def _scan_folder_source(
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_output, output)
+        from bfrs.reporting.atomic_output import publish
+        publish(temporary_output, output, overwrite=overwrite_report)
     except OSError as error:
-        temporary_output.unlink(missing_ok=True)
+        try:
+            temporary_output.unlink(missing_ok=True)
+        except OSError:
+            pass
         if checkpoint is not None:
             try:
                 checkpoint.close()
@@ -832,12 +837,13 @@ def _scan_folder_source(
     return 0
 
 
-def scan_folder_source(arguments, child_main, *, progress_callback=None) -> int:
+def scan_folder_source(arguments, child_main, *, progress_callback=None, overwrite_report=True) -> int:
     """Keep temporary result storage alive until atomic report publication."""
     try:
         with ExitStack() as resources:
             return _scan_folder_source(arguments, child_main,
-                                       progress_callback=progress_callback, resources=resources)
+                                       progress_callback=progress_callback, resources=resources,
+                                       overwrite_report=overwrite_report)
     except FolderCheckpointError as error:
         print(f"folder checkpoint error: {error}", file=sys.stderr)
         return 3

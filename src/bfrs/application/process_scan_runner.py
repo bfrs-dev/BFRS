@@ -198,6 +198,17 @@ class ProcessScanRunner:
                     f"{error_type}: {message}"
                 )
 
+            if result is not None and process.exitcode not in (None, 0):
+                event = ScanFailedEvent(
+                    message=("isolated scan worker exited abnormally "
+                        f"(process exit code {process.exitcode}) after terminal engine result "
+                        f"{result.exit_code}. A report may already exist; inspect it before retrying."),
+                    error_type="ProcessExit", recoverable=True,
+                )
+                if self._event_sink is not None:
+                    self._event_sink(event)
+                raise ProcessScanError(event.message)
+
             if result is None:
                 exit_code = process.exitcode
                 event = ScanFailedEvent(

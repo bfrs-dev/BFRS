@@ -93,6 +93,14 @@ class ScanService:
         self._last_progress_bytes = 0
         self._last_checkpoint_durable_bytes = None
         self._last_error_message = None
+        if config.protect_existing_report:
+            from bfrs.application.scan_diagnostics import PreflightError, preflight
+            try:
+                preflight(config)
+            except (OSError, PreflightError) as error:
+                code = error.code if isinstance(error, PreflightError) else 4
+                self._emit(ScanFailedEvent(message=str(error), error_type=type(error).__name__, recoverable=True))
+                return ScanRunResult(code, config.output_path, "failed")
         source_type = self._resolve_source_type(config)
         self._emit(ScanStartedEvent(
             input_path=config.input_path,
@@ -109,6 +117,7 @@ class ScanService:
                     progress_callback=self._on_progress,
                     should_stop=self._controller.should_stop,
                     error_callback=self._on_backend_error,
+                    report_overwrite=not config.protect_existing_report,
                 )
             else:
                 exit_code = self._cli_runner(build_cli_arguments(config))
@@ -295,17 +304,36 @@ def _run_current_cli(
     progress_callback=None,
     should_stop=None,
     error_callback=None,
+    report_overwrite=True,
 ) -> int:
     # Delayed import keeps the application contract independent at import time
     # and makes the temporary CLI adapter easy to remove in the next migration.
     from bfrs.cli import main
 
-    return main(
-        arguments,
-        _scan_progress=progress_callback,
-        _scan_should_stop=should_stop,
-        _scan_error=error_callback,
-    )
+    import contextlib
+    import sys
+    from bfrs.application.scan_diagnostics import DiagnosticStderr
+    diagnostics = DiagnosticStderr(sys.stderr, error_callback)
+    def report_error(message):
+        # stderr sees print() before the engine's explicit callback. Deduplicate
+        # it, while retaining callbacks for future diagnostic prefixes too.
+        if diagnostics.last_error != message:
+            diagnostics.last_error = message
+            if error_callback:
+                error_callback(message)
+    try:
+        with contextlib.redirect_stderr(diagnostics):
+            try:
+                return main(arguments, _scan_progress=progress_callback,
+                    _scan_should_stop=should_stop, _scan_error=report_error,
+                    _report_overwrite=report_overwrite)
+            except SystemExit as error:
+                diagnostics.finish()
+                if error_callback and not diagnostics.last_error:
+                    error_callback(f"CLI argument validation exited with code {error.code}")
+                return error.code if isinstance(error.code, int) else 2
+    finally:
+        diagnostics.finish()
 
 
 def _read_completion_metadata(
