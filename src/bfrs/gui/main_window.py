@@ -43,6 +43,7 @@ from bfrs.gui.i18n import (
     translate,
 )
 from bfrs.gui.result_browser import ResultBrowserWidget
+from bfrs.gui.inventory_panel import InventoryPanel
 from bfrs.gui.scan_worker import ScanWorker
 from bfrs.gui.settings import GuiPreferences, GuiSettingsStore
 from bfrs.gui.scan_jobs import ScanJobStore
@@ -110,6 +111,9 @@ class MainWindow(QMainWindow):
         )
         self.tabs.addTab(self.scan_tab, "")
         self.tabs.addTab(self.result_browser, "")
+        self.inventory_panel = InventoryPanel(language=self._language)
+        self.tabs.addTab(self.inventory_panel, "")
+        self.inventory_panel.idle.connect(self._inventory_idle)
 
         self.source_box = QGroupBox()
         source_layout = QGridLayout(self.source_box)
@@ -470,6 +474,8 @@ class MainWindow(QMainWindow):
         self.language_label.setText(self._t("language"))
         self.tabs.setTabText(0, self._t("tab_scan"))
         self.tabs.setTabText(1, self._t("tab_results"))
+        self.tabs.setTabText(2, "Zaszyfrowane pliki i foldery" if self._language == "pl" else "Encrypted files and folders")
+        self.inventory_panel.set_language(self._language)
         self.result_browser.set_language(self._language)
         self.source_box.setTitle(self._t("source_report_group"))
         self.source_edit.setPlaceholderText(self._t("source_placeholder"))
@@ -760,8 +766,9 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, self._t("scan_error_title"), self._last_failure_message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._thread is not None:
+        if self._thread is not None or self.inventory_panel.busy:
             self._closing_requested = True
+            self.inventory_panel.request_stop()
             self._request_stop()
             event.ignore()
             return
@@ -780,5 +787,10 @@ class MainWindow(QMainWindow):
         self._controller = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        if self._closing_requested:
+        if self._closing_requested and not self.inventory_panel.busy:
+            self.close()
+
+    @Slot()
+    def _inventory_idle(self):
+        if self._closing_requested and self._thread is None and not self.inventory_panel.busy:
             self.close()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path, PureWindowsPath
 import sys
@@ -90,10 +91,12 @@ class _Task(QThread):
 
 
 class InventoryBrowser(QWidget):
+    idle = Signal()
     def __init__(self, database=None):
         super().__init__()
         self.setWindowTitle('BFRS — przegląd dokumentów i archiwów')
         self.resize(1180, 740)
+        self.language = "pl"
         self.database = None
         self.page = None
         self.source_override = None
@@ -137,7 +140,7 @@ class InventoryBrowser(QWidget):
 
         self.summary_label = QLabel('')
         layout.addWidget(self.summary_label)
-        note = QLabel('Znacznik szyfrowania nie oznacza, że plik wymaga hasła przy otwieraniu. '
+        self.note = note = QLabel('Znacznik szyfrowania nie oznacza, że plik wymaga hasła przy otwieraniu. '
                       'Widok korzysta z zapisanych wyników ostatniego przebiegu; '
                       'przerwane przebiegi mogą zawierać tylko część źródła.')
         note.setWordWrap(True)
@@ -192,9 +195,46 @@ class InventoryBrowser(QWidget):
         self.copy_button.clicked.connect(self.copy_selected)
         self.previous_button.clicked.connect(lambda: self.load_page(self.page.offset-PAGE_SIZE))
         self.next_button.clicked.connect(lambda: self.load_page(self.page.offset+PAGE_SIZE))
+        self.set_language("pl")
         self._enable_controls()
         if database:
             self.open_report(database)
+
+    def _full_path(self, row):
+        try:
+            return str(source_path(self._source(), row['path'], directory=row.get('entry_kind') == 'directory'))
+        except ValueError:
+            return row['path']
+
+    def _reason(self, row):
+        return describe_reason(row) if self.language == 'pl' else str(
+            row.get('reason') or row.get('structure') or row['encryption'])
+
+    def set_language(self, language):
+        self.language = language
+        pl = language == 'pl'
+        self.labels = LABELS if pl else {'ENCRYPTED': 'Encryption indicator', 'UNKNOWN': 'Unknown',
+                                       'NO_ENCRYPTION_INDICATOR': 'No encryption indicator'}
+        for index, label in enumerate(self.labels.values()):
+            self.state_combo.setItemText(index,label)
+        self.state_combo.setItemText(3,'Wszystkie wyniki' if pl else 'All results')
+        for name, polish, english in (
+            ('open_button','Otwórz raport…','Open report…'), ('refresh_button','Odśwież','Refresh'),
+            ('root_button','Wskaż folder źródłowy…','Choose source folder…'),
+            ('reset_root_button','Przywróć ścieżkę raportu','Use report source path'),
+            ('search_button','Szukaj','Search'), ('copy_button','Kopiuj ścieżkę','Copy path'),
+            ('reveal_button','Pokaż w Eksploratorze','Reveal location'),
+            ('previous_button','Poprzednia','Previous'), ('next_button','Następna','Next')):
+            getattr(self,name).setText(polish if pl else english)
+        self.search_edit.setPlaceholderText('Szukaj w nazwie lub ścieżce…' if pl else 'Search name or path…')
+        self.table.setHorizontalHeaderLabels(['Nazwa','Format / typ','Rozmiar','Wynik','Powód','Pełna lokalizacja']
+            if pl else ['Name','Format / type','Size','Status','Reason','Full location'])
+        self.note.setText('Ocena ograniczonych metadanych. Przerwany przebieg może zawierać tylko część źródła. '
+            'Atrybut EFS folderu nie dowodzi szyfrowania wszystkich plików.' if pl else
+            'Bounded metadata assessment. An interrupted run may cover only part of the source. '
+            'An EFS directory attribute does not prove that all contained files are encrypted.')
+        if self.page is not None:
+            self._display_page(self.page)
 
     def _choose_report(self):
         name, _ = QFileDialog.getOpenFileName(self, 'Otwórz raport inwentaryzacji', '',
@@ -236,6 +276,7 @@ class InventoryBrowser(QWidget):
         self.worker.deleteLater()
         self.worker = None
         self._enable_controls()
+        self.idle.emit()
 
     def _error(self, text):
         self.message.setText('Nie udało się wykonać operacji: ' + text +
@@ -244,7 +285,7 @@ class InventoryBrowser(QWidget):
     def _display_page(self, page):
         self.page = page
         self.summary_label.setText('   |   '.join(f'{label}: {page.counts.get(state, 0)}'
-                                                 for state, label in LABELS.items()))
+                                                 for state, label in self.labels.items()))
         self._update_root_label()
         self.table.setRowCount(len(page.rows))
         for index, row in enumerate(page.rows):
@@ -253,7 +294,7 @@ class InventoryBrowser(QWidget):
             kind = ('Folder EFS' if row.get('entry_kind') == 'directory' else 'Plik EFS') if row.get('format') == 'WINDOWS_EFS' else row.get('format') or 'Nieznany'
             values = (path.name or '(folder źródłowy)', kind,
                       f'{size:,} B'.replace(',', ' ') if isinstance(size, int) else '—',
-                      LABELS[row['encryption']], describe_reason(row), str(path.parent))
+                      self.labels[row['encryption']], self._reason(row), self._full_path(row))
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 item.setToolTip(str(value))
@@ -271,8 +312,8 @@ class InventoryBrowser(QWidget):
         row = self._selected()
         self.details.setPlainText(
             f"Ścieżka w źródle: {row['path']}\n"
-            f"Wynik: {LABELS[row['encryption']]}\n"
-            f"Powód: {describe_reason(row)}\n"
+            f"Wynik: {self.labels[row['encryption']]}\n"
+            f"Powód: {self._reason(row)}\n"
             f"Kod analizy: {row.get('reason') or row.get('structure') or '—'}\n\n"
             'To zapis oceny metadanych. Nie potwierdza poprawności całego pliku '
             'ani konieczności podania hasła przy otwieraniu.' if row else '')
@@ -295,6 +336,9 @@ class InventoryBrowser(QWidget):
                     'każdy plik jest sprawdzany osobno.')
             if row.get('scan_error'):
                 self.details.appendPlainText('Niepełne przeglądanie folderu: ' + row['scan_error'])
+        if row:
+            self.details.appendPlainText('\n' + self._full_path(row) + '\n'
+                                         + json.dumps(row, ensure_ascii=False, indent=2))
         self._enable_controls()
 
     def _enable_controls(self):

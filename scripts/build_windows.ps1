@@ -37,7 +37,7 @@ try {
     Write-Host "Artifact arch:   $artifactArch"
 
     Write-Host "Installing build dependencies..."
-    & $PythonExe -m pip install -e ".[dev,gui,package]"
+    & $PythonExe -m pip install -e ".[dev,gui,package,inventory]"
     if ($LASTEXITCODE -ne 0) {
         throw "pip install failed."
     }
@@ -104,6 +104,12 @@ try {
     & $PythonExe "scripts\pe_machine.py" $exe --expect $expectedPe
     if ($LASTEXITCODE -ne 0) {
         throw "PE architecture verification failed."
+    }
+
+    Write-Host "Verifying frozen inventory GUI (without source imports)..."
+    & $PythonExe "scripts\verify_frozen_inventory.py" --exe $exe
+    if ($LASTEXITCODE -ne 0) {
+        throw "Frozen inventory verification failed; packaging aborted."
     }
 
     $pyVersion = (& $PythonExe -c "import platform; print(platform.python_version())").Trim()

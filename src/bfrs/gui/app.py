@@ -13,6 +13,9 @@ def _prepare_multiprocessing() -> None:
 
 def main() -> int:
     _prepare_multiprocessing()
+    if len(sys.argv) == 3 and sys.argv[1] == '--inventory-smoke-test':
+        from bfrs.gui.inventory_smoke import run_smoke
+        return run_smoke(sys.argv[2])
     try:
         from PySide6.QtCore import Qt
         from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap

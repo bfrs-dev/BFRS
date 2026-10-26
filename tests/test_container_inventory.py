@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import sqlite3
 from pathlib import Path
@@ -10,10 +9,7 @@ import pytest
 
 from bfrs.recovery import container_inventory as module
 
-script = Path(__file__).resolve().parents[1] / 'scripts/inventory_documents.py'
-spec = importlib.util.spec_from_file_location('inventory_documents', script)
-runner = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(runner)
+from bfrs.application import document_inventory as runner
 
 
 def zip_fixture(path, office=False, encrypted=False):
