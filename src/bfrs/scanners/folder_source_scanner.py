@@ -335,12 +335,14 @@ def _scan_batch(
     should_stop=None,
 ) -> list[_ScanOutcome]:
     outcomes = []
+    prepared_scan = getattr(child_main, "scan_file", None)
     for index, source, size, mtime_ns in batch:
         if should_stop is not None and should_stop():
             raise FolderScanStopped
         child_report_path = temporary_root / f"report-{index:09d}.json"
         try:
-            result = child_main(_child_arguments(arguments, source, child_report_path))
+            result = (prepared_scan(source, child_report_path) if prepared_scan is not None
+                      else child_main(_child_arguments(arguments, source, child_report_path)))
             if isinstance(result, dict):
                 child_report = result
             else:

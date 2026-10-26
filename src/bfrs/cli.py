@@ -525,6 +525,34 @@ def main(
     arguments = parser.parse_args(argv)
     _validate_arguments(parser, arguments)
     _validate_path_collisions(parser, arguments)
+    return _run_scan(
+        arguments, parser, _folder_child=_folder_child,
+        _scan_progress=_scan_progress, _scan_should_stop=_scan_should_stop,
+        _scan_error=_scan_error, _selection_override=_selection_override,
+        _report_sink=_report_sink, _seed_pipeline=_seed_pipeline,
+        _seed_workers=_seed_workers,
+    )
+
+
+def _run_scan(
+    arguments,
+    parser: argparse.ArgumentParser,
+    *,
+    _folder_child: bool = False,
+    _scan_progress: Callable[[ScanProgress], None] | None = None,
+    _scan_should_stop: Callable[[], bool] | None = None,
+    _scan_error: Callable[[str], None] | None = None,
+    _selection_override=None,
+    _report_sink: Callable[[dict], None] | None = None,
+    _seed_pipeline: MnemonicRecoveryPipeline | None = None,
+    _seed_workers: int | None = None,
+) -> int:
+    """Shared engine for CLI-validated requests and prepared folder children.
+
+    Folder children have no output/checkpoint/recovery writes: their destination
+    is an in-memory sink and the parent validates all write destinations. Keep
+    source checks, detection, validation, stop handling and serialization here.
+    """
     if _stop_requested(_scan_should_stop):
         return 130
     try:
