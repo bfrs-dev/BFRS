@@ -147,8 +147,12 @@ byte count and ETA is based on newly processed bytes. Format 3 checkpoints did
 not retain complete state for noisy units and are rejected with an explicit
 legacy-replay message instead of being presented as true resume.
 
-Folder scans support SQLite checkpoints with durable outcomes for each completed
-file. Keep the checkpoint and report outside the source folder. Resume requires
+Folder scans support SQLite checkpoints with durable per-file outcomes. Outcomes
+are committed in batches of up to 32 with a one-second flush deadline and
+`synchronous=FULL`. Controlled stop flushes pending results; abrupt process exit
+can replay the uncommitted batch. The schema remains version 1. See
+[folder checkpoint batching](docs/folder_checkpoint_batching.md) for measurements
+and durability details. Keep the checkpoint and report outside the source folder. Resume requires
 the same discovered file paths, sizes, modification times, and detection
 settings; completed files are skipped. `--workers` and `--file-workers` may be
 changed when resuming, including checkpoints created by earlier GUI builds.

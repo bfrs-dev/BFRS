@@ -36,6 +36,8 @@ from bfrs.version import APP_NAME, VERSION
 _BATCH_FILE_LIMIT = 32
 _BATCH_BYTE_LIMIT = 8 * 1024 * 1024
 _QUEUE_MULTIPLIER = 2
+# Runtime write policy; never part of scanner semantics or checkpoint schema.
+_CHECKPOINT_BATCH_SIZE = 32
 
 
 class FolderWorkerError(RuntimeError):
@@ -66,11 +68,13 @@ class _FolderProgress:
         files: int,
         total_bytes: int,
         progress_callback: Callable[[ScanProgress], None] | None = None,
+        checkpoint: FolderScanCheckpoint | None = None,
     ) -> None:
         self._root = root
         self._files = files
         self._total_bytes = total_bytes
         self._progress_callback = progress_callback
+        self._checkpoint = checkpoint
         self._started = time.monotonic()
         self._last_rendered = 0.0
         self._completed = 0
@@ -81,6 +85,15 @@ class _FolderProgress:
         self._validated = 0
         self._rendered = False
         self._lock = threading.Lock()
+
+    def _checkpoint_progress(self) -> dict:
+        if self._checkpoint is None:
+            return {"scanned_files": self._completed}
+        state = self._checkpoint.durability
+        return {"scanned_files": self._completed,
+                "checkpoint_durable_files": state["durable_files"],
+                "checkpoint_pending_files": state["pending_files"],
+                "checkpoint_durable_bytes": state["durable_bytes"]}
 
     def restore(self, outcomes: Sequence[_ScanOutcome]) -> None:
         for outcome in outcomes:
@@ -113,6 +126,7 @@ class _FolderProgress:
                 raw_hits=self._raw_hits,
                 stage="folder-scan",
                 complete=(self._completed >= self._files),
+                **self._checkpoint_progress(),
             ))
         print(
             "Folder scan: "
@@ -124,7 +138,7 @@ class _FolderProgress:
             file=sys.stderr,
         )
 
-    def update(self, outcome: _ScanOutcome) -> None:
+    def update(self, outcome: _ScanOutcome, *, persist=None) -> None:
         with self._lock:
             self._completed += 1
             self._completed_bytes += outcome.size
@@ -139,14 +153,21 @@ class _FolderProgress:
                         if isinstance(item, dict)
                     )
             complete = self._completed >= self._files
-            if self._progress_callback is not None:
-                self._progress_callback(ScanProgress(
-                    scanned_bytes=self._completed_bytes,
-                    total_bytes=self._total_bytes,
-                    raw_hits=self._raw_hits,
-                    stage="folder-scan",
-                    complete=complete,
-                ))
+            # Count, accept the outcome, then publish one consistent snapshot.
+            # Other workers cannot commit rows ahead of the scanned-file count.
+            try:
+                if persist is not None:
+                    persist(outcome)
+            finally:
+                if self._progress_callback is not None:
+                    self._progress_callback(ScanProgress(
+                        scanned_bytes=self._completed_bytes,
+                        total_bytes=self._total_bytes,
+                        raw_hits=self._raw_hits,
+                        stage="folder-scan",
+                        complete=complete,
+                        **self._checkpoint_progress(),
+                    ))
             now = time.monotonic()
             if not complete and now - self._last_rendered < 0.5:
                 return
@@ -169,6 +190,8 @@ class _FolderProgress:
                 f"({byte_percent:.1f}%) files/s={new_files / elapsed:.1f} "
                 f"MiB/s={new_bytes / 2**20 / elapsed:.1f} "
                 f"raw_hits={self._raw_hits} validated={self._validated} "
+                + (f"checkpoint_durable_files={self._checkpoint.durability['durable_files']} "
+                   if self._checkpoint is not None else "") +
                 f"current={current}",
                 end="\n" if complete else "",
                 file=sys.stderr,
@@ -178,6 +201,11 @@ class _FolderProgress:
 
     def finish(self) -> None:
         with self._lock:
+            if self._progress_callback is not None and self._checkpoint is not None:
+                self._progress_callback(ScanProgress(
+                    scanned_bytes=self._completed_bytes, total_bytes=self._total_bytes,
+                    raw_hits=self._raw_hits, stage="folder-scan",
+                    complete=self._completed >= self._files, **self._checkpoint_progress()))
             if self._rendered:
                 print(file=sys.stderr)
                 self._rendered = False
@@ -304,9 +332,12 @@ def _scan_batch(
     arguments,
     child_main: Callable[[Sequence[str] | None], int | dict],
     progress: Callable[[_ScanOutcome], None],
+    should_stop=None,
 ) -> list[_ScanOutcome]:
     outcomes = []
     for index, source, size, mtime_ns in batch:
+        if should_stop is not None and should_stop():
+            raise FolderScanStopped
         child_report_path = temporary_root / f"report-{index:09d}.json"
         try:
             result = child_main(_child_arguments(arguments, source, child_report_path))
@@ -349,10 +380,16 @@ def _scan_files_bounded(
     workers = arguments.file_workers
     batches = iter(_file_batches(files, workers, index_map=index_map))
     outcomes = outcome_store if outcome_store is not None else []
+    stop = threading.Event()
+    requested = getattr(arguments, "_scan_should_stop", None)
+
+    def should_stop():
+        return stop.is_set() or bool(requested and requested())
+
     if workers == 1:
         for batch in batches:
             outcomes.extend(_scan_batch(
-                batch, temporary_root, arguments, child_main, progress))
+                batch, temporary_root, arguments, child_main, progress, should_stop))
         return outcomes
     pending: dict[Future[list[_ScanOutcome]], tuple[tuple[int, Path, int, int], ...]] = {}
     executor = ThreadPoolExecutor(
@@ -364,7 +401,7 @@ def _scan_files_bounded(
         except StopIteration:
             return False
         future = executor.submit(
-            _scan_batch, batch, temporary_root, arguments, child_main, progress)
+            _scan_batch, batch, temporary_root, arguments, child_main, progress, should_stop)
         pending[future] = batch
         return True
 
@@ -378,7 +415,8 @@ def _scan_files_bounded(
                 batch = pending.pop(future)
                 try:
                     outcomes.extend(future.result())
-                except FolderScanStopped:
+                except (FolderScanStopped, FolderCheckpointError, KeyboardInterrupt):
+                    stop.set()
                     for item in pending:
                         item.cancel()
                     raise
@@ -391,6 +429,7 @@ def _scan_files_bounded(
                         f"{type(error).__name__}: {error}") from error
                 submit_next()
     finally:
+        stop.set()
         executor.shutdown(wait=True, cancel_futures=True)
     return outcomes
 
@@ -513,9 +552,11 @@ def _scan_folder_source(
             }
             completed_paths: set[str] = set()
             restore_total = checkpoint.record_count()
+            durable_bytes = checkpoint.durability["durable_bytes"]
             if progress_callback is not None:
                 progress_callback(ScanProgress(scanned_bytes=0, total_bytes=restore_total,
-                    raw_hits=0, stage="folder-checkpoint-restore", complete=False))
+                    raw_hits=0, stage="folder-checkpoint-restore", complete=False,
+                    checkpoint_durable_bytes=durable_bytes))
             for record in checkpoint.records():
                 should_stop = getattr(arguments, "_scan_should_stop", None)
                 if should_stop is not None and should_stop():
@@ -543,7 +584,12 @@ def _scan_folder_source(
                 if progress_callback is not None and len(resumed_outcomes) % 128 == 0:
                     progress_callback(ScanProgress(
                         scanned_bytes=len(resumed_outcomes), total_bytes=restore_total,
-                        raw_hits=0, stage="folder-checkpoint-restore", complete=False))
+                        raw_hits=0, stage="folder-checkpoint-restore", complete=False,
+                        checkpoint_durable_bytes=durable_bytes))
+            should_stop = getattr(arguments, "_scan_should_stop", None)
+            if should_stop is not None and should_stop():
+                print("folder scan stopped by request", file=sys.stderr)
+                return 130
             remaining_files = [
                 item for item in files
                 if item[0].relative_to(root).as_posix() not in completed_paths
@@ -559,12 +605,15 @@ def _scan_folder_source(
         return 3
 
     resumed_file_count = len(resumed_outcomes)
+    if checkpoint is not None:
+        checkpoint.set_batching(_CHECKPOINT_BATCH_SIZE, 1.0)
     started = time.monotonic()
     progress = _FolderProgress(
         root,
         files=len(files),
         total_bytes=bytes_discovered,
         progress_callback=progress_callback,
+        checkpoint=checkpoint,
     )
     progress.restore(resumed_outcomes)
     progress.initial(len(discovery_skips))
@@ -576,10 +625,12 @@ def _scan_folder_source(
             "recovered_wallets": 0, "failed_wallets": 0, "outputs": [],
         }
 
-    def on_outcome(outcome: _ScanOutcome) -> None:
-        progress.update(outcome)
+    def persist_outcome(outcome: _ScanOutcome) -> None:
         if checkpoint is not None:
             _checkpoint_outcome(checkpoint, root, outcome)
+
+    def on_outcome(outcome: _ScanOutcome) -> None:
+        progress.update(outcome, persist=persist_outcome)
 
     try:
         with tempfile.TemporaryDirectory(prefix="bfrs-folder-scan-") as temporary:
@@ -594,10 +645,12 @@ def _scan_folder_source(
             )
         outcomes = resumed_outcomes
         outcomes.extend(scanned_outcomes)
-    except FolderScanStopped:
-        progress.finish()
+        if checkpoint is not None:
+            checkpoint.flush()
+    except (FolderScanStopped, KeyboardInterrupt):
         if checkpoint is not None:
             checkpoint.close()
+        progress.finish()
         print("folder scan stopped by request", file=sys.stderr)
         return 130
     except (FolderWorkerError, FolderCheckpointError) as error:
@@ -783,6 +836,12 @@ def scan_folder_source(arguments, child_main, *, progress_callback=None) -> int:
         with ExitStack() as resources:
             return _scan_folder_source(arguments, child_main,
                                        progress_callback=progress_callback, resources=resources)
+    except FolderCheckpointError as error:
+        print(f"folder checkpoint error: {error}", file=sys.stderr)
+        return 3
+    except KeyboardInterrupt:
+        print("folder scan interrupted by user", file=sys.stderr)
+        return 130
     except (OSError, sqlite3.Error) as error:
         print(f"folder temporary storage error: {error}", file=sys.stderr)
         return 4

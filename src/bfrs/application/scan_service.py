@@ -86,10 +86,12 @@ class ScanService:
         self._cli_runner = cli_runner or _run_current_cli
         self._controller = controller or ScanController()
         self._last_progress_bytes = 0
+        self._last_checkpoint_durable_bytes = None
         self._last_error_message: str | None = None
 
     def run(self, config: ScanConfig) -> ScanRunResult:
         self._last_progress_bytes = 0
+        self._last_checkpoint_durable_bytes = None
         self._last_error_message = None
         source_type = self._resolve_source_type(config)
         self._emit(ScanStartedEvent(
@@ -130,7 +132,9 @@ class ScanService:
             if checkpoint_path is not None and checkpoint_path.exists():
                 self._emit(ScanCheckpointSavedEvent(
                     checkpoint_path=checkpoint_path,
-                    completed_bytes=self._last_progress_bytes,
+                    completed_bytes=(self._last_checkpoint_durable_bytes
+                        if self._last_checkpoint_durable_bytes is not None
+                        else self._last_progress_bytes),
                 ))
             self._emit(ScanStoppedEvent(
                 processed_bytes=self._last_progress_bytes,
@@ -190,15 +194,24 @@ class ScanService:
         self._last_error_message = message
 
     def _on_progress(self, update) -> None:
-        self._last_progress_bytes = max(
-            self._last_progress_bytes, update.scanned_bytes
-        )
+        durable_bytes = getattr(update, "checkpoint_durable_bytes", None)
+        if durable_bytes is not None:
+            self._last_checkpoint_durable_bytes = durable_bytes
+        # Discovery, restore and report progress use records rather than bytes.
+        if update.stage not in {"folder-discovery", "folder-checkpoint-restore", "folder-report"}:
+            self._last_progress_bytes = max(
+                self._last_progress_bytes, update.scanned_bytes
+            )
         self._emit(ScanProgressEvent(
             scanned_bytes=update.scanned_bytes,
             total_bytes=update.total_bytes,
             raw_hits=update.raw_hits,
             anchors_total=update.anchors_total,
             stage=update.stage,
+            scanned_files=getattr(update, "scanned_files", None),
+            checkpoint_durable_files=getattr(update, "checkpoint_durable_files", None),
+            checkpoint_pending_files=getattr(update, "checkpoint_pending_files", None),
+            checkpoint_durable_bytes=durable_bytes,
             complete=update.complete,
             raw_by_target=freeze_counts(update.raw_by_target),
             rejected_by_target=freeze_counts(update.rejected_by_target),

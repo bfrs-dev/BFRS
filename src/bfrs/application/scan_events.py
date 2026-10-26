@@ -56,9 +56,20 @@ class ScanProgressEvent:
     validated_occurrences_by_target: TargetCounts = field(default_factory=tuple)
     validated_unique_by_target: TargetCounts = field(default_factory=tuple)
 
+    # Folder counters distinguish completed scans from FULL-committed results.
+    scanned_files: int | None = None
+    checkpoint_durable_files: int | None = None
+    checkpoint_pending_files: int | None = None
+    checkpoint_durable_bytes: int | None = None
+
     def __post_init__(self) -> None:
         for name in ("scanned_bytes", "total_bytes", "raw_hits", "anchors_total"):
             if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be nonnegative")
+        for name in ("scanned_files", "checkpoint_durable_files", "checkpoint_pending_files",
+                     "checkpoint_durable_bytes"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
                 raise ValueError(f"{name} must be nonnegative")
         for counts in (
             self.raw_by_target,

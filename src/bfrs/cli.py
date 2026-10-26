@@ -549,6 +549,8 @@ def main(
                 )
         from bfrs.scanners.folder_source_scanner import scan_folder_source
         from bfrs.application.folder_file_scanner import FolderFileScanner
+        # Folder discovery/restore and scheduling also need cooperative stop.
+        arguments._scan_should_stop = _scan_should_stop
         return scan_folder_source(
             arguments,
             FolderFileScanner(

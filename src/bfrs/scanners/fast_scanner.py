@@ -25,6 +25,11 @@ class ScanProgress:
     anchors_total: int = 0
     stage: str | None = None
     complete: bool = False
+    # Folder counters distinguish completed scans from FULL-committed results.
+    scanned_files: int | None = None
+    checkpoint_durable_files: int | None = None
+    checkpoint_pending_files: int | None = None
+    checkpoint_durable_bytes: int | None = None
 
     @property
     def percent_complete(self) -> float:

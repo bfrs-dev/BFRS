@@ -579,6 +579,10 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(self._t(stage))
                 stage = self._t(stage)
                 units = self._t("progress_records", done=event.scanned_bytes, total=event.total_bytes)
+            if event.checkpoint_durable_files is not None:
+                units += " | " + self._t("folder_checkpoint_counts",
+                    scanned=event.scanned_files, durable=event.checkpoint_durable_files,
+                    pending=event.checkpoint_pending_files)
             self.detail_label.setText(
                 f"{event.percent_complete:.1f}% | "
                 f"{units} | "
