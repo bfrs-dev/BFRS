@@ -86,6 +86,20 @@ version-1 inventory checkpoints are supported; JSONL alone is not a viewer input
   See `structure` and `reason`; do not interpret UNKNOWN as unencrypted.
 
 ZIP central directory entries provide encryption flags and up to 50 filenames.
+All inspected ZIP names are now checked for case-insensitive `wallet`, `electrum`,
+`bitcoin`, `portfel` and generic `backup` clues, including names beyond that
+50-name display limit. At most 50 clue records are retained, with wallet-related
+clues taking precedence over generic backups. Counts cover all checked names;
+offsets in these folder-inventory reports are relative to the file. Clues do not
+change encryption status and do not establish wallet contents or ownership.
+The viewer adds a name-clue column, a **Nazwy sugerujące portfel lub kopię**
+filter (including unencrypted candidates), and details of matched names.
+Partial inspections are explicitly marked by `zip_name_hints_complete=false`.
+The ZIP inspection revision refreshes earlier cached ZIP/OOXML results once.
+
+To search raw image bytes rather than a folder of recovered files, use the
+separate [raw ZIP inventory command](raw_zip_inventory.md). Its checkpoint and
+reports are separate from this folder inventory and viewer.
 If the end-of-central-directory record is missing, a bounded, positive-only
 fallback can also report a traditional password flag in a surviving local ZIP
 header; see **Damaged classic ZIPs** below.
