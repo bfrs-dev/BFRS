@@ -9,12 +9,13 @@ from bfrs.recovery.pdf_inventory import PDFMetadataLimit, inspect_pdf
 from bfrs.recovery.seven_zip_inventory import SevenZipLimit, inspect_7z
 from bfrs.recovery.ole_type_hints import ole_type_hint
 from bfrs.recovery.ppt_inventory import PPTMetadataLimit, inspect_ppt
+from bfrs.recovery.archive_name_hints import NameHints
 
 VERSION = 1
 # Bump when unknown-OLE inspection changes, so cached metadata is refreshed.
 OLE_INVENTORY_REVISION = 1
 # Refresh cached ZIP/OOXML classifications after changing directory semantics.
-ZIP_INVENTORY_REVISION = 2
+ZIP_INVENTORY_REVISION = 3
 MAX_READ_BYTES = 2 * 1024 * 1024
 MAX_READ_CALLS = 4096
 MAX_MEMBERS = 4096
@@ -113,6 +114,7 @@ def _zip_local_password_marker(reader, result):
     password flag. Payloads (including encryption headers) are not validated.
     """
     offset = 0
+    hints = NameHints()
     for index in range(MAX_MEMBERS):
         header = reader.at(offset, 30)
         if header[:4] != b'PK\x03\x04':
@@ -139,6 +141,9 @@ def _zip_local_password_marker(reader, result):
             if kind == 1:
                 raise InventoryLimit('ZIP64_UNSUPPORTED')
         result['zip_local_headers_checked'] = index + 1
+        decoded_name = name.decode('utf-8' if flags & 2048 else 'cp437', 'replace')
+        hints.add(decoded_name, header_offset=offset, member_index=index, encrypted=bool(flags & 1))
+        result.update(hints.report())
         if flags & 1:
             if not flags & 8 and packed < 12:
                 raise ValueError('ZIP_INVALID_LOCAL_ENCRYPTED_SIZE')
@@ -146,7 +151,7 @@ def _zip_local_password_marker(reader, result):
                           reason='ZIP_LOCAL_PASSWORD_FLAG',
                           zip_directory_error='ZIP_END_DIRECTORY_MISSING',
                           zip_local_header_offset=offset,
-                          zip_local_member_name=name.decode('utf-8' if flags & 2048 else 'cp437', 'replace')[:512],
+                          zip_local_member_name=decoded_name[:512],
                           zip_local_flags=flags)
             return
         if flags & 8:
@@ -204,7 +209,9 @@ def _zip_directory(reader, result):
     encrypted = 0
     names = []
     markers = set()
+    hints = NameHints()
     for index in range(count):
+        header_offset = offset + central.position
         if central.position + 46 > size:
             raise ValueError('ZIP_BAD_DIRECTORY_ENTRY')
         header = central.read(46)
@@ -223,6 +230,9 @@ def _zip_directory(reader, result):
             raise ValueError('ZIP_TRUNCATED_DIRECTORY_ENTRY')
         encrypted += bool(flags & 0x2041 or method == 99)
         name = central.read(name_size).decode('utf-8' if flags & 2048 else 'cp437', 'replace')
+        hints.add(name, header_offset=header_offset, member_index=index,
+                  encrypted=bool(flags & 0x2041 or method == 99))
+        result.update(hints.report())
         if len(names) < MAX_NAMES:
             names.append(name[:512])
         if name in {'[Content_Types].xml', 'word/document.xml', 'xl/workbook.xml', 'ppt/presentation.xml'}:
@@ -239,6 +249,7 @@ def _zip_directory(reader, result):
     result.update(encryption='ENCRYPTED' if encrypted else 'NO_ENCRYPTION_INDICATOR',
                   structure='HEADERS_CHECKED', member_count=count, encrypted_members=encrypted,
                   member_names=names, names_truncated=count > len(names))
+    result.update(hints.report(complete=True))
 
 
 def _vint(data, pos):

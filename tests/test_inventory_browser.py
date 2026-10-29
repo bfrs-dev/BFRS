@@ -41,6 +41,29 @@ def test_browser_shows_partial_zip_marker_and_recovery_limit(tmp_path):
     window.close()
 
 
+def test_name_hint_filter_includes_unencrypted_zip_and_displays_clues(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    database = tmp_path / 'inventory.sqlite'
+    make_report(database, tmp_path / 'source', [('example.bin', 'NO_ENCRYPTION_INDICATOR', 2)])
+    row = dict(path='example.bin', format='ZIP', encryption='NO_ENCRYPTION_INDICATOR', size=100,
+               zip_wallet_name_hint_count=1, zip_name_hint_count=1,
+               zip_name_hints=[dict(name='hidden/wallet.dat', terms=['wallet'])],
+               zip_name_hints_complete=True)
+    with sqlite3.connect(database) as db:
+        db.execute('UPDATE files SET result=?', (json.dumps(row),))
+    window = module.InventoryBrowser(database)
+    finish(app, window)
+    assert window.table.rowCount() == 0
+    window.state_combo.setCurrentIndex(window.state_combo.findData('NAME_HINT'))
+    finish(app, window)
+    assert window.table.rowCount() == 1
+    assert 'portfelem' in window.table.item(0, 6).text()
+    window.table.selectRow(0)
+    assert 'hidden/wallet.dat' in window.details.toPlainText()
+    assert 'nie potwierdzają portfela' in window.details.toPlainText()
+    window.close()
+
+
 def test_browser_ole_hint_from_old_report_preserves_unknown(tmp_path):
     app = QApplication.instance() or QApplication([])
     database = tmp_path/'inventory.sqlite'

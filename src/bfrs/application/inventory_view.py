@@ -27,7 +27,7 @@ class InventoryPage:
 
 def read_inventory_page(database, state='ENCRYPTED', search='', offset=0):
     """Touch only SQLite; no source-file stats, reads or writes during browsing."""
-    if state is not None and state not in STATES:
+    if state is not None and state not in (*STATES, 'NAME_HINT'):
         raise ValueError('Nieznany filtr wyników.')
     if offset < 0 or offset % PAGE_SIZE:
         raise ValueError('Nieprawidłowa strona wyników.')
@@ -49,7 +49,9 @@ def read_inventory_page(database, state='ENCRYPTED', search='', offset=0):
             f"SELECT json_extract(result,'$.encryption'),count(*) FROM files WHERE {where} "
             "GROUP BY json_extract(result,'$.encryption')", (run_id,)))
         params = [run_id]
-        if state:
+        if state == 'NAME_HINT':
+            where += " AND coalesce(json_extract(result,'$.zip_name_hint_count'),0)>0"
+        elif state:
             where += " AND json_extract(result,'$.encryption')=?"
             params.append(state)
         if search.strip():
