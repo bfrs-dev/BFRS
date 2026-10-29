@@ -21,6 +21,26 @@ def finish(app, window):
     assert window.worker is None
 
 
+def test_browser_shows_partial_zip_marker_and_recovery_limit(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    database = tmp_path / 'inventory.sqlite'
+    make_report(database, tmp_path / 'source', [('recovered.bin', 'ENCRYPTED', 2)])
+    row = dict(path='recovered.bin', format='ZIP', encryption='ENCRYPTED', size=100,
+               reason='ZIP_LOCAL_PASSWORD_FLAG', structure='PARTIAL_LOCAL_HEADER_ONLY',
+               zip_local_member_name='example.txt', zip_local_header_offset=1234)
+    with sqlite3.connect(database) as db:
+        db.execute('UPDATE files SET result=?', (json.dumps(row),))
+    window = module.InventoryBrowser(database)
+    finish(app, window)
+    assert window.table.rowCount() == 1
+    window.table.selectRow(0)
+    details = window.details.toPlainText()
+    assert 'Brakuje końcowego spisu' in details
+    assert 'nie potwierdzono możliwości odzyskania' in details
+    assert 'example.txt' in details and '1234' in details
+    window.close()
+
+
 def test_browser_ole_hint_from_old_report_preserves_unknown(tmp_path):
     app = QApplication.instance() or QApplication([])
     database = tmp_path/'inventory.sqlite'

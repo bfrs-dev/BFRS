@@ -25,6 +25,8 @@ LABELS = {'ENCRYPTED': 'Znacznik szyfrowania', 'UNKNOWN': 'Nieustalone',
           'NO_ENCRYPTION_INDICATOR': 'Bez znacznika szyfrowania'}
 
 REASONS = {
+    'ZIP_LOCAL_PASSWORD_FLAG': 'Znacznik hasła w zachowanym nagłówku ZIP; brak końcowego spisu plików',
+    'ZIP_AMBIGUOUS_END_DIRECTORY': 'Niejednoznaczny koniec ZIP — wynik wymaga sprawdzenia',
     'PPT_ENCRYPTED_HEADER_TOKEN': 'Znacznik szyfrowania w nagłówku PowerPoint',
     'PPT_ENCRYPTION_REFERENCE': 'Odwołanie do szyfrowania w ostatnim zapisie PowerPoint',
     'PPT_NO_ENCRYPTION_MARKER': 'Brak znacznika szyfrowania w sprawdzonych metadanych PowerPoint',
@@ -286,6 +288,12 @@ class InventoryBrowser(QWidget):
         if row and row.get('format') == 'PPT':
             self.details.appendPlainText('\nSprawdzono wybrane metadane PowerPoint. '
                 'Slajdy, historia zmian i cele odwołań do szyfrowania nie były weryfikowane.')
+        if row and row.get('structure') == 'PARTIAL_LOCAL_HEADER_ONLY':
+            self.details.appendPlainText('\nZachował się lokalny nagłówek ZIP ze znacznikiem hasła. '
+                'Brakuje końcowego spisu plików. Zawartość może być niekompletna; '
+                'nie potwierdzono możliwości odzyskania ani odszyfrowania pliku.'
+                f"\nNazwa w nagłówku: {row.get('zip_local_member_name', '—')}"
+                f"\nPozycja nagłówka w pliku (bajty): {row.get('zip_local_header_offset', '—')}")
         if row and row.get('filesystem_encryption') == 'EFS':
             self.details.appendPlainText('\nWykryto bieżący atrybut Windows EFS. '
                 'Zawartość nie była odczytywana ani odszyfrowywana.')
