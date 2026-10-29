@@ -7,7 +7,7 @@ determine whether the bytes belong to a deleted file, a live file, embedded data
 or a duplicate copy. It does not decode E01, compressed images, virtual-disk
 containers, encrypted volumes or multipart images.
 
-This is a separate inventory command. It does not run wallet/seed detectors,
+This is a separate inventory mode. It does not run wallet/seed detectors,
 change the unified scanner checkpoint, extract archive members, try passwords,
 repair ZIPs or reconstruct fragments. The source is opened read-only. Reports
 contain metadata and filenames only, never copied member payloads.
@@ -27,9 +27,49 @@ using the same source and output paths:
 py .\scripts\inventory_zip_image.py --source "E:\ExampleImage.img" --output "C:\BFRS_reports\zip-image-01" --resume
 ```
 
-No extra runtime dependency is needed. This command is not part of the existing
-Windows EXE or the main GUI. The existing document-inventory viewer reads a
-different database; do not open `zip_scan.sqlite` with that viewer.
+No extra runtime dependency is needed for the CLI. The GUI in this checkout
+also exposes this scanner; previously built Windows installers need rebuilding
+to include it. The document-inventory viewer reads a different database; open
+`zip_scan.sqlite` in the new ZIP tab instead.
+
+## Desktop GUI (Polish / English)
+
+Start the GUI from this checkout (`py -m bfrs.gui.app`, with the `gui` extra
+installed), then choose **ZIP w obrazie / ZIP in image**.
+
+1. Choose a regular raw image and a new report folder outside the source image.
+   The folder chooser appends a timestamped subfolder for a new scan; you can
+   edit its name before starting.
+2. Start the scan. The tab shows committed byte progress, average MiB/s since
+   the first progress event of this invocation, and signature candidates seen.
+   Restored checkpoint bytes are excluded from the speed calculation. During
+   report export, wait for the final saved-status message.
+3. Use **Zatrzymaj bezpiecznie / Stop safely** to stop and save partial reports.
+   Closing the main window during scanning requests a stop and keeps the window
+   open until the worker and report reader finish. Close it again afterwards.
+4. To resume, keep the same source and report folder and enable the resume
+   checkbox. Reaching the per-run signature limit also requires resuming.
+   Source/output paths are saved on start and normal window close; resume is
+   never automatically started after reopening the app.
+5. **Otwórz raport ZIP / Open ZIP report** loads an existing `zip_scan.sqlite`
+   and fills its source and output fields for resuming. Viewing requires only
+   the report, so it works with an unplugged image drive. Scanning still requires
+   the original source identity to match.
+
+The viewer reads at most 100 records per page, sorted by priority then physical
+offset. Its default filter includes wallet/backup names and password markers;
+disable the filter to include other accepted metadata. Selecting a row shows
+its complete saved metadata. The report-folder button opens the containing
+folder, not any name recovered from an image. Full byte coverage in a saved
+checkpoint alone does not prove a successful scan; consult `summary.json` for
+the final completion/error state. GUI settings and raw ZIP checkpoints remain
+separate from wallet-recovery scan settings and checkpoints.
+
+Build a new native Windows installer using the existing release script from
+this checkout: `powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1 -Installer`.
+The GUI imports the scanner directly, so PyInstaller includes it without a
+separate CLI subprocess. Native Windows x64/ARM64 builds and execution still
+require verification on Windows; Linux Qt tests are not that verification.
 
 Options:
 

@@ -43,6 +43,7 @@ from bfrs.gui.i18n import (
     translate,
 )
 from bfrs.gui.result_browser import ResultBrowserWidget
+from bfrs.gui.raw_zip_panel import RawZipPanel
 from bfrs.gui.scan_worker import ScanWorker
 from bfrs.gui.settings import GuiPreferences, GuiSettingsStore
 
@@ -103,6 +104,11 @@ class MainWindow(QMainWindow):
         )
         self.tabs.addTab(self.scan_tab, "")
         self.tabs.addTab(self.result_browser, "")
+        self.raw_zip_panel = RawZipPanel(self._language)
+        self.raw_zip_panel.source_edit.setText(preferences.raw_zip_source)
+        self.raw_zip_panel.output_edit.setText(preferences.raw_zip_output)
+        self.raw_zip_panel.paths_changed.connect(self._save_preferences)
+        self.tabs.addTab(self.raw_zip_panel, "")
 
         self.source_box = QGroupBox()
         source_layout = QGridLayout(self.source_box)
@@ -339,6 +345,8 @@ class MainWindow(QMainWindow):
             last_source=self.source_edit.text().strip(),
             last_output=self.output_edit.text().strip(),
             last_result_report=self._last_result_report,
+            raw_zip_source=self.raw_zip_panel.source_edit.text().strip(),
+            raw_zip_output=self.raw_zip_panel.output_edit.text().strip(),
             advanced_expanded=self.advanced_toggle.isChecked(),
             start_offset=self.start_offset_edit.text().strip() or "0",
             end_offset=self.end_offset_edit.text().strip(),
@@ -368,6 +376,8 @@ class MainWindow(QMainWindow):
         self.language_label.setText(self._t("language"))
         self.tabs.setTabText(0, self._t("tab_scan"))
         self.tabs.setTabText(1, self._t("tab_results"))
+        self.tabs.setTabText(2, self._t("raw_zip_tab"))
+        self.raw_zip_panel.set_language(self._language)
         self.result_browser.set_language(self._language)
         self.source_box.setTitle(self._t("source_report_group"))
         self.source_edit.setPlaceholderText(self._t("source_placeholder"))
@@ -630,6 +640,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._save_preferences()
+        if self.raw_zip_panel.worker is not None:
+            self.raw_zip_panel.request_stop()
+            self.tabs.setCurrentWidget(self.raw_zip_panel)
+            event.ignore()
+            return
         super().closeEvent(event)
 
     @Slot()
