@@ -11,12 +11,25 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from bfrs.recovery.container_inventory import VERSION, OLE_INVENTORY_REVISION, inspect_file
+from bfrs.recovery.container_inventory import (
+    VERSION, OLE_INVENTORY_REVISION, ZIP_INVENTORY_REVISION, inspect_file,
+)
 from bfrs.recovery.ole_type_hints import OLE_HINT_REVISION, ole_type_hint, ppt_candidate
 from bfrs.recovery.ppt_inventory import PPT_INVENTORY_REVISION
 
 EXTENSIONS = {'.zip', '.rar', '.7z', '.doc', '.docx', '.xls', '.xlsx', '.rtf', '.pdf', '.ppt', '.pptx'}
 FILE_ATTRIBUTE_ENCRYPTED = 0x4000
+
+
+def _upgrade_zip_cache(connection, metadata):
+    """Refresh old ZIP classifications once, including renamed/OOXML files."""
+    revision = str(ZIP_INVENTORY_REVISION)
+    if metadata.get('zip_inventory_revision') == revision:
+        return
+    connection.execute("UPDATE files SET identity=NULL WHERE result IS NOT NULL "
+                       "AND json_extract(result, '$.format') IN ('ZIP','DOCX','XLSX','PPTX')")
+    connection.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)',
+                       ('zip_inventory_revision', revision))
 
 
 def _upgrade_ole_cache(connection, metadata):
@@ -136,6 +149,7 @@ def export_reports(connection, output, run_id, complete, counters, filesystem_ch
                               'PDF_METADATA_ONLY_NO_PASSWORD_OR_PAYLOAD_CHECK',
                               'PPT_METADATA_ONLY_NO_PASSWORD_OR_PAYLOAD_CHECK',
                               'NO_SFX_OR_EMBEDDED_SIGNATURE_SEARCH',
+                              'ZIP_LOCAL_FALLBACK_POSITIVE_MARKERS_ONLY_NOT_RECOVERY',
                               'RESUME_USES_SIZE_MTIME_AND_FILE_ID_NOT_CONTENT_HASH']}
     temporary = output / 'summary.json.tmp'
     temporary.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8')
@@ -172,6 +186,7 @@ def inventory(source, output, *, resume=False, progress=None, should_stop=None):
         if 'inspection_revision' not in columns:
             connection.execute('ALTER TABLE files ADD COLUMN inspection_revision INTEGER NOT NULL DEFAULT 0')
         _upgrade_ole_cache(connection, metadata)
+        _upgrade_zip_cache(connection, metadata)
         run_id = int(metadata.get('run_id', '0')) + 1
         for key, value in {'source': str(source), 'version': str(VERSION), 'run_id': str(run_id)}.items():
             connection.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', (key, value))
