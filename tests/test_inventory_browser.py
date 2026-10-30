@@ -21,6 +21,54 @@ def finish(app, window):
     assert window.worker is None
 
 
+def test_browser_shows_partial_zip_marker_and_recovery_limit(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    database = tmp_path / 'inventory.sqlite'
+    make_report(database, tmp_path / 'source', [('recovered.bin', 'ENCRYPTED', 2)])
+    row = dict(path='recovered.bin', format='ZIP', encryption='ENCRYPTED', size=100,
+               reason='ZIP_LOCAL_PASSWORD_FLAG', structure='PARTIAL_LOCAL_HEADER_ONLY',
+               zip_local_member_name='example.txt', zip_local_header_offset=1234)
+    with sqlite3.connect(database) as db:
+        db.execute('UPDATE files SET result=?', (json.dumps(row),))
+    window = module.InventoryBrowser(database)
+    finish(app, window)
+    assert window.table.rowCount() == 1
+    window.table.selectRow(0)
+    details = window.details.toPlainText()
+    assert 'Brakuje końcowego spisu' in details
+    assert 'nie potwierdzono możliwości odzyskania' in details
+    assert 'example.txt' in details and '1234' in details
+    window.close()
+
+
+def test_name_hint_filter_includes_unencrypted_zip_and_displays_clues(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    database = tmp_path / 'inventory.sqlite'
+    make_report(database, tmp_path / 'source', [('example.bin', 'NO_ENCRYPTION_INDICATOR', 2)])
+    row = dict(path='example.bin', format='ZIP', encryption='NO_ENCRYPTION_INDICATOR', size=100,
+               zip_wallet_name_hint_count=1, zip_name_hint_count=1,
+               zip_name_hints=[dict(name='hidden/wallet.dat', terms=['wallet'])],
+               zip_name_hints_complete=True)
+    with sqlite3.connect(database) as db:
+        db.execute('UPDATE files SET result=?', (json.dumps(row),))
+    window = module.InventoryBrowser(database)
+    finish(app, window)
+    assert window.table.rowCount() == 0
+    window.state_combo.setCurrentIndex(window.state_combo.findData('NAME_HINT'))
+    finish(app, window)
+    assert window.table.rowCount() == 1
+    assert 'portfelem' in window.table.item(0, 6).text()
+    window.table.selectRow(0)
+    assert 'hidden/wallet.dat' in window.details.toPlainText()
+    assert 'nie potwierdzają portfela' in window.details.toPlainText()
+    window.set_language('en')
+    assert window.state_combo.currentData() == 'NAME_HINT'
+    assert window.table.horizontalHeaderItem(6).text() == 'Name clues'
+    assert window.table.item(0, 6).text() == 'Wallet name clue'
+    assert window.table.item(0, 5).text().endswith('example.bin')
+    window.close()
+
+
 def test_browser_ole_hint_from_old_report_preserves_unknown(tmp_path):
     app = QApplication.instance() or QApplication([])
     database = tmp_path/'inventory.sqlite'

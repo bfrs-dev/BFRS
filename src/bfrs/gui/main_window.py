@@ -44,6 +44,7 @@ from bfrs.gui.i18n import (
 )
 from bfrs.gui.result_browser import ResultBrowserWidget
 from bfrs.gui.inventory_panel import InventoryPanel
+from bfrs.gui.raw_zip_panel import RawZipPanel
 from bfrs.gui.scan_worker import ScanWorker
 from bfrs.gui.settings import GuiPreferences, GuiSettingsStore
 from bfrs.gui.scan_jobs import ScanJobStore
@@ -114,6 +115,12 @@ class MainWindow(QMainWindow):
         self.inventory_panel = InventoryPanel(language=self._language)
         self.tabs.addTab(self.inventory_panel, "")
         self.inventory_panel.idle.connect(self._inventory_idle)
+        self.raw_zip_panel = RawZipPanel(self._language)
+        self.raw_zip_panel.source_edit.setText(preferences.raw_zip_source)
+        self.raw_zip_panel.output_edit.setText(preferences.raw_zip_output)
+        self.raw_zip_panel.paths_changed.connect(self._save_preferences)
+        self.raw_zip_panel.idle.connect(self._inventory_idle)
+        self.tabs.addTab(self.raw_zip_panel, "")
 
         self.source_box = QGroupBox()
         source_layout = QGridLayout(self.source_box)
@@ -443,6 +450,8 @@ class MainWindow(QMainWindow):
             last_source=self.source_edit.text().strip(),
             last_output=self.output_edit.text().strip(),
             last_result_report=self._last_result_report,
+            raw_zip_source=self.raw_zip_panel.source_edit.text().strip(),
+            raw_zip_output=self.raw_zip_panel.output_edit.text().strip(),
             advanced_expanded=self.advanced_toggle.isChecked(),
             start_offset=self.start_offset_edit.text().strip() or "0",
             end_offset=self.end_offset_edit.text().strip(),
@@ -476,6 +485,8 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(1, self._t("tab_results"))
         self.tabs.setTabText(2, "Zaszyfrowane pliki i foldery" if self._language == "pl" else "Encrypted files and folders")
         self.inventory_panel.set_language(self._language)
+        self.tabs.setTabText(3, self._t("raw_zip_tab"))
+        self.raw_zip_panel.set_language(self._language)
         self.result_browser.set_language(self._language)
         self.source_box.setTitle(self._t("source_report_group"))
         self.source_edit.setPlaceholderText(self._t("source_placeholder"))
@@ -766,13 +777,14 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, self._t("scan_error_title"), self._last_failure_message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._thread is not None or self.inventory_panel.busy:
+        self._save_preferences()
+        if self._thread is not None or self.inventory_panel.busy or self.raw_zip_panel.busy:
             self._closing_requested = True
             self.inventory_panel.request_stop()
+            self.raw_zip_panel.request_stop()
             self._request_stop()
             event.ignore()
             return
-        self._save_preferences()
         self._closing_requested = False
         super().closeEvent(event)
 
@@ -787,10 +799,10 @@ class MainWindow(QMainWindow):
         self._controller = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        if self._closing_requested and not self.inventory_panel.busy:
-            self.close()
+        self._inventory_idle()
 
     @Slot()
     def _inventory_idle(self):
-        if self._closing_requested and self._thread is None and not self.inventory_panel.busy:
+        if (self._closing_requested and self._thread is None
+                and not self.inventory_panel.busy and not self.raw_zip_panel.busy):
             self.close()

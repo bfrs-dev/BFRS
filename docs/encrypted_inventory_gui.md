@@ -3,6 +3,13 @@
 Stage 4 starts from `4f607f41dcd017c02f3daa7a26ce87bd833fc982` on
 `feature/encrypted-inventory-gui`. It does not change wallet recovery algorithms.
 
+The combined version on `feature/inventory-gui-integration` preserves stage4's
+folder performance changes, saved scan jobs and document inventory. It adds
+**ZIP w obrazie / ZIP in image** as the fourth tab; see
+[raw ZIP inventory](raw_zip_inventory.md). Existing ZIP/OOXML checkpoint entries
+are refreshed once when their parser revision predates password-marker recovery
+or filename hints. Other compatible cached formats retain their reuse behavior.
+
 The third main tab is **Zaszyfrowane pliki i foldery** / **Encrypted files and
 folders**. Choose a source folder and a new output directory outside the source.
 The output name must not exist for a new scan. Stop requests cooperative
@@ -35,7 +42,8 @@ indeterminate: a percentage would require an extra traversal and a changing
 denominator. Counts include visited, inspected, reused, errors/skips and MiB read.
 The browser is the existing InventoryBrowser, with its 200-row pages and
 background SQLite tasks; it now also displays full locations and raw metadata.
-Its four filters retain the original status values. Copy/reveal never opens a
+Its original four filters retain their status values; a fifth selects wallet or
+backup filename clues, including unencrypted members. Copy/reveal never opens a
 document through its associated application.
 
 Unrecognized ordinary files remain cached but omitted from reports unless they
@@ -62,7 +70,7 @@ publications. A failed export can leave a temporary file; resume does not treat
 it as a report and never executes it. No archive extraction, password attempts
 or associated-document applications are used.
 
-GUI close waits for wallet scanning, inventory scanning and browser background
+GUI close waits for wallet scanning, both inventory scanners and browser background
 tasks. It requests inventory cancellation instead of destroying a live QThread.
 There is no forced termination of a blocked OS read; an unavailable filesystem
 may delay cooperative stop. Errors preserve exception type/message. Per-file
@@ -82,9 +90,11 @@ including `_internal`. It does not require loose repository Python sources.
 `scripts/verify_frozen_inventory.py --exe <absolute BFRS.exe>` runs the production
 windowed executable from a separate temporary directory, without PYTHONPATH or
 PYTHONHOME. Its opt-in `--inventory-smoke-test <new-directory>` entry point creates
-synthetic files, constructs the actual three-tab MainWindow with isolated
+synthetic files, constructs the actual four-tab MainWindow with isolated
 preferences, runs the inventory QThread, pumps Qt timers, compares JSONL with the
-same CLI engine, and resumes. It verifies `sys.frozen`, absent stdout/stderr and
+same CLI engine, and resumes. It also scans a synthetic raw ZIP image in the
+fourth tab, compares its records with the raw CLI engine, and resumes a partial
+checkpoint. It verifies `sys.frozen`, absent stdout/stderr and
 module origins under `sys._MEIPASS`. It writes only inside the newly created
 test directory. The Windows build runs this verification before ZIP/installer
 packaging and aborts on failure.
@@ -104,7 +114,9 @@ concurrent-writer rejection, simulated EFS/reparse attributes, no-console mode,
 Qt responsiveness and safe main-window close. Existing bounded parser and wallet
 regressions remain part of the full suite.
 
-The execution host is Windows 11 x64. Real EFS was not enabled: attribute tests
+The original stage4 execution host was Windows 11 x64. The combined four-tab
+version is tested on Linux; its native Windows build and installation require
+verification again. Real EFS was not enabled: attribute tests
 use controlled stat data. Before distribution, test real encrypted files and
 folders on NTFS with the appropriate Windows certificate, actual junctions,
 removable/network drives, Windows 10 GUI/DPI, stop/restart and installation paths.
