@@ -179,6 +179,22 @@ unsupported or volume-encrypted archive.
 
 ## Validation scope
 
+On Windows, CPython can expose different meanings of `st_ctime_ns` through
+`fstat` and `lstat` (see [CPython #157671](https://github.com/python/cpython/issues/157671)).
+The source guard compares handle metadata, including ctime, against its original
+handle snapshot. Path size, modification time, volume/file ID and regular-file/
+reparse checks remain active; only the cross-API ctime equality is omitted on
+Windows. Source hashes and the V1 checkpoint identity format are unchanged.
+Both inventory engines close SQLite explicitly before releasing the output lock,
+including error/stop paths, so a completed report does not retain an open handle.
+
+Large synthetic fixtures use `tests/sparse_files.py`, which enables
+`FSCTL_SET_SPARSE` before seeking/writing on Windows. If the test filesystem does
+not support that operation, the sparse-dependent case is skipped before any
+large write; it never falls back to allocating several GiB. This affects only
+test data, not source images. Smoke-test failures record their stage and traceback
+in `smoke-result.json`, including when the GUI has no console.
+
 Tests use synthetic images and filenames, including unaligned ZIPs, chunk-edge
 signatures, orphan/truncated records, conflicting local names, checkpoints,
 interruption, I/O errors, source mutation and bounded metadata. An optional

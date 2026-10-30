@@ -1,7 +1,7 @@
 """Fast, restartable metadata inventory of recovered documents and archives."""
 from __future__ import annotations
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import tempfile
 from collections import Counter
 import json
@@ -206,7 +206,6 @@ def _output_lock(output):
 
 def source_from_checkpoint(database):
     """Read source metadata only, without creating or changing the checkpoint."""
-    from contextlib import closing
     database = Path(database).absolute()
     _no_reparse_ancestors(database)
     with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=2)) as connection:
@@ -243,7 +242,7 @@ def inventory(source, output, *, resume=False, progress=None, should_stop=None):
                         else 'UNAVAILABLE_ON_THIS_PLATFORM')
     counters = {'visited': 0, 'inspected': 0, 'reused': 0, 'bytes_read': 0,
                 'errors_or_skips': 0, 'metadata_only': 0, 'reported_directories': 0}
-    with _output_lock(output), sqlite3.connect(database) as connection:
+    with _output_lock(output), closing(sqlite3.connect(database)) as connection, connection:
         connection.execute('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)')
         connection.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, identity TEXT, result TEXT, run_id INTEGER)')
         metadata = dict(connection.execute('SELECT key,value FROM metadata'))

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import traceback
 import zipfile
 
 
@@ -14,7 +15,8 @@ def run_smoke(directory):
     directory.mkdir(parents=True, exist_ok=False)
     os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
     outcome = {'frozen': bool(getattr(sys,'frozen',False)),
-               'no_console': sys.stdout is None and sys.stderr is None}
+               'no_console': sys.stdout is None and sys.stderr is None,
+               'stage': 'imports'}
     window = None
     try:
         from PySide6.QtCore import QTimer
@@ -66,12 +68,14 @@ def run_smoke(directory):
                 time.sleep(.002)
             assert not panel.busy, 'GUI inventory did not finish'
             assert not panel.last_error, panel.last_error
+        outcome['stage'] = 'document_inventory'
         panel.start_inventory()
         finish()
         assert panel.last_result['complete']
         gui_lines = (directory/'gui/inventory.jsonl').read_text(encoding='utf-8')
         inventory(source,directory/'cli')
         assert gui_lines == (directory/'cli/inventory.jsonl').read_text(encoding='utf-8')
+        outcome['stage'] = 'document_resume'
         panel.start_inventory(resume=True)
         finish()
         assert panel.last_result['run']['reused'] >= 2
@@ -93,6 +97,7 @@ def run_smoke(directory):
                 time.sleep(.002)
             assert not raw.busy, 'GUI raw ZIP scan did not finish'
             assert raw.page is not None, raw.status.text()
+        outcome['stage'] = 'raw_zip_scan'
         raw.start_scan()
         finish_raw()
         assert json.loads((directory/'raw-gui/summary.json').read_text(encoding='utf-8'))['scan_complete']
@@ -100,6 +105,7 @@ def run_smoke(directory):
         raw_lines = (directory/'raw-gui/zip_hits.jsonl').read_text(encoding='utf-8')
         raw_engine.scan_image(image,directory/'raw-cli')
         assert raw_lines == (directory/'raw-cli/zip_hits.jsonl').read_text(encoding='utf-8')
+        outcome['stage'] = 'raw_zip_resume'
         partial = raw_engine.scan_image(image,directory/'raw-resume',max_candidates=1)
         assert not partial['scan_complete'] and partial['stop_reason'] == 'CANDIDATE_LIMIT'
         raw.output_edit.setText(str(directory/'raw-resume'))
@@ -108,6 +114,7 @@ def run_smoke(directory):
         finish_raw()
         assert json.loads((directory/'raw-resume/summary.json').read_text(encoding='utf-8'))['scan_complete']
         assert raw_lines == (directory/'raw-resume/zip_hits.jsonl').read_text(encoding='utf-8')
+        outcome['stage'] = 'language_and_shutdown'
         window._language = 'en'
         window._retranslate_ui()
         assert window.tabs.tabText(3) == 'ZIP in image'
@@ -120,8 +127,9 @@ def run_smoke(directory):
                        executable=sys.executable)
         window.close()
         application.processEvents()
+        outcome['stage'] = 'complete'
     except Exception as error:
-        outcome.update(ok=False,error=f'{type(error).__name__}: {error}')
+        outcome.update(ok=False,error=f'{type(error).__name__}: {error}', traceback=traceback.format_exc())
         # Do not destroy Qt objects with live workers on a failing smoke run.
         if window is not None:
             window.inventory_panel.request_stop()

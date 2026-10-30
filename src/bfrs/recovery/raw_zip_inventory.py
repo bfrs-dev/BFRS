@@ -6,7 +6,7 @@ classic ZIP layout and remain hypotheses even when the first local header fits.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import os
@@ -24,6 +24,7 @@ FORMAT = 'BFRS_RAW_ZIP_INVENTORY_V1'
 CHUNK_BYTES = 8 * 1024 * 1024
 MAX_CHUNK_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_CANDIDATES = 1_000_000
+_WINDOWS_STAT = os.name == 'nt'
 SIGNATURES = re.compile(rb'PK(?:\x03\x04|\x01\x02|\x05\x06)')
 METHODS = {0, 8, 9, 12, 14, 93, 98, 99}
 SAMPLE_BYTES = 64 * 1024
@@ -46,8 +47,14 @@ def _ordinary(info, *, directory=False):
 
 def _check_source(stream, path, expected):
     opened, current = os.fstat(stream.fileno()), path.lstat()
+    path_key = _stat_key(current)
+    # CPython on Windows can expose change time through fstat(), but birth
+    # time through lstat(). Do not compare those two meanings of ctime.
+    # Keep the full fstat guard (including ctime) and all other path fields.
+    path_matches = (path_key[:2] + path_key[3:] == expected[:2] + expected[3:]
+                    if _WINDOWS_STAT else path_key == expected)
     if (not _ordinary(opened) or not _ordinary(current)
-            or _stat_key(opened) != expected or _stat_key(current) != expected):
+            or _stat_key(opened) != expected or not path_matches):
         raise SourceChanged('SOURCE_CHANGED_DURING_SCAN')
 
 
@@ -370,7 +377,7 @@ def scan_image(source, output, *, resume=False, chunk_size=CHUNK_BYTES,
         io_counts = {'linear_read_bytes': 0, 'metadata_read_bytes': 0, 'identity_read_bytes': 0}
         identity = _identity(stream, source, info, io_counts)
         output.mkdir(parents=True, exist_ok=True)
-        with _lock(output), sqlite3.connect(database) as connection:
+        with _lock(output), closing(sqlite3.connect(database)) as connection, connection:
             connection.execute('PRAGMA trusted_schema=OFF')
             connection.execute('PRAGMA synchronous=FULL')
             if resume:

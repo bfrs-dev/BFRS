@@ -274,7 +274,7 @@ def test_windowed_no_stdio_smoke_from_sources(tmp_path):
         'import sys; sys.stdout=sys.stderr=None; from bfrs.gui.inventory_smoke import run_smoke; raise SystemExit(run_smoke(sys.argv[1]))',
         str(tmp_path/'smoke')],env={**os.environ,'PYTHONPATH':str(Path(__file__).resolve().parents[1]/'src')},timeout=90)
     outcome=json.loads((tmp_path/'smoke/smoke-result.json').read_text(encoding='utf-8'))
-    assert result.returncode==0,outcome
+    assert result.returncode==0,json.dumps(outcome,ensure_ascii=False,indent=2)
     assert outcome['no_console'] and outcome['cli_gui_equal'] and outcome['resume']
     assert outcome['tabs']==4
     assert outcome['raw_zip_scan'] and outcome['raw_zip_resume'] and outcome['raw_zip_cli_gui_equal']

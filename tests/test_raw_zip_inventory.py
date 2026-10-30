@@ -11,6 +11,8 @@ import zipfile
 
 import pytest
 
+from tests.sparse_files import sparse_file
+
 from bfrs.recovery import raw_zip_inventory as module
 from tests.test_zip_inventory_recovery import local_entry
 
@@ -345,7 +347,7 @@ def test_member_metadata_limit_is_unresolved_not_a_rejected_signature(tmp_path, 
 
 def test_large_sparse_source_has_bounded_memory_and_linear_reads(tmp_path):
     source, output = tmp_path / 'disk.img', tmp_path / 'report'
-    with source.open('wb') as stream:
+    with sparse_file(source) as stream:
         stream.seek(32 * 1024 * 1024 - 2)
         stream.write(local_entry())
     tracemalloc.start()
@@ -364,7 +366,7 @@ def test_physical_offsets_above_four_gib_remain_exact(tmp_path):
     source = tmp_path / 'large.img'
     base = 2**32 + 4095
     archive = zip_bytes()
-    with source.open('wb') as stream:
+    with sparse_file(source) as stream:
         stream.seek(base)
         stream.write(archive)
     eocd = base + archive.index(b'PK\x05\x06')

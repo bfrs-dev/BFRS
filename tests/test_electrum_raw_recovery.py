@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.sparse_files import sparse_file
+
 import bfrs.recovery.electrum_raw_recovery as electrum_raw_module
 from bfrs.core.chunk_reader import ChunkReader
 from bfrs.core.models import RawHit
@@ -673,7 +675,7 @@ class _RecordingAssembler:
 
 def _sized_source(tmp_path, size: int):
     path = tmp_path / "synthetic-secondary-reads.bin"
-    with path.open("wb") as stream:
+    with sparse_file(path) as stream:
         if size:
             stream.seek(size - 1)
             stream.write(b"\0")

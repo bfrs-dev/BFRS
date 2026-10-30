@@ -1,4 +1,5 @@
 """Synthetic damaged-ZIP evidence and independent traditional-encryption checks."""
+
 import json
 import shutil
 import sqlite3
@@ -7,6 +8,8 @@ import subprocess
 import zipfile
 
 import pytest
+
+from tests.sparse_files import sparse_file
 
 from bfrs.recovery import container_inventory as module
 from tests.test_container_inventory import runner, zip_fixture
@@ -41,7 +44,7 @@ def test_local_scan_skips_payload_and_finds_later_encrypted_member(tmp_path, mon
     payload_size = 100 * 1024 * 1024
     first = local_entry(b'first.txt', flags=0, payload=b'', packed=payload_size)
     second_offset = len(first) + payload_size
-    with path.open('wb') as stream:
+    with sparse_file(path) as stream:
         stream.write(first)
         stream.seek(second_offset)
         stream.write(local_entry())
