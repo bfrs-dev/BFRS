@@ -14,7 +14,7 @@ import time
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import pytest
 pytest.importorskip('PySide6')
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QThread, QTimer
 from PySide6.QtWidgets import QApplication
 from bfrs.application import document_inventory as engine
 from bfrs.gui.inventory_panel import InventoryPanel
@@ -28,7 +28,16 @@ from tests.test_pdf_inventory import classic_pdf
 
 @pytest.fixture
 def app():
-    return QApplication.instance() or QApplication([])
+    application = QApplication.instance() or QApplication([])
+    yield application
+    # pytest has no app.exec() loop to drain DeferredDelete on shutdown.
+    # Release idle windows/threads while the application is still alive.
+    for widget in application.topLevelWidgets():
+        assert not any(thread.isRunning() for thread in widget.findChildren(QThread))
+        widget.close()
+        widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    application.processEvents()
 
 
 def wait(app, predicate, timeout=20):
@@ -243,9 +252,11 @@ def test_source_read_error_is_unknown_with_reason_and_visible_counter(tmp_path,a
 
 def test_main_window_third_tab_languages_and_safe_close(tmp_path,app,monkeypatch):
     window=MainWindow(settings_store=GuiSettingsStore(tmp_path/'preferences.json'))
-    assert window.tabs.count()==3 and window.tabs.tabText(2)=='Zaszyfrowane pliki i foldery'
+    assert window.tabs.count()==4 and window.tabs.tabText(2)=='Zaszyfrowane pliki i foldery'
+    assert window.tabs.tabText(3)=='ZIP w obrazie'
     window._language='en'; window._retranslate_ui()
     assert window.tabs.tabText(2)=='Encrypted files and folders'
+    assert window.tabs.tabText(3)=='ZIP in image'
     assert window.inventory_panel.browser.state_combo.itemText(1)=='Unknown'
     source=tmp_path/'source'; source.mkdir(); (source/'a.rtf').write_bytes(br'{\rtf1 example}')
     gate=threading.Event(); entered=threading.Event(); original=engine.inspect_file
@@ -263,8 +274,10 @@ def test_windowed_no_stdio_smoke_from_sources(tmp_path):
         'import sys; sys.stdout=sys.stderr=None; from bfrs.gui.inventory_smoke import run_smoke; raise SystemExit(run_smoke(sys.argv[1]))',
         str(tmp_path/'smoke')],env={**os.environ,'PYTHONPATH':str(Path(__file__).resolve().parents[1]/'src')},timeout=90)
     outcome=json.loads((tmp_path/'smoke/smoke-result.json').read_text(encoding='utf-8'))
-    assert result.returncode==0,outcome
+    assert result.returncode==0,json.dumps(outcome,ensure_ascii=False,indent=2)
     assert outcome['no_console'] and outcome['cli_gui_equal'] and outcome['resume']
+    assert outcome['tabs']==4
+    assert outcome['raw_zip_scan'] and outcome['raw_zip_resume'] and outcome['raw_zip_cli_gui_equal']
 
 
 def test_build_contract_includes_frozen_verification_and_recursive_installer():
@@ -284,4 +297,4 @@ def test_actual_frozen_inventory_without_source_imports(tmp_path):
                           capture_output=True,timeout=120)
     assert result.returncode==0,result.stderr.decode(errors='replace')
     outcome=json.loads((tmp_path/'smoke/smoke-result.json').read_text(encoding='utf-8'))
-    assert len(outcome['bundled_modules'])>=8
+    assert len(outcome['bundled_modules'])>=12

@@ -18,8 +18,10 @@ def verify(executable, workspace):
     result = subprocess.run([str(Path(executable).resolve()),'--inventory-smoke-test',str(destination)],
                             cwd=workspace,env=environment,timeout=120)
     outcome = json.loads((destination/'smoke-result.json').read_text(encoding='utf-8'))
-    if result.returncode or not outcome.get('ok') or not outcome.get('frozen') or not outcome.get('no_console'):
-        raise RuntimeError(f'Frozen inventory check failed: {outcome}')
+    required = ('ok', 'frozen', 'no_console', 'cli_gui_equal', 'resume',
+                'raw_zip_scan', 'raw_zip_resume', 'raw_zip_cli_gui_equal')
+    if result.returncode or outcome.get('tabs') != 4 or not all(outcome.get(key) is True for key in required):
+        raise RuntimeError('Frozen inventory check failed:\n' + json.dumps(outcome,ensure_ascii=True,indent=2))
     print(json.dumps(outcome,ensure_ascii=True,indent=2))
     return outcome
 

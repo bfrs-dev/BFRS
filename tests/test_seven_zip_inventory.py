@@ -1,4 +1,5 @@
 """Metadata-only 7z cases, including bounded decoding of header streams."""
+
 import io
 import json
 import lzma
@@ -6,6 +7,8 @@ import struct
 import zlib
 
 import pytest
+
+from tests.sparse_files import sparse_file
 
 from bfrs.recovery import container_inventory as inventory
 from bfrs.recovery import seven_zip_inventory as module
@@ -249,7 +252,7 @@ def test_bcj2_large_payload_still_only_reads_metadata(tmp_path, monkeypatch):
     size = 100 * 1024 * 1024
     header = bcj2_header(bcj2_streams(sizes=(size - 6, 2, 2, 2)))
     start = struct.pack('<QQ', size, len(header)) + crc(header)
-    with path.open('wb') as stream:
+    with sparse_file(path) as stream:
         stream.write(b'7z\xbc\xaf\x27\x1c\x00\x04' + crc(start) + start)
         stream.seek(32 + size)
         stream.write(header)
@@ -347,7 +350,7 @@ def test_large_member_payload_is_not_read(tmp_path, monkeypatch):
     header = plain_header(packed_size=size)
     start = struct.pack('<QQ', size, len(header)) + crc(header)
     path = tmp_path/'sparse.bin'
-    with path.open('wb') as f:
+    with sparse_file(path) as f:
         f.write(b'7z\xbc\xaf\x27\x1c\x00\x04' + crc(start) + start)
         f.seek(32 + size)
         f.write(header)

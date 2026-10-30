@@ -7,6 +7,8 @@ import zlib
 
 import pytest
 
+from tests.sparse_files import sparse_file
+
 from bfrs.recovery import container_inventory as module
 
 from bfrs.application import document_inventory as runner
@@ -97,8 +99,9 @@ def test_renamed_zip_docx_and_encrypted_flags(tmp_path):
 
 def test_budget_truncated_zip_and_non_target_reads(tmp_path, monkeypatch):
     path = tmp_path/'huge.bin'
-    with path.open('wb') as stream:
-        stream.truncate(100*1024*1024)
+    with sparse_file(path) as stream:
+        stream.seek(100*1024*1024 - 1)
+        stream.write(b'\0')
     assert module.inspect_file(path)['bytes_read'] == 512
     path.write_bytes(b'PK\x03\x04broken')
     row = module.inspect_file(path)
@@ -330,7 +333,7 @@ def test_rar3_service_large_data_not_read(tmp_path, monkeypatch):
     main = b'Rar!\x1a\x07\x00' + rar3_header(0x73, 0, b'\0' * 6)
     service = rar3_service(packed_size=packed_size)
     end = rar3_header(0x7b, 0, b'')
-    with path.open('wb') as stream:
+    with sparse_file(path) as stream:
         stream.write(main + service)
         stream.seek(packed_size, 1)
         stream.write(end)

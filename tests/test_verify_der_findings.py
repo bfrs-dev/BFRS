@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.sparse_files import sparse_file
+
 from tests.test_orphan_private_key_der import private_der
 
 spec = importlib.util.spec_from_file_location(
@@ -84,7 +86,7 @@ def test_sparse_large_file_uses_only_one_bounded_read(tmp_path):
     source = root / "pagefile.sys"
     der = private_der(7)
     offset = 1329425220
-    with source.open("wb") as stream:
+    with sparse_file(source) as stream:
         stream.seek(offset - der.index(verifier.ANCHOR))
         stream.write(der)
         stream.seek(offset + 2000)

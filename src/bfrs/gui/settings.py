@@ -19,6 +19,8 @@ class GuiPreferences:
     last_source: str = ""
     last_output: str = ""
     last_result_report: str = ""
+    raw_zip_source: str = ""
+    raw_zip_output: str = ""
     advanced_expanded: bool = False
     start_offset: str = "0"
     end_offset: str = ""
@@ -66,6 +68,8 @@ class GuiSettingsStore:
             last_source=self._text(payload, "last_source"),
             last_output=self._text(payload, "last_output"),
             last_result_report=self._text(payload, "last_result_report"),
+            raw_zip_source=self._text(payload, "raw_zip_source"),
+            raw_zip_output=self._text(payload, "raw_zip_output"),
             advanced_expanded=self._boolean(
                 payload, "advanced_expanded", default=False
             ),
