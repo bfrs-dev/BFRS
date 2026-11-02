@@ -17,7 +17,8 @@
 #if BuildArch == "win-arm64"
   #define AllowedArch "arm64"
 #else
-  #define AllowedArch "x64compatible and not arm64"
+  // Also allow x64 emulation on Windows 11 ARM64 (for example Surface).
+  #define AllowedArch "x64compatible"
 #endif
 
 [Setup]
