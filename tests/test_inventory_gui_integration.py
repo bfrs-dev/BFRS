@@ -80,6 +80,7 @@ def test_frozen_verifier_requires_both_tabs_to_pass(tmp_path, monkeypatch, outda
                        tabs=3 if outdated else 4)
         if not outdated:
             outcome.update(raw_zip_scan=True, raw_zip_resume=True, raw_zip_cli_gui_equal=True)
+            outcome.update(raw_efs_scan=True, raw_efs_resume=True, raw_efs_cli_gui_equal=True)
         (destination / 'smoke-result.json').write_text(json.dumps(outcome), encoding='utf-8')
         return SimpleNamespace(returncode=0)
 

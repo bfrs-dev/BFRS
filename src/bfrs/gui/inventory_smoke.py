@@ -4,10 +4,27 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import struct
 import sys
 import time
 import traceback
 import zipfile
+
+
+def _efs_fixture():
+    """Minimal synthetic NTFS directory record, independent of test modules."""
+    data = bytearray(1024)
+    data[:4] = b'FILE'
+    struct.pack_into('<HH', data, 4, 48, 3)
+    struct.pack_into('<HHHH', data, 16, 1, 1, 56, 3)
+    struct.pack_into('<II', data, 24, 160, 1024)
+    struct.pack_into('<I', data, 44, 42)
+    struct.pack_into('<II', data, 56, 0x10, 96)
+    struct.pack_into('<IH', data, 72, 72, 24)
+    struct.pack_into('<I', data, 112, 0x4000)
+    struct.pack_into('<I', data, 152, 0xffffffff)
+    data[48:50] = data[510:512] = data[1022:1024] = b'\x12\x34'
+    return bytes(data)
 
 
 def run_smoke(directory):
@@ -34,9 +51,10 @@ def run_smoke(directory):
         import bfrs.application.raw_zip_view as raw_view
         import bfrs.gui.raw_zip_panel as raw_controls
         import bfrs.recovery.raw_zip_inventory as raw_engine
+        import bfrs.recovery.raw_efs_inventory as efs_engine
         import bfrs.recovery.archive_name_hints as name_hints
         modules = (engine,browser,controls,view,seven_zip_inventory,pdf_inventory,ppt_inventory,olefile,
-                   raw_view,raw_controls,raw_engine,name_hints)
+                   raw_view,raw_controls,raw_engine,name_hints,efs_engine)
         if getattr(sys,'frozen',False):
             bundle = Path(sys._MEIPASS).resolve()
             assert all(Path(module.__file__).resolve().is_relative_to(bundle) for module in modules)
@@ -53,7 +71,7 @@ def run_smoke(directory):
         outcome['tabs'] = window.tabs.count()
         assert outcome['tabs'] == 4
         assert window.tabs.tabText(2) in ('Zaszyfrowane pliki i foldery','Encrypted files and folders')
-        assert window.tabs.tabText(3) in ('ZIP w obrazie','ZIP in image')
+        assert window.tabs.tabText(3) in ('ZIP / EFS w obrazie','ZIP / EFS in image')
         panel = window.inventory_panel
         panel.source_edit.setText(str(source))
         panel.output_edit.setText(str(directory/'gui'))
@@ -114,16 +132,40 @@ def run_smoke(directory):
         finish_raw()
         assert json.loads((directory/'raw-resume/summary.json').read_text(encoding='utf-8'))['scan_complete']
         assert raw_lines == (directory/'raw-resume/zip_hits.jsonl').read_text(encoding='utf-8')
+        outcome['stage'] = 'raw_efs_scan'
+        efs_image = directory/'efs.img'
+        efs_image.write_bytes(b'prefix' + _efs_fixture() + b'suffix' + _efs_fixture())
+        raw.mode_combo.setCurrentIndex(1)
+        raw.source_edit.setText(str(efs_image))
+        raw.output_edit.setText(str(directory/'efs-gui'))
+        raw.start_scan()
+        finish_raw()
+        assert raw.table.rowCount() == 2
+        assert all(row['record_status'] == 'DIRECTORY_ENCRYPTION_DEFAULT' for row in raw.page.rows)
+        efs_lines = (directory/'efs-gui/efs_hits.jsonl').read_text(encoding='utf-8')
+        efs_engine.scan_image(efs_image, directory/'efs-cli')
+        assert efs_lines == (directory/'efs-cli/efs_hits.jsonl').read_text(encoding='utf-8')
+        outcome['stage'] = 'raw_efs_resume'
+        partial = efs_engine.scan_image(efs_image, directory/'efs-resume', max_candidates=1)
+        assert not partial['scan_complete']
+        raw.output_edit.setText(str(directory/'efs-resume'))
+        raw.resume_check.setChecked(True)
+        raw.start_scan()
+        finish_raw()
+        assert json.loads((directory/'efs-resume/summary.json').read_text(encoding='utf-8'))['scan_complete']
+        assert efs_lines == (directory/'efs-resume/efs_hits.jsonl').read_text(encoding='utf-8')
         outcome['stage'] = 'language_and_shutdown'
         window._language = 'en'
         window._retranslate_ui()
-        assert window.tabs.tabText(3) == 'ZIP in image'
+        assert window.tabs.tabText(3) == 'ZIP / EFS in image'
+        assert raw.table.item(0, 2).text() == 'Directory encryption default'
         assert window.inventory_panel.browser.table.horizontalHeaderItem(6).text() == 'Name clues'
         assert ticks, 'Qt timer did not run during background inventory'
         timer.stop()
         outcome.update(ok=True, qt_ticks=len(ticks), records=len(gui_lines.splitlines()),
                        optional_ole_available=True, resume=True, cli_gui_equal=True,
                        raw_zip_scan=True, raw_zip_resume=True, raw_zip_cli_gui_equal=True,
+                       raw_efs_scan=True, raw_efs_resume=True, raw_efs_cli_gui_equal=True,
                        executable=sys.executable)
         window.close()
         application.processEvents()

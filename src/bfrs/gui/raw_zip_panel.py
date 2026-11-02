@@ -8,14 +8,17 @@ import time
 from PySide6.QtCore import QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QCheckBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from bfrs.application.raw_zip_view import PAGE_SIZE, read_raw_zip_page
+from bfrs.application.raw_zip_view import PAGE_SIZE, read_raw_zip_page, read_raw_efs_page
 from bfrs.gui.i18n import normalize_language, translate
 from bfrs.recovery.raw_zip_inventory import scan_image
+from bfrs.recovery.raw_efs_inventory import scan_image as scan_efs_image
+
+EFS_TRANSLATIONS = {'note', 'output_hint', 'open', 'page', 'priority_only', 'priority', 'name', 'record'}
 
 
 class RawZipTask(QThread):
@@ -63,6 +66,14 @@ class RawZipPanel(QWidget):
         self._status_key = 'ready'
         self._status_values = {}
         layout = QVBoxLayout(self)
+        self.mode_label = QLabel()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem('ZIP', 'zip')
+        self.mode_combo.addItem('Windows EFS (NTFS)', 'efs')
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.mode_label)
+        mode_row.addWidget(self.mode_combo, 1)
+        layout.addLayout(mode_row)
         grid = QGridLayout()
         self.source_label, self.output_label = QLabel(), QLabel()
         self.source_edit, self.output_edit = QLineEdit(), QLineEdit()
@@ -127,11 +138,36 @@ class RawZipPanel(QWidget):
         self.previous_button.clicked.connect(lambda: self.load_page(self.page.offset - PAGE_SIZE))
         self.next_button.clicked.connect(lambda: self.load_page(self.page.offset + PAGE_SIZE))
         self.table.itemSelectionChanged.connect(self._selection_changed)
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         self.set_language(language)
         self._controls()
 
     def _t(self, key, **values):
+        if self.mode == 'efs' and key.startswith('raw_zip_') and key[8:] in EFS_TRANSLATIONS:
+            key = 'raw_efs_' + key[8:]
         return translate(self.language, key, **values)
+
+    @property
+    def mode(self):
+        return self.mode_combo.currentData()
+
+    @property
+    def database_name(self):
+        return 'efs_scan.sqlite' if self.mode == 'efs' else 'zip_scan.sqlite'
+
+    def _mode_changed(self):
+        self.database = None
+        self._clear_page()
+        self.resume_check.setChecked(False)
+        self.priority_check.blockSignals(True)
+        self.priority_check.setChecked(self.mode != 'efs')
+        self.priority_check.blockSignals(False)
+        self._set_status('ready')
+        self.progress_bar.setValue(0)
+        self.progress_label.clear()
+        self.set_language(self.language)
+        self._controls()
+        self.paths_changed.emit()
 
     @property
     def busy(self):
@@ -139,6 +175,7 @@ class RawZipPanel(QWidget):
 
     def set_language(self, language):
         self.language = normalize_language(language)
+        self.mode_label.setText(self._t('raw_image_mode'))
         for widget, key in ((self.source_label, 'source'), (self.output_label, 'raw_zip_output'),
                             (self.source_button, 'choose_file'), (self.output_button, 'choose_folder'),
                             (self.resume_check, 'resume_checkpoint'), (self.note, 'raw_zip_note'),
@@ -161,7 +198,7 @@ class RawZipPanel(QWidget):
     def _controls(self):
         idle = self.worker is None
         for widget in (self.source_edit, self.output_edit, self.source_button, self.output_button,
-                       self.resume_check, self.start_button, self.open_button, self.priority_check):
+                       self.resume_check, self.start_button, self.open_button, self.priority_check, self.mode_combo):
             widget.setEnabled(idle)
         self.stop_button.setEnabled(not idle and self.scanning and not self.worker.stop_requested.is_set())
         self.folder_button.setEnabled(idle and self.database is not None)
@@ -178,17 +215,20 @@ class RawZipPanel(QWidget):
         if path:
             output = Path(path)
             if not self.resume_check.isChecked():
-                output /= datetime.now().strftime('zip-image-%Y%m%d-%H%M%S')
+                output /= datetime.now().strftime(self.mode + '-image-%Y%m%d-%H%M%S')
             self.output_edit.setText(str(output))
 
     def _choose_report(self):
-        path, _ = QFileDialog.getOpenFileName(self, self._t('raw_zip_open'), '', 'ZIP scan (zip_scan.sqlite)')
+        path, _ = QFileDialog.getOpenFileName(self, self._t('raw_zip_open'), '',
+                                             'Image scan (zip_scan.sqlite efs_scan.sqlite)')
         if path:
             self.open_report(path)
 
     def open_report(self, database, *, preserve_status=False):
         if self.worker:
             return
+        if Path(database).name in ('efs_scan.sqlite', 'zip_scan.sqlite'):
+            self.mode_combo.setCurrentIndex(1 if Path(database).name == 'efs_scan.sqlite' else 0)
         self.database = Path(database).absolute()
         self._adopt_report = True
         if not preserve_status:
@@ -224,7 +264,8 @@ class RawZipPanel(QWidget):
         self.progress_label.clear()
         self._set_status('starting_scan')
         self._scan_output = Path(output).absolute()
-        self._start_task(lambda task: scan_image(source, output, resume=resume,
+        scanner = scan_efs_image if self.mode == 'efs' else scan_image
+        self._start_task(lambda task: scanner(source, output, resume=resume,
                          should_stop=task.stop_requested.is_set, progress=task.report_progress),
                          self._scan_done, scanning=True)
 
@@ -257,7 +298,7 @@ class RawZipPanel(QWidget):
         else:
             self._set_status('raw_zip_incomplete', reason=reason)
         self.resume_check.setChecked(True)
-        self._pending_report = self._scan_output / 'zip_scan.sqlite'
+        self._pending_report = self._scan_output / self.database_name
 
     def _failed(self, message):
         self.progress_bar.setRange(0, 1000)
@@ -285,12 +326,15 @@ class RawZipPanel(QWidget):
         if self.worker or self.database is None:
             return
         database, priority = self.database, self.priority_check.isChecked()
+        reader = read_raw_efs_page if self.mode == 'efs' else read_raw_zip_page
         self._clear_page()
-        self._start_task(lambda task: read_raw_zip_page(database, priority_only=priority, offset=offset),
+        self._start_task(lambda task: reader(database, priority_only=priority, offset=offset),
                          self._display_page)
 
     def _display_page(self, page):
         self.page = page
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setValue(round(page.scanned_bytes / page.total_bytes * 1000) if page.total_bytes else 1000)
         if getattr(self, '_adopt_report', False):
             self._adopt_report = False
             self.source_edit.setText(page.source)
@@ -301,11 +345,16 @@ class RawZipPanel(QWidget):
                                          done=page.scanned_bytes, total=page.total_bytes))
         self.table.setRowCount(len(page.rows))
         for index, row in enumerate(page.rows):
-            names = row.get('member_name') or '; '.join(hint.get('name', '')
-                                                       for hint in row.get('zip_name_hints', []))
-            values = (str(row['offset']), self._t('raw_zip_' + row['record_type']),
-                      self._t('raw_zip_priority_' + str(row.get('priority', 0))),
-                      self._t('raw_zip_' + row['encryption']), names)
+            if self.mode == 'efs':
+                values = (str(row['offset']), self._t('raw_efs_' + row['record_type']),
+                          self._t('raw_efs_' + row['record_status']),
+                          self._t('raw_efs_' + row['encryption']), row['display_name'])
+            else:
+                names = row.get('member_name') or '; '.join(hint.get('name', '')
+                                                           for hint in row.get('zip_name_hints', []))
+                values = (str(row['offset']), self._t('raw_zip_' + row['record_type']),
+                          self._t('raw_zip_priority_' + str(row.get('priority', 0))),
+                          self._t('raw_zip_' + row['encryption']), names)
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)

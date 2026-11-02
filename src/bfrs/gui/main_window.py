@@ -116,6 +116,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.inventory_panel, "")
         self.inventory_panel.idle.connect(self._inventory_idle)
         self.raw_zip_panel = RawZipPanel(self._language)
+        self.raw_zip_panel.mode_combo.setCurrentIndex(1 if preferences.raw_image_mode == 'efs' else 0)
         self.raw_zip_panel.source_edit.setText(preferences.raw_zip_source)
         self.raw_zip_panel.output_edit.setText(preferences.raw_zip_output)
         self.raw_zip_panel.paths_changed.connect(self._save_preferences)
@@ -452,6 +453,7 @@ class MainWindow(QMainWindow):
             last_result_report=self._last_result_report,
             raw_zip_source=self.raw_zip_panel.source_edit.text().strip(),
             raw_zip_output=self.raw_zip_panel.output_edit.text().strip(),
+            raw_image_mode=self.raw_zip_panel.mode,
             advanced_expanded=self.advanced_toggle.isChecked(),
             start_offset=self.start_offset_edit.text().strip() or "0",
             end_offset=self.end_offset_edit.text().strip(),

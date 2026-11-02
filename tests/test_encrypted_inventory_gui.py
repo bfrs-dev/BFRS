@@ -253,10 +253,10 @@ def test_source_read_error_is_unknown_with_reason_and_visible_counter(tmp_path,a
 def test_main_window_third_tab_languages_and_safe_close(tmp_path,app,monkeypatch):
     window=MainWindow(settings_store=GuiSettingsStore(tmp_path/'preferences.json'))
     assert window.tabs.count()==4 and window.tabs.tabText(2)=='Zaszyfrowane pliki i foldery'
-    assert window.tabs.tabText(3)=='ZIP w obrazie'
+    assert window.tabs.tabText(3)=='ZIP / EFS w obrazie'
     window._language='en'; window._retranslate_ui()
     assert window.tabs.tabText(2)=='Encrypted files and folders'
-    assert window.tabs.tabText(3)=='ZIP in image'
+    assert window.tabs.tabText(3)=='ZIP / EFS in image'
     assert window.inventory_panel.browser.state_combo.itemText(1)=='Unknown'
     source=tmp_path/'source'; source.mkdir(); (source/'a.rtf').write_bytes(br'{\rtf1 example}')
     gate=threading.Event(); entered=threading.Event(); original=engine.inspect_file
@@ -278,6 +278,7 @@ def test_windowed_no_stdio_smoke_from_sources(tmp_path):
     assert outcome['no_console'] and outcome['cli_gui_equal'] and outcome['resume']
     assert outcome['tabs']==4
     assert outcome['raw_zip_scan'] and outcome['raw_zip_resume'] and outcome['raw_zip_cli_gui_equal']
+    assert outcome['raw_efs_scan'] and outcome['raw_efs_resume'] and outcome['raw_efs_cli_gui_equal']
 
 
 def test_build_contract_includes_frozen_verification_and_recursive_installer():

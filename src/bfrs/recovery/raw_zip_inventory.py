@@ -352,8 +352,16 @@ def _export(connection, output, identity, reason, io_counts, source_unchanged):
 
 
 def scan_image(source, output, *, resume=False, chunk_size=CHUNK_BYTES,
-               max_candidates=DEFAULT_MAX_CANDIDATES, should_stop=None, progress=None):
+               max_candidates=DEFAULT_MAX_CANDIDATES, should_stop=None, progress=None,
+               _profile=None):
     """Commit each scanned prefix and its hits atomically; stop rather than skip."""
+    # The EFS carver shares the exact same read-only I/O and checkpoint guards.
+    # Select callbacks locally, never mutate globals: GUI jobs may run in threads.
+    format_name = FORMAT if _profile is None else _profile.FORMAT
+    database_name = 'zip_scan.sqlite' if _profile is None else _profile.DATABASE
+    signatures = SIGNATURES if _profile is None else _profile.SIGNATURES
+    inspect = inspect_record if _profile is None else _profile.inspect_record
+    export = _export if _profile is None else _profile.export
     if not isinstance(chunk_size, int) or not 4 <= chunk_size <= MAX_CHUNK_BYTES:
         raise ValueError('INVALID_CHUNK_SIZE')
     if not isinstance(max_candidates, int) or max_candidates < 1:
@@ -368,9 +376,9 @@ def scan_image(source, output, *, resume=False, chunk_size=CHUNK_BYTES,
         raise ValueError('OUTPUT_MUST_NOT_CONTAIN_SOURCE')
     if not resume and output.exists():
         raise ValueError('OUTPUT_EXISTS_USE_RESUME_OR_NEW_DIRECTORY')
-    database = output / 'zip_scan.sqlite'
+    database = output / database_name
     if resume and (not database.exists() or not _ordinary(database.lstat())):
-        raise ValueError('NO_REGULAR_ZIP_CHECKPOINT')
+        raise ValueError('NO_REGULAR_ZIP_CHECKPOINT' if _profile is None else 'NO_REGULAR_EFS_CHECKPOINT')
     descriptor = os.open(source, os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0))
     with os.fdopen(descriptor, 'rb', buffering=0) as stream:
         info = os.fstat(stream.fileno())
@@ -382,7 +390,7 @@ def scan_image(source, output, *, resume=False, chunk_size=CHUNK_BYTES,
             connection.execute('PRAGMA synchronous=FULL')
             if resume:
                 metadata = {key: json.loads(value) for key, value in connection.execute('SELECT key,value FROM metadata')}
-                if metadata.get('format') != FORMAT or metadata.get('source') != identity:
+                if metadata.get('format') != format_name or metadata.get('source') != identity:
                     raise ValueError('CHECKPOINT_SOURCE_OR_VERSION_MISMATCH')
                 cursor = metadata['next_offset']
                 counters = metadata['counters']
@@ -400,7 +408,7 @@ def scan_image(source, output, *, resume=False, chunk_size=CHUNK_BYTES,
                                    'priority INTEGER NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL)')
                 connection.execute('CREATE INDEX hits_priority ON hits(priority DESC,offset)')
                 cursor, counters = 0, {'signatures_seen': 0, 'rejected_signatures': 0}
-                for key, value in [('format', FORMAT), ('source', identity), ('next_offset', cursor), ('counters', counters)]:
+                for key, value in [('format', format_name), ('source', identity), ('next_offset', cursor), ('counters', counters)]:
                     _put(connection, key, value)
                 connection.commit()
             seen_this_run = 0
@@ -422,7 +430,7 @@ def scan_image(source, output, *, resume=False, chunk_size=CHUNK_BYTES,
                     next_offset = owned_end
                     new_counters = dict(counters)
                     connection.execute('BEGIN IMMEDIATE')
-                    for match in SIGNATURES.finditer(data):
+                    for match in signatures.finditer(data):
                         offset = cursor + match.start()
                         if offset >= owned_end:
                             break
@@ -433,7 +441,7 @@ def scan_image(source, output, *, resume=False, chunk_size=CHUNK_BYTES,
                         seen_this_run += 1
                         new_counters['signatures_seen'] += 1
                         reader = BoundedReader(view, info.st_size)
-                        row = inspect_record(reader, offset, match.group())
+                        row = inspect(reader, offset, match.group())
                         if row is None:
                             new_counters['rejected_signatures'] += 1
                         else:
@@ -458,4 +466,4 @@ def scan_image(source, output, *, resume=False, chunk_size=CHUNK_BYTES,
                 connection.rollback()
                 reason = str(error)[:160]
                 unchanged = False
-            return _export(connection, output, identity, reason, io_counts, unchanged)
+            return export(connection, output, identity, reason, io_counts, unchanged)

@@ -409,6 +409,60 @@ _TRANSLATIONS["en"].update({
 })
 
 
+_TRANSLATIONS['pl'].update({
+    'raw_zip_tab': 'ZIP / EFS w obrazie',
+    'raw_image_mode': 'Szukaj w obrazie:',
+    'raw_efs_note': 'Windows EFS: szukanie zachowanych metadanych NTFS z XP, Visty i Windows 8/8.1. '
+                    'Znacznik folderu nie dowodzi szyfrowania wszystkich jego plików. '
+                    'Rekordy mogą być stare lub powielone; pełne ścieżki i obecne istnienie nie są potwierdzane. '
+                    'Brak trafień nie wyklucza szyfrowania. Bez odszyfrowywania.',
+    'raw_efs_output_hint': 'Nowy, nieistniejący folder raportów EFS',
+    'raw_efs_open': 'Otwórz raport EFS / ZIP',
+    'raw_efs_page': 'Strona {page} · {count} rekordów',
+    'raw_efs_priority_only': 'Tylko nazwy sugerujące portfel',
+    'raw_efs_priority': 'Dowód w metadanych',
+    'raw_efs_record': 'Rodzaj rekordu',
+    'raw_efs_name': 'Zachowane nazwy (bez pełnej ścieżki)',
+    'raw_efs_FILE_RECORD': 'Rekord pliku',
+    'raw_efs_DIRECTORY_RECORD': 'Rekord folderu',
+    'raw_efs_EXTENSION_RECORD': 'Rekord rozszerzenia',
+    'raw_efs_DIRECTORY_ENCRYPTION_DEFAULT': 'Domyślne szyfrowanie folderu',
+    'raw_efs_EFS_METADATA_AND_ENCRYPTED_FLAG': '$EFS i znacznik szyfrowania',
+    'raw_efs_ENCRYPTED_FLAG_ONLY': 'Znacznik szyfrowania',
+    'raw_efs_EFS_STREAM_ONLY': 'Tylko nagłówek strumienia $EFS',
+    'raw_efs_FILE_NAME_FLAG_ONLY': 'Tylko kopia znacznika w nazwie',
+    'raw_efs_ENCRYPTION_DEFAULT': 'Ustawienie folderu',
+    'raw_efs_ENCRYPTED_METADATA': 'Oznaczony jako zaszyfrowany',
+    'raw_efs_HINT_ONLY': 'Ślad do weryfikacji',
+})
+_TRANSLATIONS['en'].update({
+    'raw_zip_tab': 'ZIP / EFS in image',
+    'raw_image_mode': 'Search image for:',
+    'raw_efs_note': 'Windows EFS: preserved NTFS metadata from XP, Vista and Windows 8/8.1. '
+                    'A directory flag does not prove all children are encrypted. '
+                    'Records may be stale or duplicated; full paths and current existence are not confirmed. '
+                    'No hits does not rule out encryption. No decryption.',
+    'raw_efs_output_hint': 'New, nonexistent EFS report folder',
+    'raw_efs_open': 'Open EFS / ZIP report',
+    'raw_efs_page': 'Page {page} · {count} records',
+    'raw_efs_priority_only': 'Only names suggesting a wallet',
+    'raw_efs_priority': 'Metadata evidence',
+    'raw_efs_record': 'Record type',
+    'raw_efs_name': 'Preserved names (no full path)',
+    'raw_efs_FILE_RECORD': 'File record',
+    'raw_efs_DIRECTORY_RECORD': 'Directory record',
+    'raw_efs_EXTENSION_RECORD': 'Extension record',
+    'raw_efs_DIRECTORY_ENCRYPTION_DEFAULT': 'Directory encryption default',
+    'raw_efs_EFS_METADATA_AND_ENCRYPTED_FLAG': '$EFS and encryption flag',
+    'raw_efs_ENCRYPTED_FLAG_ONLY': 'Encryption flag',
+    'raw_efs_EFS_STREAM_ONLY': '$EFS stream header only',
+    'raw_efs_FILE_NAME_FLAG_ONLY': 'File name flag copy only',
+    'raw_efs_ENCRYPTION_DEFAULT': 'Directory default',
+    'raw_efs_ENCRYPTED_METADATA': 'Marked encrypted',
+    'raw_efs_HINT_ONLY': 'Clue to verify',
+})
+
+
 def normalize_language(language: str | None) -> str:
     """Return a supported language code, falling back to Polish."""
     code = (language or DEFAULT_LANGUAGE).casefold()

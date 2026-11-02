@@ -19,7 +19,8 @@ def verify(executable, workspace):
                             cwd=workspace,env=environment,timeout=120)
     outcome = json.loads((destination/'smoke-result.json').read_text(encoding='utf-8'))
     required = ('ok', 'frozen', 'no_console', 'cli_gui_equal', 'resume',
-                'raw_zip_scan', 'raw_zip_resume', 'raw_zip_cli_gui_equal')
+                'raw_zip_scan', 'raw_zip_resume', 'raw_zip_cli_gui_equal',
+                'raw_efs_scan', 'raw_efs_resume', 'raw_efs_cli_gui_equal')
     if result.returncode or outcome.get('tabs') != 4 or not all(outcome.get(key) is True for key in required):
         raise RuntimeError('Frozen inventory check failed:\n' + json.dumps(outcome,ensure_ascii=True,indent=2))
     print(json.dumps(outcome,ensure_ascii=True,indent=2))

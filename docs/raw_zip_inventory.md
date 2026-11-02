@@ -1,5 +1,9 @@
 # ZIP metadata search inside raw disk images
 
+The desktop tab is **ZIP / EFS in image**. Select **ZIP** for the mode described
+here, or **Windows EFS (NTFS)** for [EFS metadata detection](raw_efs_inventory.md).
+Each mode uses a separate report directory and checkpoint format.
+
 `scripts/inventory_zip_image.py` scans the entire byte stream of a regular raw
 image file (`.img`, `.dd`, `.bin`, `.raw`, or any other filename). It can find ZIP
 headers that are no longer reachable as files in a filesystem. It does not

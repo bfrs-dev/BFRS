@@ -21,6 +21,7 @@ class GuiPreferences:
     last_result_report: str = ""
     raw_zip_source: str = ""
     raw_zip_output: str = ""
+    raw_image_mode: str = "zip"
     advanced_expanded: bool = False
     start_offset: str = "0"
     end_offset: str = ""
@@ -70,6 +71,7 @@ class GuiSettingsStore:
             last_result_report=self._text(payload, "last_result_report"),
             raw_zip_source=self._text(payload, "raw_zip_source"),
             raw_zip_output=self._text(payload, "raw_zip_output"),
+            raw_image_mode="efs" if payload.get("raw_image_mode") == "efs" else "zip",
             advanced_expanded=self._boolean(
                 payload, "advanced_expanded", default=False
             ),

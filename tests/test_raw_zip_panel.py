@@ -14,6 +14,7 @@ from bfrs.gui import raw_zip_panel as module
 from bfrs.gui.main_window import MainWindow
 from bfrs.gui.settings import GuiSettingsStore
 from tests.test_raw_zip_inventory import zip_bytes
+from tests.ntfs_efs_fixtures import record, standard, filename
 
 
 @pytest.fixture
@@ -145,3 +146,71 @@ def test_progress_speed_excludes_restored_bytes_and_is_throttled(monkeypatch):
         task.report_progress(dict(scanned_bytes=scanned, total_bytes=200 * 1048576))
     assert len(values) == 2
     assert values[-1]['speed_mib'] == 2.0
+
+
+def test_efs_mode_scan_filter_resume_and_saved_report(tmp_path, app):
+    panel = module.RawZipPanel()
+    source, output = tmp_path / 'efs.img', tmp_path / 'efs-report'
+    source.write_bytes(record() + record(standard(), filename('Documents')))
+    panel.mode_combo.setCurrentIndex(1)
+    assert not panel.priority_check.isChecked()
+    panel.source_edit.setText(str(source))
+    panel.output_edit.setText(str(output))
+    panel.start_scan()
+    assert not panel.mode_combo.isEnabled()
+    finish(app, panel)
+    assert panel.table.rowCount() == 2
+    assert 'Domyślne szyfrowanie' in panel.table.item(0, 2).text()
+    assert 'Ustawienie folderu' == panel.table.item(0, 3).text()
+    panel.priority_check.setChecked(True)
+    finish(app, panel)
+    assert panel.table.rowCount() == 1
+    panel.set_language('en')
+    assert 'Only names' in panel.priority_check.text()
+    before = (output / 'efs_hits.jsonl').read_bytes()
+    panel.start_scan()
+    finish(app, panel)
+    assert (output / 'efs_hits.jsonl').read_bytes() == before
+    panel.mode_combo.setCurrentIndex(0)
+    assert not panel.resume_check.isChecked() and panel.table.rowCount() == 0
+    source.unlink()
+    panel.open_report(output / 'efs_scan.sqlite')
+    finish(app, panel)
+    assert panel.mode == 'efs' and panel.table.rowCount() == 2
+    assert panel.progress_bar.value() == 1000
+    assert panel.source_edit.text() == str(source)
+    panel.close()
+
+
+def test_efs_mode_and_paths_persist_in_main_window(tmp_path, app):
+    store = GuiSettingsStore(tmp_path / 'settings.json')
+    window = MainWindow(settings_store=store)
+    window.raw_zip_panel.mode_combo.setCurrentIndex(1)
+    window.raw_zip_panel.source_edit.setText('test-image.img')
+    window.close()
+    restored = MainWindow(settings_store=store)
+    assert restored.raw_zip_panel.mode == 'efs'
+    assert restored.raw_zip_panel.source_edit.text() == 'test-image.img'
+    restored.close()
+
+
+def test_close_safely_stops_efs_worker(tmp_path, app, monkeypatch):
+    real_scan = module.scan_efs_image
+    def held_scan(source, output, **kwargs):
+        deadline = time.monotonic() + 5
+        while not kwargs['should_stop']() and time.monotonic() < deadline:
+            time.sleep(.005)
+        return real_scan(source, output, **kwargs)
+    monkeypatch.setattr(module, 'scan_efs_image', held_scan)
+    window = MainWindow(settings_store=GuiSettingsStore(tmp_path / 'settings.json'))
+    panel = window.raw_zip_panel
+    panel.mode_combo.setCurrentIndex(1)
+    source, output = configure(tmp_path, panel)
+    source.write_bytes(record())
+    panel.start_scan()
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert not event.isAccepted()
+    finish(app, panel)
+    assert json.loads((output / 'summary.json').read_text())['stop_reason'] == 'STOP_REQUESTED'
+    window.close()
