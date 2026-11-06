@@ -86,6 +86,23 @@ version-1 inventory checkpoints are supported; JSONL alone is not a viewer input
   See `structure` and `reason`; do not interpret UNKNOWN as unencrypted.
 
 ZIP central directory entries provide encryption flags and up to 50 filenames.
+All inspected ZIP names are now checked for case-insensitive `wallet`, `electrum`,
+`bitcoin`, `portfel` and generic `backup` clues, including names beyond that
+50-name display limit. At most 50 clue records are retained, with wallet-related
+clues taking precedence over generic backups. Counts cover all checked names;
+offsets in these folder-inventory reports are relative to the file. Clues do not
+change encryption status and do not establish wallet contents or ownership.
+The viewer adds a name-clue column, a **Nazwy sugerujące portfel lub kopię**
+filter (including unencrypted candidates), and details of matched names.
+Partial inspections are explicitly marked by `zip_name_hints_complete=false`.
+The ZIP inspection revision refreshes earlier cached ZIP/OOXML results once.
+
+To search raw image bytes rather than a folder of recovered files, use the
+separate [raw ZIP inventory command](raw_zip_inventory.md). Its checkpoint and
+reports are separate from this folder inventory and viewer.
+If the end-of-central-directory record is missing, a bounded, positive-only
+fallback can also report a traditional password flag in a surviving local ZIP
+header; see **Damaged classic ZIPs** below.
 OOXML marker paths distinguish DOCX/XLSX/PPTX inside ZIP. RAR3/RAR5 header CRCs
 are checked and encryption records/flags inspected without reading payloads.
 RAR3 service headers (`0x7a`, including archive comments) use the file-header
@@ -121,14 +138,55 @@ Reports include `zip_declared_members`, `zip_directory_size` (bytes) and
 fields: encryption classification and `member_count`/`encrypted_members` are
 published only after all declared entries and the directory boundary pass the
 existing checks. Malformed entries, truncation, unsupported layouts and limits
-remain UNKNOWN, even if an earlier entry carried a marker. This does not check
+remain UNKNOWN, even if an earlier directory entry carried a marker. This does not check
 local headers, payload integrity or password requirements. ZIP64, multivolume,
 directory trailers and encrypted central-directory layouts remain unsupported.
+ZIP64 sentinel values in individual directory entries are also rejected, even
+when the EOCD itself uses classic fields. Multiple EOF-aligned EOCD candidates
+produce `ZIP_AMBIGUOUS_END_DIRECTORY` instead of allowing a fake empty directory
+inside an archive comment to hide earlier encryption flags.
 
 Checkpoint version 1 is retained. Old `ZIP_MEMBER_LIMIT` results already retry
-on `--resume`; unchanged successful ZIP and other cached file results are reused.
-Newly classified ZIPs are reusable on the next resume. Other unresolved formats
-also retain their existing retry behavior; resume is not a ZIP-only pass.
+on `--resume`. The first resume after the ZIP inspection revision changes
+invalidates cached ZIP/DOCX/XLSX/PPTX classifications, including renamed archives,
+so earlier negative results are not silently retained. Other formats and ordinary
+files remain reusable. Newly classified ZIPs are reusable on the next resume.
+Other unresolved formats also retain their existing retry behavior; resume is
+not a ZIP-only pass. The SQLite schema and checkpoint version do not change.
+
+### Damaged classic ZIPs
+
+When no EOF-aligned EOCD record survives, the inventory follows local file
+headers starting at byte zero. It supports classic stored/Deflate entries and
+traditional password flags, validates fixed fields, name and extra-field bounds,
+and jumps over payloads using their declared compressed sizes. It stops at the
+first password marker, an unknown boundary, unsupported metadata, truncation,
+4096 entries or the existing shared 2 MiB / 4096-read budget. A data-descriptor
+flag prevents walking to the next member, but the current header's password
+flag can still be reported. ZIP64, AES/strong encryption and masked local-header
+layouts are not supported by this fallback.
+
+A surviving marker reports `ENCRYPTED`, `ZIP_LOCAL_PASSWORD_FLAG` and
+`structure=PARTIAL_LOCAL_HEADER_ONLY`, with the local header's byte offset and
+bounded filename. It appears in the viewer's default encryption-marker filter,
+with an explicit warning about incomplete content. This is evidence from a
+header, not confirmation of ciphertext integrity, successful password recovery,
+an intact archive, or a wallet. Even missing ciphertext can leave such evidence.
+No total member count or total encrypted-member count is inferred. The original
+directory failure is retained in `zip_directory_error`.
+
+Failure to find a marker leaves the result UNKNOWN, never a negative encryption
+finding; `zip_local_scan_reason` describes where the bounded fallback stopped.
+Other directory errors (including ambiguous EOCDs, corrupt directory entries,
+unsupported layouts and limits) retain UNKNOWN without enabling this fallback.
+There is no signature search inside payloads, SFX executables or raw disk images,
+no reassembly of fragmented ZIPs and no archive repair or extraction. The input
+must still be an ordinary file whose ZIP signature starts at byte zero.
+
+Regression tests include a real traditional-password archive generated with
+the independent Info-ZIP writer and read back using Python's ZIP reader before
+its directory is removed. These checks run on Linux; creation/opening in native
+Windows XP Explorer has not been tested.
 
 Format reference: https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
 

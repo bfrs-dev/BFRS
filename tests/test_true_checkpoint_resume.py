@@ -4,6 +4,8 @@ import sqlite3
 
 import pytest
 
+from tests.sparse_files import sparse_file
+
 from bfrs.core.chunk_reader import ChunkReader
 from bfrs.recovery.unified_scan_checkpoint import (
     UNIFIED_CHECKPOINT_FORMAT_VERSION,
@@ -38,8 +40,9 @@ def test_512_mib_first_physical_resume_read_skips_five_completed_units(tmp_path)
     chunk_size = 64 * MIB
     overlap = 64 * 1024
     source = tmp_path / "synthetic-512mib.img"
-    with source.open("wb") as stream:
-        stream.truncate(size)
+    with sparse_file(source) as stream:
+        stream.seek(size - 1)
+        stream.write(b"\0")
     marker = b"BFRS-SYNTHETIC-MARKER"
     step = chunk_size - overlap
     with source.open("r+b") as stream:

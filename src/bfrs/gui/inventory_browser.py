@@ -26,6 +26,8 @@ LABELS = {'ENCRYPTED': 'Znacznik szyfrowania', 'UNKNOWN': 'Nieustalone',
           'NO_ENCRYPTION_INDICATOR': 'Bez znacznika szyfrowania'}
 
 REASONS = {
+    'ZIP_LOCAL_PASSWORD_FLAG': 'Znacznik hasła w zachowanym nagłówku ZIP; brak końcowego spisu plików',
+    'ZIP_AMBIGUOUS_END_DIRECTORY': 'Niejednoznaczny koniec ZIP — wynik wymaga sprawdzenia',
     'PPT_ENCRYPTED_HEADER_TOKEN': 'Znacznik szyfrowania w nagłówku PowerPoint',
     'PPT_ENCRYPTION_REFERENCE': 'Odwołanie do szyfrowania w ostatnim zapisie PowerPoint',
     'PPT_NO_ENCRYPTION_MARKER': 'Brak znacznika szyfrowania w sprawdzonych metadanych PowerPoint',
@@ -130,6 +132,7 @@ class InventoryBrowser(QWidget):
         for value, label in LABELS.items():
             self.state_combo.addItem(label, value)
         self.state_combo.addItem('Wszystkie wyniki', None)
+        self.state_combo.addItem('Nazwy sugerujące portfel lub kopię', 'NAME_HINT')
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText('Szukaj w nazwie lub ścieżce…')
         self.search_button = QPushButton('Szukaj')
@@ -147,14 +150,15 @@ class InventoryBrowser(QWidget):
         layout.addWidget(note)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(['Nazwa', 'Format / typ', 'Rozmiar', 'Wynik', 'Powód', 'Folder'])
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(['Nazwa', 'Format / typ', 'Rozmiar', 'Wynik', 'Powód', 'Folder', 'Wskazówki z nazw'])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         for index, width in enumerate((220, 90, 100, 170, 200)):
             self.table.setColumnWidth(index, width)
+        self.table.setColumnWidth(6, 210)
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         splitter.addWidget(self.table)
         self.details = QPlainTextEdit()
@@ -218,6 +222,7 @@ class InventoryBrowser(QWidget):
         for index, label in enumerate(self.labels.values()):
             self.state_combo.setItemText(index,label)
         self.state_combo.setItemText(3,'Wszystkie wyniki' if pl else 'All results')
+        self.state_combo.setItemText(4,'Nazwy sugerujące portfel lub kopię' if pl else 'Wallet or backup name clues')
         for name, polish, english in (
             ('open_button','Otwórz raport…','Open report…'), ('refresh_button','Odśwież','Refresh'),
             ('root_button','Wskaż folder źródłowy…','Choose source folder…'),
@@ -227,8 +232,8 @@ class InventoryBrowser(QWidget):
             ('previous_button','Poprzednia','Previous'), ('next_button','Następna','Next')):
             getattr(self,name).setText(polish if pl else english)
         self.search_edit.setPlaceholderText('Szukaj w nazwie lub ścieżce…' if pl else 'Search name or path…')
-        self.table.setHorizontalHeaderLabels(['Nazwa','Format / typ','Rozmiar','Wynik','Powód','Pełna lokalizacja']
-            if pl else ['Name','Format / type','Size','Status','Reason','Full location'])
+        self.table.setHorizontalHeaderLabels(['Nazwa','Format / typ','Rozmiar','Wynik','Powód','Pełna lokalizacja','Wskazówki z nazw']
+            if pl else ['Name','Format / type','Size','Status','Reason','Full location','Name clues'])
         self.note.setText('Ocena ograniczonych metadanych. Przerwany przebieg może zawierać tylko część źródła. '
             'Atrybut EFS folderu nie dowodzi szyfrowania wszystkich plików.' if pl else
             'Bounded metadata assessment. An interrupted run may cover only part of the source. '
@@ -292,9 +297,14 @@ class InventoryBrowser(QWidget):
             path = PureWindowsPath(row['path'])
             size = row.get('size')
             kind = ('Folder EFS' if row.get('entry_kind') == 'directory' else 'Plik EFS') if row.get('format') == 'WINDOWS_EFS' else row.get('format') or 'Nieznany'
+            hints = ('Nazwa związana z portfelem' if row.get('zip_wallet_name_hint_count', 0)
+                     else 'Nazwa kopii zapasowej' if row.get('zip_name_hint_count', 0) else '—')
+            if self.language != 'pl':
+                hints = ('Wallet name clue' if row.get('zip_wallet_name_hint_count', 0)
+                         else 'Backup name clue' if row.get('zip_name_hint_count', 0) else '—')
             values = (path.name or '(folder źródłowy)', kind,
                       f'{size:,} B'.replace(',', ' ') if isinstance(size, int) else '—',
-                      self.labels[row['encryption']], self._reason(row), self._full_path(row))
+                      self.labels[row['encryption']], self._reason(row), self._full_path(row), hints)
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 item.setToolTip(str(value))
@@ -327,6 +337,21 @@ class InventoryBrowser(QWidget):
         if row and row.get('format') == 'PPT':
             self.details.appendPlainText('\nSprawdzono wybrane metadane PowerPoint. '
                 'Slajdy, historia zmian i cele odwołań do szyfrowania nie były weryfikowane.')
+        if row and row.get('zip_name_hints'):
+            self.details.appendPlainText('\nNazwy do sprawdzenia (nie potwierdzają portfela):')
+            for hint in row['zip_name_hints']:
+                self.details.appendPlainText(f"• {hint['name']} — {', '.join(hint['terms'])}")
+            if row.get('zip_name_hints_truncated'):
+                self.details.appendPlainText('Lista wskazówek jest skrócona; pełna liczba: '
+                    + str(row.get('zip_name_hint_count', '—')))
+            if not row.get('zip_name_hints_complete'):
+                self.details.appendPlainText('Sprawdzono tylko część nazw w metadanych.')
+        if row and row.get('structure') == 'PARTIAL_LOCAL_HEADER_ONLY':
+            self.details.appendPlainText('\nZachował się lokalny nagłówek ZIP ze znacznikiem hasła. '
+                'Brakuje końcowego spisu plików. Zawartość może być niekompletna; '
+                'nie potwierdzono możliwości odzyskania ani odszyfrowania pliku.'
+                f"\nNazwa w nagłówku: {row.get('zip_local_member_name', '—')}"
+                f"\nPozycja nagłówka w pliku (bajty): {row.get('zip_local_header_offset', '—')}")
         if row and row.get('filesystem_encryption') == 'EFS':
             self.details.appendPlainText('\nWykryto bieżący atrybut Windows EFS. '
                 'Zawartość nie była odczytywana ani odszyfrowywana.')

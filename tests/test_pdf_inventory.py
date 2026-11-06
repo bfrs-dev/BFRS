@@ -1,9 +1,12 @@
 """PDF inventory: real encrypted files, xref layouts and bounded failure cases."""
+
 import re
 import struct
 import zlib
 
 import pytest
+
+from tests.sparse_files import sparse_file
 from pypdf import PdfReader, PdfWriter
 
 from bfrs.recovery import container_inventory as inventory
@@ -11,7 +14,7 @@ from bfrs.recovery import pdf_inventory as pdf
 
 
 def classic_pdf(path, extra=b'', *, entries=4, payload_size=0):
-    with path.open('wb') as stream:
+    with (sparse_file(path) if payload_size else path.open('wb')) as stream:
         stream.write(b'%PDF-1.7\n')
         offsets = [0]
         for number, body in [(1, b'<< /Type /Catalog /Pages 2 0 R >>'),

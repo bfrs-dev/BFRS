@@ -9,10 +9,13 @@ from bfrs.recovery.pdf_inventory import PDFMetadataLimit, inspect_pdf
 from bfrs.recovery.seven_zip_inventory import SevenZipLimit, inspect_7z
 from bfrs.recovery.ole_type_hints import ole_type_hint
 from bfrs.recovery.ppt_inventory import PPTMetadataLimit, inspect_ppt
+from bfrs.recovery.archive_name_hints import NameHints
 
 VERSION = 1
 # Bump when unknown-OLE inspection changes, so cached metadata is refreshed.
 OLE_INVENTORY_REVISION = 1
+# Refresh cached ZIP/OOXML classifications after changing directory semantics.
+ZIP_INVENTORY_REVISION = 3
 MAX_READ_BYTES = 2 * 1024 * 1024
 MAX_READ_CALLS = 4096
 MAX_MEMBERS = 4096
@@ -102,15 +105,91 @@ class _ZipDirectoryReader:
         self.position += count
 
 
+def _zip_local_password_marker(reader, result):
+    """Positive-only fallback for classic local headers when the EOCD is lost.
+
+    Follow declared stored/Deflate member boundaries from byte zero. Never
+    search payload bytes for signatures or infer a negative from partial data.
+    A data descriptor prevents walking further, but not observing this header's
+    password flag. Payloads (including encryption headers) are not validated.
+    """
+    offset = 0
+    hints = NameHints()
+    for index in range(MAX_MEMBERS):
+        header = reader.at(offset, 30)
+        if header[:4] != b'PK\x03\x04':
+            raise ValueError('ZIP_LOCAL_HEADER_MISSING')
+        version, flags, method = struct.unpack_from('<3H', header, 4)
+        packed, unpacked = struct.unpack_from('<2L', header, 18)
+        name_size, extra_size = struct.unpack_from('<2H', header, 26)
+        if not 10 <= version <= 63 or method not in (0, 8) or flags & ~0x080f:
+            raise InventoryLimit('ZIP_LOCAL_LAYOUT_UNSUPPORTED')
+        if packed == 0xffffffff or unpacked == 0xffffffff:
+            raise InventoryLimit('ZIP64_UNSUPPORTED')
+        metadata = reader.at(offset + 30, name_size + extra_size)
+        name = metadata[:name_size]
+        if not name or b'\x00' in name:
+            raise ValueError('ZIP_INVALID_LOCAL_NAME')
+        extra_pos = name_size
+        while extra_pos < len(metadata):
+            if len(metadata) - extra_pos < 4:
+                raise ValueError('ZIP_INVALID_LOCAL_EXTRA')
+            kind, size = struct.unpack_from('<2H', metadata, extra_pos)
+            extra_pos += 4 + size
+            if extra_pos > len(metadata):
+                raise ValueError('ZIP_INVALID_LOCAL_EXTRA')
+            if kind == 1:
+                raise InventoryLimit('ZIP64_UNSUPPORTED')
+        result['zip_local_headers_checked'] = index + 1
+        decoded_name = name.decode('utf-8' if flags & 2048 else 'cp437', 'replace')
+        hints.add(decoded_name, header_offset=offset, member_index=index, encrypted=bool(flags & 1))
+        result.update(hints.report())
+        if flags & 1:
+            if not flags & 8 and packed < 12:
+                raise ValueError('ZIP_INVALID_LOCAL_ENCRYPTED_SIZE')
+            result.update(encryption='ENCRYPTED', structure='PARTIAL_LOCAL_HEADER_ONLY',
+                          reason='ZIP_LOCAL_PASSWORD_FLAG',
+                          zip_directory_error='ZIP_END_DIRECTORY_MISSING',
+                          zip_local_header_offset=offset,
+                          zip_local_member_name=decoded_name[:512],
+                          zip_local_flags=flags)
+            return
+        if flags & 8:
+            raise InventoryLimit('ZIP_LOCAL_DESCRIPTOR_BOUNDARY_UNKNOWN')
+        offset += 30 + name_size + extra_size + packed
+        if offset >= reader.size:
+            raise ValueError('ZIP_LOCAL_CHAIN_ENDED_WITHOUT_PASSWORD_MARKER')
+    raise InventoryLimit('ZIP_LOCAL_MEMBER_LIMIT')
+
+
 def _zip(reader, result):
+    try:
+        _zip_directory(reader, result)
+    except ValueError as error:
+        # Retain the existing UNKNOWN policy for inconsistent directories,
+        # limits, ZIP64 and split layouts. Only a lost EOCD enables fallback.
+        if str(error) != 'ZIP_END_DIRECTORY_MISSING':
+            raise
+        try:
+            _zip_local_password_marker(reader, result)
+        except (ValueError, OSError, struct.error) as local_error:
+            result['zip_local_scan_reason'] = str(local_error)[:160]
+            raise error
+
+
+def _zip_directory(reader, result):
     length = min(reader.size, 65557)
     tail = reader.at(reader.size - length, length)
-    pos = tail.rfind(b'PK\x05\x06')
-    while pos >= 0:
-        if pos + 22 <= len(tail) and pos + 22 + struct.unpack_from('<H', tail, pos+20)[0] == len(tail):
-            break
-        pos = tail.rfind(b'PK\x05\x06', 0, pos)
-    if pos < 0:
+    candidate = tail.rfind(b'PK\x05\x06')
+    pos = None
+    while candidate >= 0:
+        if (candidate + 22 <= len(tail)
+                and candidate + 22 + struct.unpack_from('<H', tail, candidate+20)[0] == len(tail)):
+            if pos is not None:
+                raise ValueError('ZIP_AMBIGUOUS_END_DIRECTORY')
+            pos = candidate
+        candidate = tail.rfind(b'PK\x05\x06', 0, candidate)
+    if pos is None:
         raise ValueError('ZIP_END_DIRECTORY_MISSING')
     disk, cd_disk, disk_count, count, size, offset, comment = struct.unpack_from('<4H2LH', tail, pos+4)
     if disk or cd_disk or disk_count != count:
@@ -130,7 +209,9 @@ def _zip(reader, result):
     encrypted = 0
     names = []
     markers = set()
+    hints = NameHints()
     for index in range(count):
+        header_offset = offset + central.position
         if central.position + 46 > size:
             raise ValueError('ZIP_BAD_DIRECTORY_ENTRY')
         header = central.read(46)
@@ -139,12 +220,19 @@ def _zip(reader, result):
         flags, method = struct.unpack_from('<HH', header, 8)
         name_size, extra_size, comment_size = struct.unpack_from('<HHH', header, 28)
         disk_start = struct.unpack_from('<H', header, 34)[0]
+        packed, unpacked = struct.unpack_from('<2L', header, 20)
+        local_offset = struct.unpack_from('<L', header, 42)[0]
+        if disk_start == 0xffff or 0xffffffff in (packed, unpacked, local_offset):
+            raise InventoryLimit('ZIP64_UNSUPPORTED')
         if disk_start:
             raise InventoryLimit('ZIP_MULTIVOLUME_UNSUPPORTED')
         if central.position + name_size + extra_size + comment_size > size:
             raise ValueError('ZIP_TRUNCATED_DIRECTORY_ENTRY')
         encrypted += bool(flags & 0x2041 or method == 99)
         name = central.read(name_size).decode('utf-8' if flags & 2048 else 'cp437', 'replace')
+        hints.add(name, header_offset=header_offset, member_index=index,
+                  encrypted=bool(flags & 0x2041 or method == 99))
+        result.update(hints.report())
         if len(names) < MAX_NAMES:
             names.append(name[:512])
         if name in {'[Content_Types].xml', 'word/document.xml', 'xl/workbook.xml', 'ppt/presentation.xml'}:
@@ -161,6 +249,7 @@ def _zip(reader, result):
     result.update(encryption='ENCRYPTED' if encrypted else 'NO_ENCRYPTION_INDICATOR',
                   structure='HEADERS_CHECKED', member_count=count, encrypted_members=encrypted,
                   member_names=names, names_truncated=count > len(names))
+    result.update(hints.report(complete=True))
 
 
 def _vint(data, pos):

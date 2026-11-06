@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.sparse_files import sparse_file
+
 from tests.test_cli import structural_metadata
 from tests.test_electrum_raw_recovery import _plaintext, SYNTHETIC_SEED, SYNTHETIC_XPRV
 from tests.test_raw_bitcoin_record_key_side import COMPRESSED_PUBLIC_KEY, framed, public_key_vector
@@ -82,7 +84,7 @@ def test_metadata_checks_exact_reported_magic_not_nearby_good_page(tmp_path):
 def test_truncated_metadata_is_fragment_and_large_file_read_is_bounded(tmp_path):
     source = tmp_path / "sparse.bin"
     offset = 1329425220
-    with source.open("wb") as stream:
+    with sparse_file(source) as stream:
         stream.seek(offset - 12)
         stream.write(structural_metadata())
         stream.seek(offset + 100000)
