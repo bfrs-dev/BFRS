@@ -26,6 +26,9 @@ LABELS = {'ENCRYPTED': 'Znacznik szyfrowania', 'UNKNOWN': 'Nieustalone',
           'NO_ENCRYPTION_INDICATOR': 'Bez znacznika szyfrowania'}
 
 REASONS = {
+    'ODF_MANIFEST_ENCRYPTION_DATA': 'Znacznik szyfrowania dokumentu OpenOffice / LibreOffice',
+    'ODF_NO_ENCRYPTION_MARKER': 'Brak znacznika szyfrowania w metadanych OpenOffice / LibreOffice',
+    'ODF_MANIFEST_MISSING': 'Brakuje manifestu dokumentu OpenOffice / LibreOffice',
     'ZIP_LOCAL_PASSWORD_FLAG': 'Znacznik hasła w zachowanym nagłówku ZIP; brak końcowego spisu plików',
     'ZIP_AMBIGUOUS_END_DIRECTORY': 'Niejednoznaczny koniec ZIP — wynik wymaga sprawdzenia',
     'PPT_ENCRYPTED_HEADER_TOKEN': 'Znacznik szyfrowania w nagłówku PowerPoint',
@@ -337,6 +340,9 @@ class InventoryBrowser(QWidget):
         if row and row.get('format') == 'PPT':
             self.details.appendPlainText('\nSprawdzono wybrane metadane PowerPoint. '
                 'Slajdy, historia zmian i cele odwołań do szyfrowania nie były weryfikowane.')
+        if row and row.get('odf_metadata_scope'):
+            self.details.appendPlainText('\nSprawdzono metadane OpenOffice / LibreOffice. '
+                'Nie sprawdzano hasła ani zaszyfrowanej zawartości dokumentu.')
         if row and row.get('zip_name_hints'):
             self.details.appendPlainText('\nNazwy do sprawdzenia (nie potwierdzają portfela):')
             for hint in row['zip_name_hints']:

@@ -18,18 +18,22 @@ from bfrs.recovery.container_inventory import (
 )
 from bfrs.recovery.ole_type_hints import OLE_HINT_REVISION, ole_type_hint, ppt_candidate
 from bfrs.recovery.ppt_inventory import PPT_INVENTORY_REVISION
+from bfrs.recovery.odf_inventory import ODF_EXTENSIONS, ODF_FORMATS
 
 EXTENSIONS = {'.zip', '.rar', '.7z', '.doc', '.docx', '.xls', '.xlsx', '.rtf', '.pdf', '.ppt', '.pptx'}
+EXTENSIONS |= ODF_EXTENSIONS
 FILE_ATTRIBUTE_ENCRYPTED = 0x4000
 
 
 def _upgrade_zip_cache(connection, metadata):
-    """Refresh cached ZIP/OOXML classifications once after parser changes."""
+    """Refresh cached ZIP/OOXML/ODF classifications once after parser changes."""
     revision = str(ZIP_INVENTORY_REVISION)
     if metadata.get('zip_inventory_revision') == revision:
         return
+    formats = sorted({'ZIP', 'DOCX', 'XLSX', 'PPTX'} | ODF_FORMATS)
     connection.execute("UPDATE files SET identity=NULL WHERE result IS NOT NULL "
-                       "AND json_extract(result, '$.format') IN ('ZIP','DOCX','XLSX','PPTX')")
+                       "AND json_extract(result, '$.format') IN ("
+                       + ','.join('?' for _ in formats) + ')', formats)
     connection.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)',
                        ('zip_inventory_revision', revision))
 
@@ -160,6 +164,7 @@ def export_reports(connection, output, run_id, complete, counters, filesystem_ch
                               '7Z_BOUNDED_HEADER_DECODING_NO_MEMBER_EXTRACTION',
                               'PDF_METADATA_ONLY_NO_PASSWORD_OR_PAYLOAD_CHECK',
                               'PPT_METADATA_ONLY_NO_PASSWORD_OR_PAYLOAD_CHECK',
+                              'ODF_BOUNDED_MANIFEST_ONLY_NO_PASSWORD_OR_PAYLOAD_CHECK',
                               'NO_SFX_OR_EMBEDDED_SIGNATURE_SEARCH',
                               'ZIP_LOCAL_FALLBACK_POSITIVE_MARKERS_ONLY_NOT_RECOVERY',
                               'RESUME_USES_SIZE_MTIME_AND_FILE_ID_NOT_CONTENT_HASH']}
