@@ -73,8 +73,22 @@ This also creates:
 
 with a matching `.sha256` file.
 
-The x64 installer is restricted to x64 Windows when the separate native ARM64
-package is used. The ARM64 installer is restricted to Arm64 Windows.
+The x64 installer also permits x64 emulation on Windows 11 ARM64.
+The ARM64 installer is restricted to Arm64 Windows.
+
+## GitHub Actions installer
+
+The `Windows installer` workflow builds x64 on `windows-2022` using Python 3.13
+and a checksum-verified Inno Setup 7 download. It runs the existing build script
+with the full test suite and checks the frozen GUI, including ODF encryption
+detection without source imports. It runs on relevant pushes to
+`feature/odf-encryption-inventory`; a manual dispatch is also defined.
+
+The `BFRS-Windows-x64-installer` artifact contains the setup EXE, SHA-256 sidecar
+and `BUILD-SOURCE.txt` with the source commit and run URL. The filename includes
+the date, `odf` label and short commit to distinguish it from older 2.0.1 builds.
+Artifacts are retained for 30 days. This workflow does not create a release or
+merge branches, and needs only repository contents read permission.
 
 ## Notes
 

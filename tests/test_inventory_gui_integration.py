@@ -71,16 +71,18 @@ def test_close_waits_for_both_inventory_workers_and_readers(tmp_path, app, monke
         window.close()
 
 
-@pytest.mark.parametrize('outdated', [True, False])
-def test_frozen_verifier_requires_both_tabs_to_pass(tmp_path, monkeypatch, outdated):
+@pytest.mark.parametrize('outdated', ['tabs', 'odf', None])
+def test_frozen_verifier_requires_both_tabs_and_odf_to_pass(tmp_path, monkeypatch, outdated):
     def fake_run(command, **kwargs):
         destination = Path(command[-1])
         destination.mkdir()
         outcome = dict(ok=True, frozen=True, no_console=True, cli_gui_equal=True, resume=True,
-                       tabs=3 if outdated else 4)
-        if not outdated:
+                       tabs=3 if outdated == 'tabs' else 4)
+        if outdated != 'tabs':
             outcome.update(raw_zip_scan=True, raw_zip_resume=True, raw_zip_cli_gui_equal=True)
             outcome.update(raw_efs_scan=True, raw_efs_resume=True, raw_efs_cli_gui_equal=True)
+        if outdated != 'odf':
+            outcome['odf_encryption'] = True
         (destination / 'smoke-result.json').write_text(json.dumps(outcome), encoding='utf-8')
         return SimpleNamespace(returncode=0)
 

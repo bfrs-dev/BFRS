@@ -1,0 +1,72 @@
+name: Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/odf-encryption-inventory]
+    paths:
+      - '.github/workflows/windows-installer.yml'
+      - 'src/**'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'packaging/**'
+      - 'pyproject.toml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: '1'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Install verified Inno Setup 7
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.1-x64.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_1/innosetup-7.1.1-x64.exe' -OutFile $installer
+          $expected = '8a5a6711c3766a6e5fb74f280ba0e3551e719ce94538d901fdbd1f8f9920b3f0'
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'Inno Setup SHA-256 mismatch'
+          }
+          $destination = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7'
+          $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER', ('/DIR="' + $destination + '"'))
+          $process = Start-Process $installer -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $destination 'ISCC.exe'))) {
+            throw 'Inno Setup installation failed'
+          }
+      - name: Test, build and verify Windows installer
+        run: |
+          ./scripts/build_windows.ps1 -PythonExe python -Installer
+          if ($LASTEXITCODE -ne 0) { throw 'Windows build failed' }
+      - name: Prepare identifiable installer and checksum
+        run: |
+          $version = (python -c "from bfrs.version import VERSION; print(VERSION)").Trim()
+          $date = Get-Date -Format yyyyMMdd
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $name = "BFRS-$version-$date-odf-$short-win-x64-setup.exe"
+          New-Item -ItemType Directory -Force delivery | Out-Null
+          Copy-Item "artifacts/BFRS-$version-win-x64-setup.exe" "delivery/$name"
+          $hash = (Get-FileHash "delivery/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content "delivery/$name.sha256" "$hash  $name" -Encoding ascii
+          @("source_commit=$env:GITHUB_SHA", "run=$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID", "sha256=$hash") | Set-Content delivery/BUILD-SOURCE.txt -Encoding utf8
+          Get-Content delivery/BUILD-SOURCE.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: BFRS-Windows-x64-installer
+          path: delivery/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

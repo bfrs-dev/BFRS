@@ -42,7 +42,7 @@ def run_smoke(directory):
         from bfrs.gui.settings import GuiSettingsStore
         from bfrs.application.document_inventory import inventory
         from bfrs.recovery.container_inventory import inspect_file
-        from bfrs.recovery import seven_zip_inventory, pdf_inventory, ppt_inventory
+        from bfrs.recovery import seven_zip_inventory, pdf_inventory, ppt_inventory, odf_inventory
         import olefile
         import bfrs.application.document_inventory as engine
         import bfrs.gui.inventory_browser as browser
@@ -54,7 +54,7 @@ def run_smoke(directory):
         import bfrs.recovery.raw_efs_inventory as efs_engine
         import bfrs.recovery.archive_name_hints as name_hints
         modules = (engine,browser,controls,view,seven_zip_inventory,pdf_inventory,ppt_inventory,olefile,
-                   raw_view,raw_controls,raw_engine,name_hints,efs_engine)
+                   raw_view,raw_controls,raw_engine,name_hints,efs_engine,odf_inventory)
         if getattr(sys,'frozen',False):
             bundle = Path(sys._MEIPASS).resolve()
             assert all(Path(module.__file__).resolve().is_relative_to(bundle) for module in modules)
@@ -66,6 +66,19 @@ def run_smoke(directory):
             archive.writestr('backup/wallet.dat','Synthetic fixture, not a wallet')
         (source/'zwykły.rtf').write_bytes(br'{\rtf1 synthetic}')
         (source/'uszkodzony.pdf').write_bytes(b'%PDF-1.7\ntruncated')
+        # Synthetic encryption metadata only; no real document or password.
+        with zipfile.ZipFile(source/'openoffice.bin', 'w') as archive:
+            archive.writestr('mimetype', 'application/vnd.oasis.opendocument.text')
+            archive.writestr('META-INF/manifest.xml',
+                '<m:manifest xmlns:m="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0">'
+                '<m:file-entry m:full-path="/" m:media-type="application/vnd.oasis.opendocument.text"/>'
+                '<m:file-entry m:full-path="content.xml" m:media-type="text/xml">'
+                '<m:encryption-data><m:algorithm m:algorithm-name="Blowfish CFB"/>'
+                '<m:key-derivation m:key-derivation-name="PBKDF2"/>'
+                '</m:encryption-data></m:file-entry></m:manifest>', compress_type=zipfile.ZIP_DEFLATED)
+        odf = inspect_file(source/'openoffice.bin')
+        assert odf['format'] == 'ODT' and odf['encryption'] == 'ENCRYPTED', odf
+        outcome['odf_encryption'] = True
         window = MainWindow(settings_store=GuiSettingsStore(directory/'prefs.json'))
         window.show()
         outcome['tabs'] = window.tabs.count()
@@ -91,6 +104,8 @@ def run_smoke(directory):
         finish()
         assert panel.last_result['complete']
         gui_lines = (directory/'gui/inventory.jsonl').read_text(encoding='utf-8')
+        odf_row = next(row for row in map(json.loads, gui_lines.splitlines()) if row['path'] == 'openoffice.bin')
+        assert odf_row['format'] == 'ODT' and odf_row['encryption'] == 'ENCRYPTED'
         inventory(source,directory/'cli')
         assert gui_lines == (directory/'cli/inventory.jsonl').read_text(encoding='utf-8')
         outcome['stage'] = 'document_resume'
