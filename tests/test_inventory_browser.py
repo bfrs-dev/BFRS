@@ -21,6 +21,24 @@ def finish(app, window):
     assert window.worker is None
 
 
+def test_browser_shows_openoffice_encryption(tmp_path):
+    from tests.test_odf_inventory import package
+    from bfrs.application.document_inventory import inventory
+    app = QApplication.instance() or QApplication([])
+    source, report = tmp_path/'source', tmp_path/'report'
+    source.mkdir()
+    package(source/'renamed.bin')
+    inventory(source, report)
+    window = module.InventoryBrowser(report/'inventory.sqlite')
+    finish(app, window)
+    assert window.table.rowCount() == 1
+    assert window.table.item(0, 1).text() == 'ODT'
+    assert 'OpenOffice' in window.table.item(0, 4).text()
+    window.table.selectRow(0)
+    assert 'Nie sprawdzano hasła' in window.details.toPlainText()
+    window.close()
+
+
 def test_browser_shows_partial_zip_marker_and_recovery_limit(tmp_path):
     app = QApplication.instance() or QApplication([])
     database = tmp_path / 'inventory.sqlite'

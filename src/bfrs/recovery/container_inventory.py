@@ -10,12 +10,13 @@ from bfrs.recovery.seven_zip_inventory import SevenZipLimit, inspect_7z
 from bfrs.recovery.ole_type_hints import ole_type_hint
 from bfrs.recovery.ppt_inventory import PPTMetadataLimit, inspect_ppt
 from bfrs.recovery.archive_name_hints import NameHints
+from bfrs.recovery.odf_inventory import inspect_odf_package
 
 VERSION = 1
 # Bump when unknown-OLE inspection changes, so cached metadata is refreshed.
 OLE_INVENTORY_REVISION = 1
 # Refresh cached ZIP/OOXML classifications after changing directory semantics.
-ZIP_INVENTORY_REVISION = 3
+ZIP_INVENTORY_REVISION = 4
 MAX_READ_BYTES = 2 * 1024 * 1024
 MAX_READ_CALLS = 4096
 MAX_MEMBERS = 4096
@@ -164,7 +165,7 @@ def _zip_local_password_marker(reader, result):
 
 def _zip(reader, result):
     try:
-        _zip_directory(reader, result)
+        _zip_directory(reader, result, check_odf=True)
     except ValueError as error:
         # Retain the existing UNKNOWN policy for inconsistent directories,
         # limits, ZIP64 and split layouts. Only a lost EOCD enables fallback.
@@ -177,7 +178,7 @@ def _zip(reader, result):
             raise error
 
 
-def _zip_directory(reader, result):
+def _zip_directory(reader, result, *, check_odf=False):
     length = min(reader.size, 65557)
     tail = reader.at(reader.size - length, length)
     candidate = tail.rfind(b'PK\x05\x06')
@@ -210,6 +211,7 @@ def _zip_directory(reader, result):
     names = []
     markers = set()
     hints = NameHints()
+    odf_entries = {}
     for index in range(count):
         header_offset = offset + central.position
         if central.position + 46 > size:
@@ -230,6 +232,11 @@ def _zip_directory(reader, result):
             raise ValueError('ZIP_TRUNCATED_DIRECTORY_ENTRY')
         encrypted += bool(flags & 0x2041 or method == 99)
         name = central.read(name_size).decode('utf-8' if flags & 2048 else 'cp437', 'replace')
+        if check_odf and name in ('mimetype', 'META-INF/manifest.xml'):
+            if name in odf_entries:
+                raise ValueError('ODF_DUPLICATE_METADATA_ENTRY')
+            odf_entries[name] = (local_offset, flags, method,
+                                struct.unpack_from('<L', header, 16)[0], packed, unpacked)
         hints.add(name, header_offset=header_offset, member_index=index,
                   encrypted=bool(flags & 0x2041 or method == 99))
         result.update(hints.report())
@@ -250,6 +257,8 @@ def _zip_directory(reader, result):
                   structure='HEADERS_CHECKED', member_count=count, encrypted_members=encrypted,
                   member_names=names, names_truncated=count > len(names))
     result.update(hints.report(complete=True))
+    if check_odf and odf_entries:
+        inspect_odf_package(reader, result, odf_entries, offset)
 
 
 def _vint(data, pos):

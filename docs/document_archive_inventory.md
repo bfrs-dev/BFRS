@@ -116,6 +116,50 @@ the shared byte/read/block limits are unchanged.
 Encrypted Office containers are identified by EncryptionInfo+EncryptedPackage;
 legacy DOC uses FibBase.fEncrypted and BIFF8 XLS uses FILEPASS in globals.
 
+### OpenOffice / LibreOffice documents (ODF)
+
+The folder inventory (CLI and GUI **Szyfrowane pliki**) checks OpenDocument
+packages, including ODT/ODS/ODP, drawings, databases, formulas and templates.
+Identification uses the internal MIME type and manifest, so renamed files are
+also supported. ODF encryption does not require ZIP password flags: the parser
+checks namespace-qualified `encryption-data` under manifest file entries, with
+algorithm and key-derivation metadata. Both legacy Blowfish and AES descriptions
+are recognized without attempting passwords or decrypting document content.
+Editing restrictions and sheet protection are not classified as encryption.
+
+Only `mimetype` and `META-INF/manifest.xml` are decoded, using stored or Deflate
+ZIP members. Metadata local headers, member names, sizes and CRCs are checked;
+document XML, images, embedded objects and ciphertext are never decoded.
+The manifest is limited to 256 KiB packed / 512 KiB decoded, 8192 XML elements
+and depth 32. DTDs and entities are rejected, including in UTF-16 XML. Reads share
+the existing 2 MiB / 4096-call per-file budget. Ordinary ZIPs without these
+metadata members retain their directory-only I/O behavior.
+
+An encryption marker produces `ENCRYPTED`, reason
+`ODF_MANIFEST_ENCRYPTION_DATA`, a document format such as `ODT`, and a separate
+`odf_encrypted_members` count (ZIP's `encrypted_members` still counts ZIP flags).
+At most 50 encrypted member names are reported. `odf_password_required` remains
+`NOT_CHECKED`: metadata does not prove password correctness, intact ciphertext,
+or recoverability. A complete supported manifest without markers yields
+`NO_ENCRYPTION_INDICATOR`. Missing manifests for recognized ODF MIME types,
+malformed XML, duplicate metadata/paths, conflicting MIME types, unsupported
+extensions/compression and exceeded limits remain `UNKNOWN`.
+
+Resuming an older folder inventory refreshes cached ZIP/OOXML results once,
+including ODF previously misclassified as plain ZIP. Other cached formats are
+reused. Subsequent resumes reuse successful ODF classifications. Old reports
+must be resumed against the source to change their results; merely viewing a
+report does not reclassify it. Damaged files with ODF extensions remain listed
+as candidates even if their start signature is lost.
+
+This change applies to file/folder inventory. Raw-image ZIP scanning retains
+its existing ZIP-header-only scope and checkpoints. Legacy OpenOffice 1.x
+SXW/SXC/SXI packages, flat XML ODF, fragmented packages, ZIP64 and nested-document
+inspection are not supported by this ODF parser.
+
+Reference: OASIS OpenDocument 1.2, Part 3, sections 3.2–3.4 and 4:
+https://docs.oasis-open.org/office/v1.2/os/OpenDocument-v1.2-os-part3.html
+
 ### Large classic ZIP directories
 
 Classic single-volume ZIP directories are no longer rejected at 4096 entries.
@@ -123,7 +167,8 @@ They are traversed with a 64 KiB input window, retaining at most 50 names of
 512 characters each and the fixed OOXML marker set. Each entry's header and
 filename are checked, including entries after the name-report limit. Extra
 fields and comments are skipped by their bounded lengths, reusing prefetched
-bytes where available. No archive members are extracted or decompressed.
+bytes where available. Document payloads are not extracted or decompressed;
+ODF package metadata is decoded separately within the bounds described above.
 
 The existing 2 MiB / 4096-read per-file budgets still apply, including the initial
 signature probe and final EOCD search. A declared central-directory size larger
@@ -420,7 +465,7 @@ classic ZIP counts up to 65534 with a 64 KiB directory window and the shared byt
 64 KiB RAR header limit; 1 MiB Office metadata prefix limit. Non-candidates use only the
 512-byte probe. Large recognized containers may require seeks to their metadata.
 No whole-file hashing, member-payload decompression, secondary worker pool, or
-in-memory file list is used. Only supported 7z metadata headers may be decoded
+in-memory file list is used. Only supported 7z headers and ODF package metadata are decoded
 within the limits above. Directory traversal is streamed; SQLite persists batches of 100.
 On interruption the current batch is committed and reports exported. Abrupt
 termination can require redoing the last uncommitted batch.

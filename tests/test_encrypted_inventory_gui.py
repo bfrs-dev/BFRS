@@ -276,6 +276,7 @@ def test_windowed_no_stdio_smoke_from_sources(tmp_path):
     outcome=json.loads((tmp_path/'smoke/smoke-result.json').read_text(encoding='utf-8'))
     assert result.returncode==0,json.dumps(outcome,ensure_ascii=False,indent=2)
     assert outcome['no_console'] and outcome['cli_gui_equal'] and outcome['resume']
+    assert outcome['odf_encryption']
     assert outcome['tabs']==4
     assert outcome['raw_zip_scan'] and outcome['raw_zip_resume'] and outcome['raw_zip_cli_gui_equal']
     assert outcome['raw_efs_scan'] and outcome['raw_efs_resume'] and outcome['raw_efs_cli_gui_equal']
